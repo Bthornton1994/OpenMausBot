@@ -1044,7 +1044,7 @@ export function saveConfig(
   // back after we have successfully recognized the legacy list.
   const storedProfiles = storedBrowserProfilesSchema.safeParse(disk.browserProfiles);
   if (storedProfiles.success) disk.browserProfiles = storedProfiles.data;
-  for (const key of ["xai", "anthropic", "mistral", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "context", "localVm", "features", "budgets", "billing", "decisions", "onboarding", "browserEngine", "newBots"] as const) {
+  for (const key of ["xai", "anthropic", "mistral", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "context", "memory", "localVm", "features", "budgets", "billing", "decisions", "onboarding", "browserEngine", "newBots"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

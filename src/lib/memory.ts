@@ -38,7 +38,7 @@ export interface MemoryDoc {
   exists: boolean;
 }
 
-export type MemoryActor = "bot" | "person" | "import";
+export type MemoryActor = "bot" | "person" | "import" | "upkeep";
 
 /** A journal row as the server sends it: no prior text (that stays on
  * the server for the revert), but the chat title when the thread is known. */
@@ -175,7 +175,7 @@ function fileLabel(path: string): string {
  * "Scout rewrote 3 lines in MEMORY.md". Subject first, in the person's
  * words: what the row means, not which fields it has. */
 export function journalSummary(row: MemoryJournalRow, botName: string): string {
-  const who = row.actor === "bot" ? botName : row.actor === "import" ? "An import" : "You";
+  const who = row.actor === "bot" ? botName : row.actor === "import" ? "An import" : row.actor === "upkeep" ? "Memory upkeep" : "You";
   const file = fileLabel(row.path);
   const isIndex = row.path === MEMORY_INDEX;
   const topic = isIndex ? file : row.path.startsWith("memory/log/") ? file : `the ${file} topic`;
@@ -194,6 +194,8 @@ function plural(count: number, noun: string): string {
 export function journalSource(row: MemoryJournalRow): string | null {
   if (row.via === "revert") return "undo";
   if (row.via === "disk") return "changed outside the app";
+  if (row.via === "tidy") return "tidy-up";
+  if (row.via === "capture") return row.threadTitle ? `noticed in chat “${row.threadTitle}”` : "noticed in a chat";
   if (row.threadTitle) return `from chat “${row.threadTitle}”`;
   if (row.actor === "bot") return "during a task";
   if (row.via === "ui") return "in Settings";

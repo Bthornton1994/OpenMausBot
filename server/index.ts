@@ -110,6 +110,8 @@ import * as composio from "./composio.ts";
 import { connectorCallFromFrame, connectorRefusalText, connectorUnrecognizedText, evaluateConnectorTools } from "./connector-verdict.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { buildRecall } from "./recall.ts";
+import { createMemoryUpkeep } from "./memory-upkeep.ts";
+import { aboutMeLine, appendAboutMe, listProfileSuggestions, resolveProfileSuggestion } from "./profile-suggestions.ts";
 import { canAccessTeam, canReachPeer, coordinatorSupervises, livePeerRoster, livePeerRosterBlock, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, resolveTeammate, roomPeerRosterSystemPrompt, roomRosterLine, PEER_ACCESS_HELP } from "./peer-roster.ts";
 import { openMausStatusSystemPrompt } from "./openmaus-status-capsule.ts";
 import {
@@ -144,6 +146,8 @@ import {
   claudeUserMcpEnabled,
   skillAuthoringEnabled,
   autoRecallEnabled,
+  captureQuietMs,
+  tidyHour,
   sharedComputersEnabled,
   builtInBrowserEnabled,
   llmThreadTitlesEnabled,
@@ -299,7 +303,7 @@ import {
   SESSION_SEARCH_SYSTEM_PROMPT,
   workspaceDir,
 } from "./workspace.ts";
-import { listMemoryTopics, readMemoryFile, readMemoryTopic, writeMemoryFile, writeMemoryTopic } from "./workspace.ts";
+import { listMemoryTopics, memoryDate, readMemoryFile, readMemoryTopic, writeMemoryFile, writeMemoryTopic } from "./workspace.ts";
 import {
   MEMORY_INDEX,
   MemoryStoreError,
@@ -945,7 +949,7 @@ function recentWorkSources(bot: BotRecord) {
  * or a room must not be able to pull a private chat into its reply. The
  * conversations are the ones session_search would search, minus this one. */
 function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opts: { conversations: boolean; userName: string }): string {
-  if (!autoRecallEnabled(loadConfig())) return "";
+  if (!autoRecallEnabled(cfg)) return "";
   const roomByThread = new Map<string, GroupRecord>();
   if (opts.conversations) {
     for (const group of store.groups) {
@@ -4881,6 +4885,50 @@ bus.subscribe((event: RuntimeEvent) => {
   }
 });
 
+// Memory upkeep (server/memory-upkeep.ts): background capture, About me
+// suggestions and the nightly tidy-up, for bots with the switch on.
+const memoryUpkeep = createMemoryUpkeep({
+  bots: () => store.bots,
+  bot: (id) => store.bot(id) ?? undefined,
+  engine: (botId) => {
+    const bot = store.bot(botId);
+    const instance = bot ? registry.get(bot.modelSelection.instanceId) : undefined;
+    // an engine the organisation disallows never receives memory text
+    if (!instance || policyModelRefusal(instance)) return null;
+    return instance.generateText ? { generateText: instance.generateText.bind(instance) } : {};
+  },
+  busy: (botId) => botHasActiveTurn(botId),
+  aboutMe: () => cfg.profile?.aboutMe ?? "",
+  sourceLabel: (botId, threadId) => memorySourceLabel({ task: store.taskByThread(botId, threadId), threadId }),
+  quietMs: () => captureQuietMs(cfg),
+  tidyHour: () => tidyHour(cfg),
+  log: (line) => console.log(line),
+});
+
+// A finished 1:1 turn of an upkeep bot waits for capture. Only the person's
+// own conversation: not a room, not a turn another bot or the harness
+// started (its "user" line is not the person), not a failed turn.
+bus.subscribe((event: RuntimeEvent) => {
+  if (shouldIgnoreProviderEvent(event)) return;
+  if (event.type !== "turn.completed" || !event.turnId || !event.ok) return;
+  try {
+    const bot = store.botByThread(event.threadId);
+    if (!bot?.memoryUpkeep || store.groupByThread(event.threadId) || isInternalTurn(event.threadId)) return;
+    const path = store.activePath(event.threadId);
+    const replyAt = path.findLastIndex((message) => message.role === "bot" && message.kind === "text" && message.turnId === event.turnId);
+    if (replyAt < 0) return;
+    const asked = path.slice(0, replyAt).findLast((message) => message.role === "user" && message.kind === "text");
+    if (!asked || asked.peerAsk) return;
+    memoryUpkeep.noteTurn(bot.id, event.threadId, {
+      person: extractTurnImages(asked.text ?? "").text,
+      bot: path[replyAt]!.text ?? "",
+      owner: !asked.sender,
+    });
+  } catch (error) {
+    console.warn(`memory upkeep: could not queue a turn for capture: ${(error as Error).message}`);
+  }
+});
+
 // One line per finished turn in the bot's daily log (server/recent-work.ts):
 // what it said last, the tools it used, whether the turn failed. What a bot
 // did in one conversation was invisible from every other; the log is where
@@ -6780,6 +6828,8 @@ async function compactConversation(input: {
   const controller = new AbortController();
   compactionControllers.set(threadId, { generation, controller });
   try {
+    // facts said in the part about to be folded are captured first
+    memoryUpkeep.flushThread(threadId);
     const summary = await draftSummary(fold.folded, { signal: controller.signal, generateText: instance.generateText?.bind(instance) });
     if (!directTurnClaimIsCurrent(bot.id, generation, threadId)) throw new DirectTurnSetupCancelled("context summarization stopped");
     controller.signal.throwIfAborted();
@@ -12666,8 +12716,8 @@ const workspaceBackupRoutes = createWorkspaceBackupRoutes({
       teamComputers.list().every(computer => !teamComputerInUse(computer)) &&
       store.bots.every((bot) => !botHasActiveTurn(bot.id) && !routines?.activeRunForBot(bot.id) && !botComputerControlSnapshot(bot.id).held) &&
       store.groups.every((group) => !groupIsWorking(group)),
-    pause: () => { routines?.stop(); calendarCalls?.stop(); watchdog.stop(); },
-    resume: () => { routines?.start(); calendarCalls?.start(); watchdog.start(); },
+    pause: () => { routines?.stop(); calendarCalls?.stop(); watchdog.stop(); memoryUpkeep.pause(); },
+    resume: () => { routines?.start(); calendarCalls?.start(); watchdog.start(); memoryUpkeep.resume(); },
     flush: async () => {
       await Promise.all([flushAllProfileHistory(), flushAllMemoryJournals(), flushUsageLedger(DATA_DIR), flushDecisionLog(DATA_DIR), flushAdminActivity(DATA_DIR)]);
       // With writers gated and work idle, release our WAL connection for the
@@ -17295,6 +17345,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         patch.mcpServers = requestedMcpServers;
       }
+      if (body.memoryUpkeep !== undefined) {
+        if (typeof body.memoryUpkeep !== "boolean") return json(res, 400, { error: "memoryUpkeep must be true or false" });
+        patch.memoryUpkeep = body.memoryUpkeep;
+        if (!body.memoryUpkeep && existingBot) memoryUpkeep.dropBot(existingBot.id);
+      }
       // per-bot gate on the app's built-in browser
       if (body.browser !== undefined) {
         if (typeof body.browser !== "boolean") return json(res, 400, { error: "browser must be true or false" });
@@ -18003,6 +18058,45 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const result = revertMemoryChange(m[1], m[2]);
       if (!result.ok) return json(res, result.status, { error: result.error });
       return json(res, 200, { ok: true, ...result.doc, entry: result.entry ? journalEntryForClient(m[1], result.entry) : null, overview: memoryOverview(m[1]) });
+    }
+    // About me suggestions from bots with Memory upkeep on
+    // (server/profile-suggestions.ts). Only the person adds one; About me
+    // is shared with every bot. Admin scope by default, like the config.
+    if (method === "GET" && path === "/api/profile/suggestions") {
+      return json(res, 200, { suggestions: listProfileSuggestions() });
+    }
+    m = path.match(/^\/api\/profile\/suggestions\/([\w-]+)$/);
+    if (m && method === "POST") {
+      const parsed = z.object({ action: z.enum(["add", "dismiss"]) }).safeParse(await readBody(req));
+      if (!parsed.success) return json(res, 400, { error: "action must be add or dismiss" });
+      const pending = listProfileSuggestions().find((suggestion) => suggestion.id === m![1]);
+      if (!pending) return json(res, 404, { error: "That suggestion was already added or dismissed." });
+      if (parsed.data.action === "add") {
+        const next = appendAboutMe(cfg.profile?.aboutMe ?? "", aboutMeLine(pending, memoryDate()));
+        if (next === null) return json(res, 413, { error: "About me is full (24,000 characters). Shorten it first, then add this." });
+        saveConfig({ profile: { ...cfg.profile, aboutMe: next } });
+        Object.assign(cfg, loadConfig());
+        broadcast({ kind: "config", ...configStatus() });
+      }
+      resolveProfileSuggestion(pending.id, parsed.data.action);
+      return json(res, 200, { ok: true, aboutMe: cfg.profile?.aboutMe ?? "", suggestions: listProfileSuggestions() });
+    }
+
+    // Memory upkeep: its status, and a tidy-up now (Bot Settings → Memory).
+    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/upkeep$/);
+    if (m && method === "GET") {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      return json(res, 200, { enabled: bot.memoryUpkeep === true, ...memoryUpkeep.status(bot.id) });
+    }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/tidy$/);
+    if (m && method === "POST") {
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      if (!bot.memoryUpkeep) return json(res, 409, { error: "Switch on Memory upkeep for this bot first." });
+      const report = await memoryUpkeep.tidy(bot.id);
+      await flushMemoryJournal(bot.id);
+      return json(res, 200, { report, overview: memoryOverview(bot.id) });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/open$/);
     if (m && method === "POST") {
@@ -20947,6 +21041,7 @@ server.listen(PORT, "127.0.0.1", () => {
   // ordinary chat. Start only once every registry is initialized and the
   // endpoint is listening; earlier dispatch can hit uninitialized bindings.
   routines!.start();
+  memoryUpkeep.start();
   const leftover = pendingThreads();
   if (leftover.length) console.log(`delegations: ${leftover.length} thread(s) with queued handoffs from a previous run — draining`);
   for (const threadId of leftover) {
@@ -20997,6 +21092,7 @@ const gracefulShutdown = createGracefulShutdown({
       watchdog.stop();
       routines?.stop();
       calendarCalls?.stop();
+      memoryUpkeep.stop();
       webhookIngress?.server.close();
       tunnelListener?.close();
     },
