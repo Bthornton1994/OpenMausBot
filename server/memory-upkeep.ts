@@ -196,7 +196,8 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     // From here to the journal row there is no await, so no write interleaves.
     if (!deps.bot(bot.id)?.memoryUpkeep) return { at, added: 0, suggested: 0, note: "upkeep is off" };
     const before = readRaw(bot.id, "MEMORY.md");
-    const fresh = newCandidates(parseCandidates(answer, today), before ?? "");
+    const parsed = parseCandidates(answer, today);
+    const fresh = newCandidates(parsed, before ?? "");
     const source = `${deps.sourceLabel(bot.id, batch.threadId)} (noticed)`;
     let added = 0;
     let full = false;
@@ -213,7 +214,10 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     // workspace another person's facts are not the owner's profile.
     const owner = batch.turns.every((turn) => turn.owner !== false);
     const suggested = owner
-      ? suggestProfileFacts({ botId: bot.id, botName: bot.name }, fresh.filter((c) => c.aboutUser).map((c) => c.text), deps.aboutMe(), at).length
+      // from every parsed fact, not only new ones: the bot may already have
+      // noted a fact about the person in its own memory, and About me is
+      // where every other bot would learn it
+      ? suggestProfileFacts({ botId: bot.id, botName: bot.name }, parsed.filter((c) => c.aboutUser).map((c) => c.text), deps.aboutMe(), at).length
       : 0;
     const report: CaptureReport = { at, added, suggested, ...(full ? { note: "MEMORY.md is full; the tidy-up or a person needs to make room." } : {}) };
     record(bot.id, { lastCapture: report });

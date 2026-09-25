@@ -51,7 +51,7 @@ describe("capture parsing", () => {
 
   it("names both speakers and today in the prompt", () => {
     const prompt = capturePrompt({ botName: "Scout", turns: [{ person: "I'm vegetarian", bot: "Noted." }], notebook: "", today: TODAY });
-    expect(prompt).toContain("Today is 2026-09-25");
+    expect(prompt).toContain("Today is Friday, 2026-09-25");
     expect(prompt).toContain("Person: I'm vegetarian\nScout: Noted.");
     expect(prompt).toContain("(empty)");
   });
@@ -201,6 +201,15 @@ describe("the upkeep loop", () => {
     await flushMemoryJournal(BOT.id);
     expect(readMemoryJournal(BOT.id, 5)[0]).toMatchObject({ actor: "upkeep", via: "capture", threadId: "t1", path: "MEMORY.md" });
     expect(listProfileSuggestions().map((s) => s.text)).toEqual(["The person is vegetarian"]);
+  });
+
+  it("suggests a fact the notebook already holds, without appending it again", async () => {
+    ensureWorkspace(BOT.id);
+    writeMemoryFile(BOT.id, "- 2026-09-25 · The user's company is called Northwind Studio.\n");
+    answers.push(JSON.stringify([{ text: "The user's company is Northwind Studio", kind: "fact", aboutUser: true, noted: true }]));
+    const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "My company is Northwind Studio", bot: "Noted." }] });
+    expect(report).toMatchObject({ added: 0, suggested: 1 });
+    expect(memory().match(/Northwind/g)).toHaveLength(1);
   });
 
   it("does not suggest About me lines from another person's message", async () => {
