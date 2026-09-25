@@ -970,7 +970,8 @@ function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opt
         const room = roomByThread.get(id);
         if (room) return `room ${JSON.stringify(room.name)}`;
         const task = store.taskByThread(bot.id, id);
-        return task ? `chat ${JSON.stringify(task.title)}` : "an earlier chat";
+        if (task) return `chat ${JSON.stringify(task.title)}`;
+        return id === bot.threadId ? "your main chat" : "an earlier chat";
       },
       author: (hit) => (hit.role === "user" ? hit.peer ?? opts.userName : hit.from ?? bot.name),
     });
@@ -980,6 +981,11 @@ function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opt
     console.warn(`auto-recall failed for ${bot.id}: ${(err as Error).message}`);
     return "";
   }
+}
+
+/** The recalled block in front of a turn's message, or the message alone. */
+function withRecalled(recalled: string, text: string): string {
+  return recalled ? `${recalled}\n\n${text}` : text;
 }
 
 /** Bots in one room must be visible to the same people: a room is one
@@ -8505,10 +8511,6 @@ async function startTurn(
         // never redoes — or forgets — what another one already did
         { id: "recent", label: "Recent work", text: recentWorkPrompt(recentWork(recentWorkSources(bot), bot, { userName: cfg.profile?.name?.trim() || "User", currentThreadId: threadId })) },
         { id: "memory", label: "Memory", text: memorySystemPrompt(bot.id, { managedWrites: Boolean(integrations.agents), fileTools: worksInWorkspace }) },
-        { id: "recalled", label: "Recalled", text: autoRecallPrompt(bot, threadId, resolvedImages.text, {
-          conversations: commsDepth === 0 && !coordinationNode && opts?.automationSource !== "webhook",
-          userName: cfg.profile?.name?.trim() || "User",
-        }) },
         { id: "skills", label: "Skills index", text: privateWorkspace ? skillsSystemPrompt(bot.id) : "" },
         { id: "skill-instructions", label: "Skill instructions", text: skillInstructions },
         { id: "playbooks", label: "Playbooks", text: packagePlaybooks },
@@ -8516,6 +8518,13 @@ async function startTurn(
         { id: "mentions", label: "Mentions", text: boundedCoordination && tagged.length ? `The user named these existing teammates: ${tagged.map(b => `${peerName(b.name)} (${b.id})`).join(", ")}. Use coordinate_bots when their contribution is needed; do not substitute native helper agents for these bots.` : mentionPrompt(tagged) },
       ]);
       turnPromptBytes.set(threadId, { stable: Buffer.byteLength(prompt.stable), volatile: Buffer.byteLength(prompt.volatile) });
+      // Automatic recall rides in front of THIS turn's message, never in the
+      // system prompt: the volatile half is re-sent whole whenever any part of
+      // it changes, and recall changes nearly every turn.
+      const recalled = autoRecallPrompt(bot, threadId, resolvedImages.text, {
+        conversations: commsDepth === 0 && !coordinationNode && opts?.automationSource !== "webhook",
+        userName: cfg.profile?.name?.trim() || "User",
+      });
       runningTurnEngines.set(threadId, instance);
       // The prompt carries the soul as saved now. If it changed during setup,
       // decide again from what is actually sent — except on a continuation
@@ -8538,7 +8547,7 @@ async function startTurn(
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: bot.id,
-        text: dispatchContext.turnText,
+        text: withRecalled(recalled, dispatchContext.turnText),
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: approvalModeForTurn(bot, commsDepth > 0),
@@ -10335,9 +10344,6 @@ async function runGroupMemberTurn(
     // mounted, exactly as the 1:1 path decides it: memory_update is on the
     // agents server, so a room turn with it must be told to use it too.
     { id: "memory", label: "Memory", text: roomMemory ? `\n${roomMemory.trim()}` : "" },
-    // notes only in a room: a private chat reaches a room through the
-    // explicit, disclosed session_search, never automatically
-    { id: "recalled", label: "Recalled", text: cardContinuation ? "" : autoRecallPrompt(bot, threadId, resolvedLatestImages.text, { conversations: false, userName }) },
     { id: "skills", label: "Skills index", text: workspace ? skillsSystemPrompt(bot.id) : "" },
     { id: "skill-instructions", label: "Skill instructions", text: renderSkillInstructions(selectedSkills, { includeRoot: Boolean(workspace) }) },
     { id: "playbooks", label: "Playbooks", text: installedPlaybookInstructions(text, bot.playbooks) },
@@ -10446,10 +10452,13 @@ async function runGroupMemberTurn(
     providerDispatched = true;
     turnPromptBytes.set(threadId, { stable: Buffer.byteLength(roomSystem.stable), volatile: Buffer.byteLength(roomSystem.volatile) });
     runningTurnEngines.set(threadId, instance);
+    // notes only in a room: a private chat reaches a room through the
+    // explicit, disclosed session_search, never automatically
+    const roomRecalled = cardContinuation ? "" : autoRecallPrompt(bot, threadId, resolvedLatestImages.text, { conversations: false, userName });
     guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: readyBot.id,
-        text,
+        text: withRecalled(roomRecalled, text),
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: roomTurnApprovalMode(readyBot, orchestration),

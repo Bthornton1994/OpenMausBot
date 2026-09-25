@@ -30,7 +30,7 @@ export function userProfileSystemPrompt(profile?: { aboutMe?: string }): string 
  * entire conversation at the cache-write rate. Mentions did the same on any
  * turn that tagged a bot, and recent work did it on every turn of an active
  * bot, because its "2h ago" labels drift even when nothing else changed. */
-const VOLATILE_SECTIONS = new Set(["memory", "mentions", "outstanding", "recent", "recalled"]);
+const VOLATILE_SECTIONS = new Set(["memory", "mentions", "outstanding", "recent"]);
 
 export function buildSystemPrompt(
   persona: string,

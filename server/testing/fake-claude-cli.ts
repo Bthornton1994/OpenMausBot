@@ -26,6 +26,10 @@
 //                      server can vary it per test. A missing file, or a body
 //                      of exactly __FAIL__, makes the call fail outright —
 //                      the shape a caller's fallback path has to survive.
+//   FAKE_CLAUDE_TEXT_ROUTES path of a JSON object {"marker": "reply"}, read
+//                      fresh each run: a one-shot prompt containing a marker
+//                      gets that reply (first match wins), before
+//                      FAKE_CLAUDE_TEXT_FILE is consulted.
 //   FAKE_CLAUDE_TEXT_DUMP like FAKE_CLAUDE_DUMP, but for one-shot text runs,
 //                      so they never overwrite a turn's dump mid-test.
 //   FAKE_CLAUDE_TEXT_HANG when set, the one-shot text mode never replies —
@@ -213,6 +217,21 @@ if (argAfter("--output-format") === "text") {
     // a repeating timer keeps the loop alive without settling the
     // top-level await, which Node would otherwise treat as fatal
     await new Promise(() => setInterval(() => {}, 1 << 30));
+  }
+  // FAKE_CLAUDE_TEXT_ROUTES: a JSON file {"marker": "reply"}, re-read each
+  // run; the first marker the prompt contains picks the reply, so one run
+  // can answer a capture, a tidy-up and a title differently.
+  if (process.env.FAKE_CLAUDE_TEXT_ROUTES && existsSync(process.env.FAKE_CLAUDE_TEXT_ROUTES)) {
+    try {
+      const routes = JSON.parse(readFileSync(process.env.FAKE_CLAUDE_TEXT_ROUTES, "utf8")) as Record<string, string>;
+      const hit = Object.entries(routes).find(([marker]) => prompt.includes(marker));
+      if (hit) {
+        process.stdout.write(hit[1]);
+        process.exit(0);
+      }
+    } catch {
+      // a malformed routes file falls through to the plain reply below
+    }
   }
   if (process.env.FAKE_CLAUDE_TEXT_FILE) {
     const file = process.env.FAKE_CLAUDE_TEXT_FILE;

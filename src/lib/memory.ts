@@ -106,6 +106,49 @@ export function revertMemoryChange(botId: string, entryId: string): Promise<Memo
   return api(`/api/bots/${botId}/memory/journal/${encodeURIComponent(entryId)}/revert`, { method: "POST" });
 }
 
+export interface TidyReport {
+  at: number;
+  expired: number;
+  duplicates: number;
+  superseded: number;
+  deferred: number;
+  contradictionsChecked: boolean;
+  note?: string;
+}
+
+export interface CaptureReport {
+  at: number;
+  added: number;
+  suggested: number;
+  note?: string;
+}
+
+export interface UpkeepStatus {
+  enabled: boolean;
+  /** The engine can make the one-shot model call capture and contradictions need. */
+  modelSteps: boolean;
+  lastTidy?: TidyReport;
+  lastCapture?: CaptureReport;
+}
+
+export function fetchUpkeepStatus(botId: string): Promise<UpkeepStatus> {
+  return api(`/api/bots/${botId}/memory/upkeep`);
+}
+
+export function tidyMemoryNow(botId: string): Promise<{ report: TidyReport; overview: MemoryOverview }> {
+  return api(`/api/bots/${botId}/memory/tidy`, { method: "POST" });
+}
+
+/** "Archived 1 expired note, merged 2 duplicates" — or "Nothing to tidy". */
+export function tidySummary(report: TidyReport): string {
+  const parts: string[] = [];
+  if (report.expired) parts.push(`archived ${report.expired} expired note${report.expired === 1 ? "" : "s"}`);
+  if (report.duplicates) parts.push(`merged ${report.duplicates} duplicate${report.duplicates === 1 ? "" : "s"}`);
+  if (report.superseded) parts.push(`crossed out ${report.superseded} contradicted note${report.superseded === 1 ? "" : "s"}`);
+  const head = parts.length ? parts.join(", ") : "nothing to tidy";
+  return head.charAt(0).toUpperCase() + head.slice(1);
+}
+
 export type MemoryOpenTarget = "obsidian" | "folder";
 
 export function openMemoryLocation(botId: string, target: MemoryOpenTarget): Promise<{ ok: boolean; workspacePath: string }> {
