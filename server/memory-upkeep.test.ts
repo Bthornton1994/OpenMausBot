@@ -118,6 +118,14 @@ describe("tidy plan", () => {
     expect(next).toContain("Office is in Mumbai");
   });
 
+  it("keeps the still-true part of a line that held two facts", () => {
+    const text = ["- 2026-09-01 · Lives in Pune and prefers short replies", "- 2026-09-02 · Likes tea", "- 2026-09-03 · Has a dog", "- 2026-09-04 · Drives a Honda", "- 2026-09-10 · Moved to Mumbai"].join("\n");
+    const pairs = parseContradictions('{"pairs":[{"a":0,"b":4,"keep":"b","remainder":"Prefers short replies"}]}', 5);
+    const next = applyTidy(text, planTidy(text, TODAY, pairs), TODAY).text.split("\n");
+    expect(next[0]).toBe("- 2026-09-01 · ~~Lives in Pune and prefers short replies~~ · superseded 2026-09-25");
+    expect(next[1]).toBe("- 2026-09-25 · from tidy-up · Prefers short replies");
+  });
+
   it("ignores malformed or out-of-range contradiction answers", () => {
     expect(parseContradictions("nope", 3)).toEqual([]);
     expect(parseContradictions('{"pairs":[{"a":0,"b":0,"keep":"a"},{"a":0,"b":9,"keep":"a"},{"a":1,"b":2,"keep":"x"},{"a":2,"b":1,"keep":"b"},{"a":1,"b":2,"keep":"a"}]}', 3)).toEqual([

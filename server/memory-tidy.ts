@@ -20,12 +20,15 @@ export interface Contradiction {
   a: number;
   b: number;
   keep: "a" | "b";
+  /** What in the losing line is still true, when it held more than one
+   * fact ("lives in Pune and prefers short replies"): kept as its own entry. */
+  remainder?: string;
 }
 
 export interface TidyPlan {
   expired: MemoryEntryLine[];
   duplicates: MemoryEntryLine[];
-  superseded: Array<{ loser: MemoryEntryLine; winner: MemoryEntryLine }>;
+  superseded: Array<{ loser: MemoryEntryLine; winner: MemoryEntryLine; remainder?: string }>;
   /** Contradictions the share limit held back for another night. */
   deferred: number;
 }
@@ -81,7 +84,7 @@ export function planTidy(text: string, today: string, contradictions: readonly C
       deferred += 1;
       continue;
     }
-    superseded.push({ loser, winner });
+    superseded.push({ loser, winner, ...(pair.remainder ? { remainder: pair.remainder } : {}) });
     touched.add(loser.line);
     touched.add(winner.line);
   }
@@ -96,8 +99,10 @@ export function planChanges(plan: TidyPlan): number {
 export function applyTidy(text: string, plan: TidyPlan, today: string): { text: string; archived: string[] } {
   const lines = text.split("\n");
   const drop = new Set<number>([...plan.expired, ...plan.duplicates].map((e) => e.line));
-  for (const { loser } of plan.superseded) {
-    lines[loser.line] = `${loser.prefix}~~${loser.body}~~ · superseded ${today}`;
+  for (const { loser, remainder } of plan.superseded) {
+    const struck = `${loser.prefix}~~${loser.body}~~ · superseded ${today}`;
+    // the still-true part of a mixed line lives on as its own dated entry
+    lines[loser.line] = remainder ? `${struck}\n- ${today} · from tidy-up · ${remainder}` : struck;
   }
   const archived = plan.expired.map((e) => `${e.raw} · expired ${today}`);
   return { text: lines.filter((_, index) => !drop.has(index)).join("\n"), archived };
@@ -113,8 +118,9 @@ export function contradictionPrompt(candidates: readonly MemoryEntryLine[]): str
     "Find pairs of lines that cannot both be true now: a direct contradiction about the same thing (a changed number, a new city, a reversed preference) — not a refinement, not two different topics, not two facts that can both hold.",
     "Numbers, signs and symbols matter: \"balance is -10\" and \"balance is 10\" contradict; \"uses C\" and \"uses C++\" may both be true.",
     "For each pair say which to keep: the later line unless the earlier one is clearly the correction.",
+    "When the line that loses also states other facts that are still true, give them as remainder, one sentence, worded as in the line; otherwise omit remainder.",
     "Answer with one JSON object and nothing else:",
-    '{"pairs": [{"a": <index>, "b": <index>, "keep": "a"|"b"}]}',
+    '{"pairs": [{"a": <index>, "b": <index>, "keep": "a"|"b", "remainder": "optional"}]}',
     'An empty list {"pairs": []} is the normal answer. Never invent a contradiction.',
   ].join("\n");
 }
@@ -137,7 +143,7 @@ export function parseContradictions(text: string, count: number): Contradiction[
   const seen = new Set<string>();
   for (const pair of parsed.pairs) {
     if (!pair || typeof pair !== "object") continue;
-    const { a, b, keep } = pair as Record<string, unknown>;
+    const { a, b, keep, remainder } = pair as Record<string, unknown>;
     if (!Number.isInteger(a) || !Number.isInteger(b) || a === b) continue;
     const ia = a as number;
     const ib = b as number;
@@ -146,7 +152,8 @@ export function parseContradictions(text: string, count: number): Contradiction[
     const key = `${Math.min(ia, ib)}:${Math.max(ia, ib)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ a: ia, b: ib, keep });
+    const rest = typeof remainder === "string" ? remainder.replace(/\s+/g, " ").replace(/~~/g, "").trim().slice(0, 300) : "";
+    out.push({ a: ia, b: ib, keep, ...(rest ? { remainder: rest } : {}) });
   }
   return out;
 }

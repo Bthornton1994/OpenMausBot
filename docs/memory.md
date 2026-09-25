@@ -103,7 +103,9 @@ app keeps the notes in shape without the bot having to decide to:
   on **Tidy up now**: expired entries move to `memory/archive.md`; of two
   entries with exactly the same fact the newer stays; and one model call
   looks for pairs that cannot both be true, striking the older through
-  (`~~…~~ · superseded <date>`) rather than deleting it. At most a fifth of
+  (`~~…~~ · superseded <date>`) rather than deleting it; when that line also
+  held something still true ("lives in Pune and prefers short replies"), that
+  part is kept as its own entry `from tidy-up`. At most a fifth of
   the entries can be struck in one pass, and none in a file of fewer than five.
 
 "Exactly the same fact" is narrow on purpose: spacing, a bullet and a final
