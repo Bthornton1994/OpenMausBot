@@ -1,0 +1,98 @@
+// The topic index: one line per memory/<topic>.md, so a bot knows what its
+// longer notes cover without a pointer in MEMORY.md. A topic may begin with
+// YAML frontmatter (`title`, `description`, `aliases`); aliases are the other
+// words someone might search with, which matters because every lookup here
+// is word matching, not meaning. Only the head of each file is read.
+import { closeSync, openSync, readSync } from "node:fs";
+
+/** How much of a topic file is read to find its frontmatter. */
+const HEAD_BYTES = 2_048;
+export const TOPIC_INDEX_MAX_TOPICS = 40;
+export const TOPIC_INDEX_MAX_CHARS = 2_000;
+
+export interface TopicHeader {
+  title?: string;
+  description?: string;
+  aliases: string[];
+}
+
+function unquote(value: string): string {
+  const v = value.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) return v.slice(1, -1).trim();
+  return v;
+}
+
+/** The frontmatter fields the index uses. Anything else, or no frontmatter,
+ * reads as an empty header — a hand-written topic is still listed by name. */
+export function parseTopicHeader(text: string): TopicHeader {
+  const header: TopicHeader = { aliases: [] };
+  const m = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
+  if (!m) return header;
+  const lines = m[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const field = /^(title|description|aliases|tags)\s*:\s*(.*)$/.exec(lines[i]);
+    if (!field) continue;
+    const [, key, value] = field;
+    if (key === "title" || key === "description") {
+      if (value.trim()) header[key] = unquote(value).slice(0, 160);
+      continue;
+    }
+    // aliases (and tags, which people use the same way): [a, b] or a list below
+    const items: string[] = [];
+    if (value.trim().startsWith("[")) {
+      items.push(...value.trim().replace(/^\[|\]$/g, "").split(","));
+    } else if (value.trim()) {
+      items.push(...value.split(","));
+    } else {
+      while (i + 1 < lines.length && /^\s*-\s+/.test(lines[i + 1])) items.push(lines[(i += 1)].replace(/^\s*-\s+/, ""));
+    }
+    for (const item of items.map(unquote).filter(Boolean)) {
+      if (!header.aliases.includes(item)) header.aliases.push(item.slice(0, 40));
+    }
+  }
+  header.aliases = header.aliases.slice(0, 12);
+  return header;
+}
+
+export function readTopicHead(path: string): string {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(HEAD_BYTES);
+    const read = readSync(fd, buffer, 0, HEAD_BYTES, 0);
+    return buffer.subarray(0, read).toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** One line per topic, capped by count and length. The archive the tidy-up
+ * keeps is listed last and labelled, so it is not mistaken for current notes. */
+export function renderTopicIndex(topics: ReadonlyArray<{ name: string; header: TopicHeader }>): string {
+  if (!topics.length) return "";
+  const ordered = [...topics].sort((a, b) => Number(a.name === "archive.md") - Number(b.name === "archive.md") || a.name.localeCompare(b.name));
+  const lines: string[] = [];
+  let length = 0;
+  let omitted = 0;
+  for (const { name, header } of ordered) {
+    if (lines.length >= TOPIC_INDEX_MAX_TOPICS) {
+      omitted += 1;
+      continue;
+    }
+    const about = name === "archive.md" && !header.title && !header.description
+      ? "expired and replaced notes, kept for the record"
+      : [header.title, header.description].filter(Boolean).join(" — ");
+    const also = header.aliases.length ? ` (also: ${header.aliases.join(", ")})` : "";
+    const line = `- memory/${name}${about ? ` — ${about}` : ""}${also}`.replace(/\s+/g, " ");
+    if (length + line.length + 1 > TOPIC_INDEX_MAX_CHARS) {
+      omitted += 1;
+      continue;
+    }
+    lines.push(line);
+    length += line.length + 1;
+  }
+  if (omitted) lines.push(`- …and ${omitted} more in memory/`);
+  return lines.join("\n");
+}
