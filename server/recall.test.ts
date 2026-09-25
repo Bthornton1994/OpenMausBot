@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { DATA_DIR } from "./config.ts";
 import { closeMessageDb, recallTerms } from "./message-db.ts";
 import { buildRecall, enoughMatches, memoryPassages, RECALL_CLOSE, RECALL_OPEN, recallQuery, renderRecall } from "./recall.ts";
-import { writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
+import { appendMemoryLog, writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
 
 const BOT = "bot-recall-test";
 
@@ -69,6 +69,11 @@ describe("recall from memory files", () => {
     const block = buildRecall({ botId: BOT, message: "book a table, any restaurants?", threadIds: [], label: () => "", author: () => "" });
     expect(block?.text).toContain("memory/dining.md");
     expect(block?.text).toContain("Loves pasta");
+  });
+
+  it("never recalls a daily log, which repeats what was just said", () => {
+    appendMemoryLog(BOT, "shipped the quarterly invoice report");
+    expect(memoryPassages(BOT, "the quarterly invoice report")).toEqual([]);
   });
 
   it("is null for a short message or nothing matching", () => {

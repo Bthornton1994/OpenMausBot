@@ -8522,7 +8522,9 @@ async function startTurn(
       // system prompt: the volatile half is re-sent whole whenever any part of
       // it changes, and recall changes nearly every turn.
       const recalled = autoRecallPrompt(bot, threadId, resolvedImages.text, {
-        conversations: commsDepth === 0 && !coordinationNode && opts?.automationSource !== "webhook",
+        // a routine run starts fresh by design, and a webhook is untrusted:
+        // neither pulls earlier conversations in
+        conversations: commsDepth === 0 && !coordinationNode && !opts?.automationSource,
         userName: cfg.profile?.name?.trim() || "User",
       });
       runningTurnEngines.set(threadId, instance);

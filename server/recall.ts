@@ -22,8 +22,12 @@ const CONVERSATION_HITS = 4;
 /** From this many content words on, a hit must match two of them: one
  * shared word with a long question is usually a coincidence. */
 export const MIN_TERMS_FOR_TWO = 5;
-/** MEMORY.md already loads whole; the archive holds what is no longer true. */
+/** MEMORY.md already loads whole; the archive holds what is no longer true;
+ * daily logs are a record of what happened, never loaded into a prompt
+ * (session_search finds them when the bot asks), and they repeat what was
+ * just said. */
 const NOT_RECALLED = new Set(["MEMORY.md", "memory/archive.md"]);
+const recalled = (file: string) => !NOT_RECALLED.has(file) && !file.startsWith("memory/log/");
 
 export const RECALL_OPEN =
   "Recalled for this message — passages from your own memory files and earlier conversations, found by OpenMausBot because they share words with the message below." +
@@ -117,7 +121,7 @@ export function memoryPassages(botId: string, query: string): RecallPassage[] {
     return [];
   }
   return hits
-    .filter((hit) => !NOT_RECALLED.has(hit.file) && enoughMatches(query, hit.snippet))
+    .filter((hit) => recalled(hit.file) && enoughMatches(query, hit.snippet))
     .slice(0, MEMORY_HITS)
     .map((hit) => ({ source: "memory" as const, label: hit.file, at: hit.at, snippet: plain(hit.snippet) }));
 }

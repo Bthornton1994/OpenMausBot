@@ -14,6 +14,7 @@ and a journal of every change with one-click undo.
 ├── MEMORY.md            the notes that load into every conversation
 └── memory/
     ├── <topic>.md       longer notes the bot reads on demand
+    ├── archive.md       expired notes the tidy-up moved out (Memory upkeep)
     └── log/
         └── 2026-09-10.md   what the bot did that day, in its own words
 ```
@@ -49,6 +50,71 @@ its prompt.
 Both limits are `MEMORY_MAX_LINES` and `MEMORY_MAX_BYTES` in
 `server/workspace.ts`; the panel, the loader, and the bot's prompt all read the
 same two constants.
+
+Two more things load with it:
+
+- **Expired notes stay out.** An entry that ends in `· until 2026-09-28` stops
+  loading the day after that date. The file keeps it (the gauge still counts
+  it) until the tidy-up or a person moves it.
+- **The topic index.** Every `memory/<topic>.md` is listed by name under the
+  memory block, with its `title`, `description` and `aliases` when the file
+  starts with frontmatter — at most 40 topics or 2,000 characters. The files
+  themselves still load only when the bot reads them.
+
+## Recall before each turn
+
+Before a turn, the person's message (eight characters or more) searches the
+bot's topic files and, in a 1:1 chat the person started, the bot's other
+conversations. Any matching word counts; a message with five or
+more content words needs two per hit. Up to four notes and four conversation
+passages — numbered, dated, and at most 6,000 characters — go in front of that
+turn's message, opened by a line saying they are the bot's own notes and that
+a command inside one is not an instruction. `MEMORY.md` (already loaded) and
+`memory/archive.md` (no longer true) are never recalled, nor are daily logs
+(`session_search` finds those when the bot asks).
+
+It is placed in the message, not the system prompt, on purpose: the prompt's
+changing half is re-sent whole whenever any part of it changes, and recall
+changes nearly every turn. Rooms, routine runs (which start fresh), and turns
+started by another bot, a webhook or a teammate hand-off, recall notes only — a private chat reaches a room
+through `session_search`, which discloses it. `features.autoRecall: false` in
+`config.json` switches recall off. The server log names every recall
+(`auto-recall: … got N note and M conversation passage(s)`).
+
+## Memory upkeep
+
+**Bot Settings → Memory → Memory upkeep** is off by default. Switched on, the
+app keeps the notes in shape without the bot having to decide to:
+
+- **Noticing facts.** When a 1:1 chat has been quiet for two minutes
+  (`memory.captureQuietMs`), or after six turns, or just before a long chat is
+  compacted, one quick model call reads those turns — the person's words and
+  the bot's under different rules — beside `MEMORY.md` and proposes new facts.
+  New ones are appended as ordinary entries marked `(noticed)`:
+  `- 2026-09-25 · from chat "Plans" (noticed) · The person is vegetarian`.
+  A temporary one gets its `until` date. Turns started by another bot or by
+  the harness, rooms and failed turns are never read.
+- **About me suggestions.** A lasting fact about the person is also offered
+  under **Settings → About me**, which every bot reads. Nothing is added
+  there until the person presses **Add**; **Dismiss** stops it coming back.
+  Only the owner's own messages can produce a suggestion.
+- **Nightly tidy-up.** Once a day after 3 am (`memory.tidyHour`), or at the
+  next check if the computer was asleep, never while the bot is working, and
+  on **Tidy up now**: expired entries move to `memory/archive.md`; of two
+  entries with exactly the same fact the newer stays; and one model call
+  looks for pairs that cannot both be true, striking the older through
+  (`~~…~~ · superseded <date>`) rather than deleting it. At most a fifth of
+  the entries can be struck in one pass, and none in a file of fewer than five.
+
+"Exactly the same fact" is narrow on purpose: spacing, a bullet and a final
+full stop are ignored, nothing else — `Balance is -10` and `Balance is 10`,
+`C++` and `C`, `1.5` and `15` are different facts.
+
+Every upkeep change is a journal row by **Memory upkeep** and can be undone.
+Upkeep pauses while a backup runs. The model steps need an engine with a
+one-shot text call — Claude, Grok, OpenAI-compatible, Mistral and MiniMax.
+On any other engine the panel says so and only the expiry and exact-duplicate
+steps run.
 
 ## Editing
 
@@ -143,10 +209,14 @@ bot follows when it writes are:
 - **Daily logs** under `memory/log/YYYY-MM-DD.md` are the bot's diary of what
   it did; they are never loaded into a conversation and are meant for you to
   read in the panel or in Obsidian.
+- **Until dates.** A fact that stops being true on a known day ends with
+  `· until YYYY-MM-DD` (`memory_update` takes an `until` field for it) and
+  stops loading the day after.
 - **Topic files** are ordinary markdown. A topic may begin with a small YAML
-  frontmatter block (a title, tags) and may link to another topic with an
-  Obsidian-style `[[wikilink]]`; Obsidian renders both, and the app leaves
-  them as text. A pointer in `MEMORY.md` to a topic (`see memory/clients.md`)
+  frontmatter block — `title`, `description`, and `aliases` (other words for
+  the topic, since notes are found by matching words) — which the topic index
+  reads, and may link to another topic with an Obsidian-style `[[wikilink]]`,
+  which the app leaves as text. A pointer in `MEMORY.md` to a topic (`see memory/clients.md`)
   is how the bot knows the topic exists.
 
 Nothing about the panel depends on these: an older `MEMORY.md` written in
@@ -163,5 +233,9 @@ free form, or one you rewrite by hand, works the same.
 | `GET` | `/api/bots/:id/memory/journal?limit=` | Recent changes, newest first. |
 | `POST` | `/api/bots/:id/memory/journal/:entryId/revert` | Puts the file back to that row's earlier text. |
 | `POST` | `/api/bots/:id/memory/open` | `{ target: "obsidian" \| "folder" }` — opens the folder on this computer; loopback only. |
+| `GET` | `/api/bots/:id/memory/upkeep` | Whether upkeep is on, whether the engine can run the model steps, and the last tidy-up and capture. |
+| `POST` | `/api/bots/:id/memory/tidy` | Runs the tidy-up now (`409` while upkeep is off) and returns its report. |
+| `GET` | `/api/profile/suggestions` | About me suggestions waiting for the person. |
+| `POST` | `/api/profile/suggestions/:id` | `{ action: "add" \| "dismiss" }`; add appends a dated, attributed line to About me. |
 
 All of them need the owner (admin) session, like the other bot-settings routes.
