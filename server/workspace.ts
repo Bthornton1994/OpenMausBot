@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import { isMemoryDate, untilMark, withoutExpired } from "./memory-entries.ts";
 import { parseTopicHeader, readTopicHead, renderTopicIndex } from "./memory-topics.ts";
-import { indexMemoryFile, indexedMemoryFiles, recallMemory, removeMemoryFile, type MemoryHit } from "./message-db.ts";
+import { indexMemoryFile, indexedMemoryFiles, recallMemory, removeMemoryFile, type MemoryHit, type SearchMode } from "./message-db.ts";
 import { redactSecretsInText } from "./redact.ts";
 
 import { DATA_DIR } from "./config.ts";
@@ -220,9 +220,9 @@ export function syncMemoryIndex(botId: string): void {
 }
 
 /** Search one bot's memory files, after syncing the index to the disk. */
-export function searchMemoryFiles(botId: string, query: string, limit = 12): MemoryHit[] {
+export function searchMemoryFiles(botId: string, query: string, limit = 12, mode: SearchMode = "all"): MemoryHit[] {
   syncMemoryIndex(botId);
-  return recallMemory(query, botId, limit);
+  return recallMemory(query, botId, limit, mode);
 }
 
 export interface MemoryUpdate {

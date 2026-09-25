@@ -617,14 +617,44 @@ const STOP_WORDS = new Set(
  * whitespace-separated token becomes a quoted string, so `AND`, `NOT`,
  * `*`, `:`, and stray quotes are searched for rather than interpreted.
  * Tokens are ANDed — FTS5's default — so a hit contains all of them. */
-function ftsQuery(query: string): string | null {
+function ftsQuery(query: string, mode: SearchMode = "all"): string | null {
   const tokens = query
     .split(/\s+/)
     .map((token) => token.replace(/"/g, "").trim())
     .filter(Boolean);
   if (!tokens.length) return null;
   const content = tokens.filter((token) => !STOP_WORDS.has(token.toLowerCase()));
+  if (mode === "any") {
+    // Automatic recall searches with a whole message: any content word may
+    // match, ranked by bm25. Punctuation-only tokens are dropped, since a
+    // lone "?" or "—" would match nothing useful. No content word, no query.
+    const terms = recallTerms(query);
+    return terms.length ? terms.map((token) => `"${token}"`).join(" OR ") : null;
+  }
   return (content.length ? content : tokens).map((token) => `"${token}"`).join(" ");
+}
+
+/** "all": every word must match (session_search). "any": one is enough (automatic recall). */
+export type SearchMode = "all" | "any";
+
+/** Words that go at the end of a question and say nothing about its topic. */
+const RECALL_FILLER = new Set(
+  "about again also any anything can could does don't know me my please remember remind should tell there they us would".split(" "),
+);
+
+/** The content words of a message, for an any-term recall: lower-cased,
+ * de-duplicated, stop words and filler dropped, punctuation trimmed from the
+ * ends only (so `-10`, `c++` and `v2.1` survive as they are written). */
+export function recallTerms(query: string): string[] {
+  const out: string[] = [];
+  for (const raw of query.split(/\s+/)) {
+    const token = raw.replace(/"/g, "").replace(/^[\s.,;:!?()[\]{}'`“”‘’]+|[\s.,;:!?()[\]{}'`“”‘’]+$/g, "").toLowerCase();
+    if (token.length < 2 && !/\d/.test(token)) continue;
+    if (!/[\p{L}\p{N}]/u.test(token)) continue;
+    if (STOP_WORDS.has(token) || RECALL_FILLER.has(token)) continue;
+    if (!out.includes(token)) out.push(token);
+  }
+  return out.slice(0, 16);
 }
 
 /** How much of a matched message rides back in a hit. Wide enough that a
@@ -685,8 +715,8 @@ function rangeClause(range: RecallRange | undefined, column: string): { sql: str
   return { sql: parts.map((part) => ` AND ${part}`).join(""), params };
 }
 
-export function recallMessages(query: string, threadIds: readonly string[], limit = 12, range?: RecallRange): RecallHit[] {
-  const match = ftsQuery(query);
+export function recallMessages(query: string, threadIds: readonly string[], limit = 12, range?: RecallRange, mode: SearchMode = "all"): RecallHit[] {
+  const match = ftsQuery(query, mode);
   if (!match || !threadIds.length) return [];
   const placeholders = threadIds.map(() => "?").join(", ");
   const window = rangeClause(range, "m.at");
@@ -848,8 +878,8 @@ export interface MemoryHit {
 /** Relevance-ranked recall over ONE bot's memory files. Scoped by bot id
  * in SQL, the same way recallMessages scopes by thread: another bot's
  * memory is not a lower-ranked result, it is not a result. */
-export function recallMemory(query: string, botId: string, limit = 12): MemoryHit[] {
-  const match = ftsQuery(query);
+export function recallMemory(query: string, botId: string, limit = 12, mode: SearchMode = "all"): MemoryHit[] {
+  const match = ftsQuery(query, mode);
   if (!match) return [];
   const rows = db()
     .prepare(

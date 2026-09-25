@@ -288,6 +288,10 @@ const featureConfigSchema = z.object({
    * enabled; a one-shot that fails or answers junk leaves the first-message
    * snippet in place — see llmThreadTitlesEnabled. */
   llmThreadTitles: z.boolean().optional(),
+  /** Before each turn, passages from the bot's own memory files and earlier
+   * conversations that share words with the message ride into the turn.
+   * Read-only; on unless explicitly switched off — see autoRecallEnabled. */
+  autoRecall: z.boolean().optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -453,6 +457,13 @@ const appConfigSchema = z.object({
     compactAt: z.number().positive().max(10_000_000).optional(),
     autoCompact: z.boolean().optional(),
   }).optional(),
+  /** Memory upkeep timing, for bots with Memory upkeep switched on. */
+  memory: z.object({
+    /** Quiet time after a turn before its facts are captured (ms). */
+    captureQuietMs: z.number().int().min(1_000).max(24 * 60 * 60_000).optional(),
+    /** Local hour (0-23) after which the nightly tidy-up runs. */
+    tidyHour: z.number().int().min(0).max(23).optional(),
+  }).strict().optional(),
   threads: threadsConfigSchema.optional(),
   /** The authorization decision log (server/decision-log.ts): days of month
    * files kept, at least; OMB_DECISION_RETENTION_DAYS wins when set. */
@@ -511,11 +522,12 @@ export interface AppConfig {
   rooms?: { turnTimeoutMinutes: number; handoffLifetimeMinutes?: number; handoffMinRunwayMinutes?: number; handoffHardCapMinutes?: number };
   threads?: { maxConcurrentPerBot: number; eventLogMaxBytes?: number; eventLogRetentionDays?: number };
   context?: { rebuildBytes?: number; compactAt?: number; autoCompact?: boolean };
+  memory?: { captureQuietMs?: number; tidyHour?: number };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean };
+  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean; autoRecall?: boolean };
   /** First-run progress; see onboardingConfigSchema. */
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
   /** Named browser sessions any bot can be pointed at. */
@@ -698,6 +710,22 @@ export function skillAuthoringEnabled(cfg: AppConfig): boolean {
   return cfg.features?.skillAuthoring !== false;
 }
 
+/** Automatic recall is read-only, so it is on unless switched off. */
+export function autoRecallEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.autoRecall !== false;
+}
+
+export const DEFAULT_CAPTURE_QUIET_MS = 2 * 60_000;
+export const DEFAULT_TIDY_HOUR = 3;
+
+export function captureQuietMs(cfg: AppConfig): number {
+  return cfg.memory?.captureQuietMs ?? DEFAULT_CAPTURE_QUIET_MS;
+}
+
+export function tidyHour(cfg: AppConfig): number {
+  return cfg.memory?.tidyHour ?? DEFAULT_TIDY_HOUR;
+}
+
 export function showToolCallsEnabled(cfg: AppConfig): boolean {
   return cfg.features?.showToolCalls === true;
 }
@@ -753,6 +781,7 @@ export const FLEET_NEUTRAL_KEYS: ReadonlySet<string> = new Set([
   "rooms",
   "threads",
   "context",
+  "memory",
   "localVm",
   "features",
   "browserProfiles",
