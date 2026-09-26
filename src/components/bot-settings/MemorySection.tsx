@@ -403,7 +403,7 @@ export function MemoryUpkeepCard({
           <p className="mt-1 text-[13px] leading-relaxed text-ink-secondary">
             Keeps these notes in shape without the bot having to remember to: notices facts you mention in chats and adds them,
             and tidies up every night — expired notes are archived, duplicates merged, contradicted notes crossed out. Facts about
-            you are offered for About me in Settings; nothing is added there without you. Every change shows below and can be undone.
+            you are offered for About me (Settings → General); nothing is added there without you. Every change shows below and can be undone.
           </p>
         </div>
         <Switch checked={enabled} aria-label="Memory upkeep" onClick={onToggle} />
@@ -425,6 +425,11 @@ export function MemoryUpkeepCard({
           </span>
         </div>
       )}
+      {enabled && status?.pendingSuggestions ? (
+        <p className="mt-2 text-[12.5px] text-ink">
+          {status.pendingSuggestions === 1 ? "1 suggestion" : `${status.pendingSuggestions} suggestions`} about you waiting in Settings → General → About me.
+        </p>
+      ) : null}
     </div>
   );
 }

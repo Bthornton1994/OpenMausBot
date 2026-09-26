@@ -260,7 +260,9 @@ describe("the upkeep loop", () => {
     expect(readMemoryTopic(BOT.id, "archive.md")).toContain("Exams this weekend · until 2026-09-07 · expired 2026-09-25");
     await flushMemoryJournal(BOT.id);
     const rows = readMemoryJournal(BOT.id, 10);
-    expect(rows.filter((row) => row.actor === "upkeep" && row.via === "tidy").map((row) => row.path).sort()).toEqual(["MEMORY.md", "memory/archive.md"]);
+    expect(rows.filter((row) => row.actor === "upkeep" && row.via === "tidy").map((row) => row.path)).toEqual(["MEMORY.md", "memory/archive.md"]);
+    // newest first: undoing the top row puts MEMORY.md back, and the archive keeps its copy
+    expect(rows[0]!.path).toBe("MEMORY.md");
   });
 
   it("skips the model step on small notebooks and on engines without a text call", async () => {

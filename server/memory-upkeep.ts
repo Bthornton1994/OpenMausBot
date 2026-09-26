@@ -270,8 +270,9 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     const plan = planTidy(before, today, contradictions);
     if (planChanges(plan)) {
       const { text, archived } = applyTidy(before, plan, today);
-      writeMemoryFile(botId, text);
-      recordMemoryChange(botId, { path: "MEMORY.md", actor: "upkeep", via: "tidy", before, after: readRaw(botId, "MEMORY.md") });
+      // The archive is written first: a line is never out of MEMORY.md
+      // before it is in the archive, and the newest journal row — the one a
+      // person undoes — is MEMORY.md, whose undo brings the line back.
       if (archived.length) {
         const archivePath = `memory/${ARCHIVE_TOPIC}`;
         const archiveBefore = readRaw(botId, archivePath);
@@ -279,6 +280,8 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
         writeMemoryTopic(botId, ARCHIVE_TOPIC, `${head}${head.endsWith("\n") ? "" : "\n"}${archived.join("\n")}\n`);
         recordMemoryChange(botId, { path: archivePath, actor: "upkeep", via: "tidy", before: archiveBefore, after: readRaw(botId, archivePath) });
       }
+      writeMemoryFile(botId, text);
+      recordMemoryChange(botId, { path: "MEMORY.md", actor: "upkeep", via: "tidy", before, after: readRaw(botId, "MEMORY.md") });
     }
     const report: TidyReport = {
       at,

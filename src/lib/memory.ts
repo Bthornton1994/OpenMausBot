@@ -129,6 +129,8 @@ export interface UpkeepStatus {
   modelSteps: boolean;
   lastTidy?: TidyReport;
   lastCapture?: CaptureReport;
+  /** About me suggestions from this bot still waiting for the person. */
+  pendingSuggestions?: number;
 }
 
 export function fetchUpkeepStatus(botId: string): Promise<UpkeepStatus> {

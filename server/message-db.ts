@@ -629,9 +629,20 @@ function ftsQuery(query: string, mode: SearchMode = "all"): string | null {
     // match, ranked by bm25. Punctuation-only tokens are dropped, since a
     // lone "?" or "—" would match nothing useful. No content word, no query.
     const terms = recallTerms(query);
-    return terms.length ? terms.map((token) => `"${token}"`).join(" OR ") : null;
+    return terms.length ? terms.map(recallMatchTerm).join(" OR ") : null;
   }
   return (content.length ? content : tokens).map((token) => `"${token}"`).join(" ");
+}
+
+/** One recall term as FTS5 syntax. The index does no stemming, so a word
+ * of four or more letters matches as a prefix, with a plural -s taken off
+ * first: "restaurant" and "restaurants" find each other. Anything with a
+ * digit or symbol ("-10", "c++", "v2.1") stays an exact token — as a prefix,
+ * "c" would match every word starting with c. */
+export function recallMatchTerm(term: string): string {
+  if (!/^\p{L}{4,}$/u.test(term)) return `"${term}"`;
+  const stem = term.length > 4 && term.endsWith("s") && !term.endsWith("ss") ? term.slice(0, -1) : term;
+  return `"${stem}"*`;
 }
 
 /** "all": every word must match (session_search). "any": one is enough (automatic recall). */

@@ -18098,7 +18098,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "GET") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      return json(res, 200, { enabled: bot.memoryUpkeep === true, ...memoryUpkeep.status(bot.id) });
+      const pendingSuggestions = listProfileSuggestions().filter((suggestion) => suggestion.botId === bot.id).length;
+      return json(res, 200, { enabled: bot.memoryUpkeep === true, pendingSuggestions, ...memoryUpkeep.status(bot.id) });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/tidy$/);
     if (m && method === "POST") {

@@ -4,7 +4,7 @@ import { rmSync } from "node:fs";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import { closeMessageDb, recallTerms } from "./message-db.ts";
+import { closeMessageDb, recallMatchTerm, recallTerms } from "./message-db.ts";
 import { buildRecall, enoughMatches, memoryPassages, RECALL_CLOSE, RECALL_OPEN, recallQuery, renderRecall } from "./recall.ts";
 import { appendMemoryLog, writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
 
@@ -69,6 +69,17 @@ describe("recall from memory files", () => {
     const block = buildRecall({ botId: BOT, message: "book a table, any restaurants?", threadIds: [], label: () => "", author: () => "" });
     expect(block?.text).toContain("memory/dining.md");
     expect(block?.text).toContain("Loves pasta");
+  });
+
+  it("matches singular and plural, but never turns a symbol into a prefix", () => {
+    expect(recallMatchTerm("restaurants")).toBe('"restaurant"*');
+    expect(recallMatchTerm("restaurant")).toBe('"restaurant"*');
+    expect(recallMatchTerm("class")).toBe('"class"*');
+    expect(recallMatchTerm("c++")).toBe('"c++"');
+    expect(recallMatchTerm("-10")).toBe('"-10"');
+    expect(recallMatchTerm("tea")).toBe('"tea"');
+    writeMemoryTopic(BOT, "dining.md", "---\naliases: [food, restaurants]\n---\n- Loves pasta\n");
+    expect(memoryPassages(BOT, "suggest a restaurant for tonight").map((p) => p.label)).toEqual(["memory/dining.md"]);
   });
 
   it("never recalls a daily log, which repeats what was just said", () => {

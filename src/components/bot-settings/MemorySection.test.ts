@@ -162,5 +162,7 @@ describe("MemoryUpkeepCard", () => {
     expect(markup).toContain("Tidy up now");
     expect(markup).toContain("archived 1 expired note, merged 2 duplicates");
     expect(markup).toContain("can't make the quick background model call");
+    const waiting = render(createElement(MemoryUpkeepCard, { enabled: true, status: { enabled: true, modelSteps: true, pendingSuggestions: 2 }, tidying: false, onToggle: noop, onTidy: noop }));
+    expect(waiting).toContain("2 suggestions about you waiting in Settings → General → About me.");
   });
 });
