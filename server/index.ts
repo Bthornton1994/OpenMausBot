@@ -110,8 +110,8 @@ import * as composio from "./composio.ts";
 import { connectorCallFromFrame, connectorRefusalText, connectorUnrecognizedText, evaluateConnectorTools } from "./connector-verdict.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { buildRecall } from "./recall.ts";
-import { createMemoryUpkeep } from "./memory-upkeep.ts";
-import { aboutMeLine, appendAboutMe, listProfileSuggestions, resolveProfileSuggestion } from "./profile-suggestions.ts";
+import { createMemoryUpkeep, upkeepEnabled } from "./memory-upkeep.ts";
+import { appendAboutMe, commitLearned, listLearnedFacts, planLearned, removeLearned } from "./profile-learned.ts";
 import { canAccessTeam, canReachPeer, coordinatorSupervises, livePeerRoster, livePeerRosterBlock, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, resolveTeammate, roomPeerRosterSystemPrompt, roomRosterLine, PEER_ACCESS_HELP } from "./peer-roster.ts";
 import { openMausStatusSystemPrompt } from "./openmaus-status-capsule.ts";
 import {
@@ -4904,7 +4904,18 @@ const memoryUpkeep = createMemoryUpkeep({
     return instance.generateText ? { generateText: instance.generateText.bind(instance) } : {};
   },
   busy: (botId) => botHasActiveTurn(botId),
-  aboutMe: () => cfg.profile?.aboutMe ?? "",
+  addToAboutMe: (from, texts) => {
+    const current = cfg.profile?.aboutMe ?? "";
+    const facts = planLearned(from, texts, current, memoryDate());
+    const next = appendAboutMe(current, facts.map((fact) => fact.line));
+    // a full About me takes nothing more; the person trims it first
+    if (!facts.length || next === null) return 0;
+    saveConfig({ profile: { ...cfg.profile, aboutMe: next } });
+    Object.assign(cfg, loadConfig());
+    commitLearned(facts);
+    broadcast({ kind: "config", ...configStatus() });
+    return facts.length;
+  },
   sourceLabel: (botId, threadId) => memorySourceLabel({ task: store.taskByThread(botId, threadId), threadId }),
   quietMs: () => captureQuietMs(cfg),
   tidyHour: () => tidyHour(cfg),
@@ -4919,7 +4930,7 @@ bus.subscribe((event: RuntimeEvent) => {
   if (event.type !== "turn.completed" || !event.turnId || !event.ok) return;
   try {
     const bot = store.botByThread(event.threadId);
-    if (!bot?.memoryUpkeep || store.groupByThread(event.threadId) || isInternalTurn(event.threadId)) return;
+    if (!bot || !upkeepEnabled(bot) || store.groupByThread(event.threadId) || isInternalTurn(event.threadId)) return;
     const path = store.activePath(event.threadId);
     const replyAt = path.findLastIndex((message) => message.role === "bot" && message.kind === "text" && message.turnId === event.turnId);
     if (replyAt < 0) return;
@@ -18070,27 +18081,22 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!result.ok) return json(res, result.status, { error: result.error });
       return json(res, 200, { ok: true, ...result.doc, entry: result.entry ? journalEntryForClient(m[1], result.entry) : null, overview: memoryOverview(m[1]) });
     }
-    // About me suggestions from bots with Memory upkeep on
-    // (server/profile-suggestions.ts). Only the person adds one; About me
-    // is shared with every bot. Admin scope by default, like the config.
-    if (method === "GET" && path === "/api/profile/suggestions") {
-      return json(res, 200, { suggestions: listProfileSuggestions() });
+    // What bots with Memory upkeep added to About me on their own
+    // (server/profile-learned.ts), and Remove for any of it. Admin scope by
+    // default, like the config.
+    if (method === "GET" && path === "/api/profile/learned") {
+      return json(res, 200, { learned: listLearnedFacts() });
     }
-    m = path.match(/^\/api\/profile\/suggestions\/([\w-]+)$/);
+    m = path.match(/^\/api\/profile\/learned\/([\w-]+)\/remove$/);
     if (m && method === "POST") {
-      const parsed = z.object({ action: z.enum(["add", "dismiss"]) }).safeParse(await readBody(req));
-      if (!parsed.success) return json(res, 400, { error: "action must be add or dismiss" });
-      const pending = listProfileSuggestions().find((suggestion) => suggestion.id === m![1]);
-      if (!pending) return json(res, 404, { error: "That suggestion was already added or dismissed." });
-      if (parsed.data.action === "add") {
-        const next = appendAboutMe(cfg.profile?.aboutMe ?? "", aboutMeLine(pending, memoryDate()));
-        if (next === null) return json(res, 413, { error: "About me is full (24,000 characters). Shorten it first, then add this." });
-        saveConfig({ profile: { ...cfg.profile, aboutMe: next } });
+      const removed = removeLearned(m[1], cfg.profile?.aboutMe ?? "");
+      if (!removed) return json(res, 404, { error: "That fact was already removed." });
+      if (removed.aboutMe !== (cfg.profile?.aboutMe ?? "")) {
+        saveConfig({ profile: { ...cfg.profile, aboutMe: removed.aboutMe } });
         Object.assign(cfg, loadConfig());
         broadcast({ kind: "config", ...configStatus() });
       }
-      resolveProfileSuggestion(pending.id, parsed.data.action);
-      return json(res, 200, { ok: true, aboutMe: cfg.profile?.aboutMe ?? "", suggestions: listProfileSuggestions() });
+      return json(res, 200, { ok: true, aboutMe: cfg.profile?.aboutMe ?? "", learned: listLearnedFacts() });
     }
 
     // Memory upkeep: its status, and a tidy-up now (Bot Settings → Memory).
@@ -18098,14 +18104,13 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "GET") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      const pendingSuggestions = listProfileSuggestions().filter((suggestion) => suggestion.botId === bot.id).length;
-      return json(res, 200, { enabled: bot.memoryUpkeep === true, pendingSuggestions, ...memoryUpkeep.status(bot.id) });
+      return json(res, 200, { enabled: upkeepEnabled(bot), ...memoryUpkeep.status(bot.id) });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/tidy$/);
     if (m && method === "POST") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      if (!bot.memoryUpkeep) return json(res, 409, { error: "Switch on Memory upkeep for this bot first." });
+      if (!upkeepEnabled(bot)) return json(res, 409, { error: "Switch on Memory upkeep for this bot first." });
       const report = await memoryUpkeep.tidy(bot.id);
       await flushMemoryJournal(bot.id);
       return json(res, 200, { report, overview: memoryOverview(bot.id) });

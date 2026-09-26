@@ -27,9 +27,18 @@ Lessons carried in from the closed PRs #1362/#1363/#1281:
 | 1. Automatic recall per turn | on (`features.autoRecall: false` disables) | no |
 | 2. Topic index in the prompt | on | no |
 | 3. Expiry dates (`· until YYYY-MM-DD`) hidden from the prompt once past | on | no |
-| 4. Background fact capture (and before compaction) | per-bot **Memory upkeep**, off | yes, journaled as *upkeep* |
-| 5. Nightly tidy-up (expired → archive, exact duplicates, contradictions) | per-bot **Memory upkeep**, off | yes, journaled as *upkeep* |
-| 6. Profile suggestions for *About me*, approved by the person | per-bot **Memory upkeep**, off | only on approval |
+| 4. Background fact capture into MEMORY.md and topic files it creates | per-bot **Memory upkeep**, on | yes, journaled as *upkeep* |
+| 5. Nightly tidy-up (expired → archive, exact duplicates, contradictions) | per-bot **Memory upkeep**, on | yes, journaled as *upkeep* |
+| 6. *About me* learned from the person's own words, listed with Remove | per-bot **Memory upkeep**, on | yes, the shared About me |
+
+**Decision change (2026-09-26, Omkar, after hand testing):** the first cut
+kept writing opt-in and About me behind approval, to answer the maintainer's
+regression concern on #1362/#1363. In use that asked people to curate by
+hand, which they will not do. Upkeep is now on unless a bot's switch is off
+(`memoryUpkeep !== false`); bots create their own topic files; About me is
+updated on its own from the person's own words, with every added line listed
+and removable. The per-bot switch is the escape hatch, and every memory
+write stays undoable in the journal.
 | 7. Memory regression suite named after the rubric | tests only | — |
 
 Everything upkeep writes is an ordinary journal row (actor `upkeep`), so it
@@ -103,14 +112,22 @@ Over-budget appends stop and are left for the tidy-up. A compaction flushes
 that thread's buffer first, so facts in the folded part are captured before
 they are summarised away.
 
-### Profile suggestions (`server/profile-suggestions.ts`)
+### Topic files (`server/memory-topics.ts` `mergeTopicText`)
 
-A candidate marked `aboutUser` with kind `preference` or `fact` also becomes
-a *suggestion* in `DATA_DIR/profile-suggestions.json` (deduplicated, at most
-50 pending). Settings → About me lists them: **Add** appends
-`- 2026-09-25 · learned by Scout · prefers short replies` to *About me*
-(respecting the 24,000 limit); **Dismiss** drops it. Nothing reaches the
-shared profile without the person, because it is shared by every bot.
+Each captured candidate may name a `topic` (and `topicAliases`). Core facts
+go to MEMORY.md; the rest go to `memory/<topic>.md`, reusing an existing topic
+case-insensitively or creating one with a `title` and `aliases` header; new
+aliases merge into an existing header. Deduplicated against the topic by the
+identity rule; a topic past 64 KB gains nothing more. One journal row per file.
+
+### About me (`server/profile-learned.ts`)
+
+A candidate marked `aboutUser` (kind `preference` or `fact`, no `until`) from
+the owner's own messages is appended to *About me* as
+`- 2026-09-25 · learned by Scout · …` (respecting the 24,000 limit) and
+recorded in `DATA_DIR/profile-learned.json`. Settings → General → About me
+lists them under *Added by your bots* with **Remove**, which deletes that
+exact line and remembers the fact so it is never added again.
 
 ### Nightly tidy-up (`server/memory-tidy.ts`)
 
@@ -184,3 +201,17 @@ and raised two About me suggestions; a new chat answered from an older chat
 with no tool calls (3 conversation passages recalled); the tidy-up archived
 one expired note, merged one duplicate and struck one contradiction in 12 s,
 and Undo restored the file.
+- **M5 — topics must answer to their names.** Hand test: the panel's
+  new-topic text began with a heading, so the header under it was ignored; a
+  topic called `Dining` with aliases `Bhel, Irani Cafe` was not found for
+  "restaurant". Headers may now follow a heading; recall matches topic names,
+  titles and aliases directly; new topics start with the header; plurals
+  match ("restaurant"/"restaurants").
+- **M6 — capture files into topics, tuned live.** Replays against
+  claude-haiku-4-5 of a chat mixing food, a sister and a client deadline:
+  3/3 reused the existing `Dining` topic and created `asha` and `acme`; the
+  first wording gave a birthday an `until` date (it would have vanished after
+  the day) — recurring dates now never expire; aliases now always come back
+  (Dining gained "restaurants"). Negative replay still `[]`.
+- **M7 — undo after a tidy-up must not lose a line.** The archive is written
+  before the file the line left, so the newest row is that file.

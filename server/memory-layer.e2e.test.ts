@@ -23,6 +23,7 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
       { text: "The person is vegetarian", kind: "preference", aboutUser: true, confidence: 0.9 },
       { text: "The person has exams this weekend", kind: "fact", until: future, aboutUser: true, confidence: 0.9 },
       { text: "The account balance is -10", kind: "fact", confidence: 0.9 },
+      { text: "The person loves Irani cafes", kind: "preference", topic: "food", topicAliases: ["restaurants", "cafes"], confidence: 0.9 },
     ]),
     [TIDY_MARKER]: '{"pairs": []}',
   }));
@@ -47,6 +48,9 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
   try {
     const { bot } = await api<{ bot: WireBot }>("/api/bots", "POST", { name: "Memo" }, 201);
     await api("/api/config", "PUT", { memory: { captureQuietMs: 1_000 } });
+    // upkeep is on for a new bot; switched off here so the read side is tested alone
+    expect(await api(`/api/bots/${bot.id}/memory/upkeep`)).toMatchObject({ enabled: true });
+    await api(`/api/bots/${bot.id}`, "PATCH", { memoryUpkeep: false });
 
     // ── read side, on by default ─────────────────────────────────────────
     // single-fact recall by an alias: a topic note found by a word it never says
@@ -78,7 +82,7 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
     expect(withExpired).not.toContain("Dentist appointment on Monday");
     expect(withExpired).toContain("Prefers short replies");
 
-    // ── write side, only with Memory upkeep on ───────────────────────────
+    // ── write side, on by default; off above ─────────────────────────────
     await api(`/api/bots/${bot.id}/memory/tidy`, "POST", undefined, 409);
     await turn(bot.id, bot.threadId, "Just so you know, I'm vegetarian and I have exams this weekend.");
     await new Promise((resolve) => setTimeout(resolve, 2_500));
@@ -91,6 +95,12 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
     expect(captured).toMatch(/- \d{4}-\d{2}-\d{2} · from chat "[^"]*" \(noticed\) · The person is vegetarian/);
     expect(captured).toContain(`The person has exams this weekend · until ${future}`);
     expect(captured).toContain("The account balance is -10");
+    // detail is filed into a topic the bot creates, found later by its other words
+    const food = (await memoryFile(bot.id, "memory/food.md")).text;
+    expect(food).toContain("title: food");
+    expect(food).toContain("aliases: [restaurants, cafes]");
+    expect(food).toContain("The person loves Irani cafes");
+    expect(captured).not.toContain("Irani cafes");
     const journal = await api<{ entries: Array<{ actor: string; via: string }> }>(`/api/bots/${bot.id}/memory/journal`);
     expect(journal.entries.some((row) => row.actor === "upkeep" && row.via === "capture")).toBe(true);
 
@@ -106,13 +116,15 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
     await expect.poll(async () => (await memoryFile(bot.id)).text, { timeout: 20_000 }).toContain("The account balance is 10\n");
     expect((await memoryFile(bot.id)).text.match(/The account balance is -10/g)).toHaveLength(1);
 
-    // explicit personalisation: a durable fact about the person waits for them
-    const { suggestions } = await api<{ suggestions: Array<{ id: string; text: string; botName: string }> }>("/api/profile/suggestions");
-    expect(suggestions.map((s) => s.text)).toEqual(["The person is vegetarian"]);
-    const added = await api<{ aboutMe: string }>(`/api/profile/suggestions/${suggestions[0]!.id}`, "POST", { action: "add" });
-    expect(added.aboutMe).toMatch(/- \d{4}-\d{2}-\d{2} · learned by Memo · The person is vegetarian/);
+    // explicit personalisation: a durable fact about the person reaches About
+    // me on its own, is listed with Remove, and a removed one never returns
+    const { learned } = await api<{ learned: Array<{ id: string; text: string; botName: string }> }>("/api/profile/learned");
+    expect(learned.map((f) => f.text)).toEqual(["The person is vegetarian"]);
+    expect((await api("/api/config")).profile.aboutMe).toMatch(/- \d{4}-\d{2}-\d{2} · learned by Memo · The person is vegetarian/);
     expect(JSON.stringify(await api(`/api/bots/${bot.id}/system-prompt`))).toContain("learned by Memo · The person is vegetarian");
-    await api(`/api/profile/suggestions/${suggestions[0]!.id}`, "POST", { action: "add" }, 404);
+    const removed = await api<{ aboutMe: string }>(`/api/profile/learned/${learned[0]!.id}/remove`, "POST");
+    expect(removed.aboutMe).not.toContain("vegetarian");
+    await api(`/api/profile/learned/${learned[0]!.id}/remove`, "POST", undefined, 404);
 
     // forgetting and contradiction: the tidy-up archives the expired entry
     // and strikes the older balance, leaving both in the record

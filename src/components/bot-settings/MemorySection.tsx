@@ -32,6 +32,7 @@ import {
   fetchUpkeepStatus,
   tidyMemoryNow,
   tidySummary,
+  noticedCount,
   topicFileName,
   type UpkeepStatus,
   type MemoryCapacity,
@@ -207,7 +208,7 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
   };
 
   const toggleUpkeep = () => {
-    const enabled = !(bot.memoryUpkeep === true);
+    const enabled = bot.memoryUpkeep === false;
     dispatch({ type: "updateBot", botId: bot.id, patch: { memoryUpkeep: enabled } });
     setUpkeep((current) => (current ? { ...current, enabled } : current));
   };
@@ -259,7 +260,7 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
       {overview && <MemoryGauge index={overview.index} />}
 
       <MemoryUpkeepCard
-        enabled={bot.memoryUpkeep === true}
+        enabled={bot.memoryUpkeep !== false}
         status={upkeep}
         tidying={tidying}
         onToggle={toggleUpkeep}
@@ -408,9 +409,10 @@ export function MemoryUpkeepCard({
         <div className="min-w-0">
           <div className="text-[15px] font-medium text-ink">Memory upkeep</div>
           <p className="mt-1 text-[13px] leading-relaxed text-ink-secondary">
-            Keeps these notes in shape without the bot having to remember to: notices facts you mention in chats and adds them,
-            and tidies up every night — expired notes are archived, duplicates merged, contradicted notes crossed out. Facts about
-            you are offered for About me (Settings → General); nothing is added there without you. Every change shows below and can be undone.
+            Keeps these notes in shape without the bot having to remember to: notices facts you mention in chats and files them —
+            core facts here, detail in topic files it creates — and tidies up every night: expired notes are archived, duplicates
+            merged, contradicted notes crossed out. Facts about you are added to About me (Settings → General), where every bot reads
+            them and you can remove any. Every change shows below and can be undone.
           </p>
         </div>
         <Switch checked={enabled} aria-label="Memory upkeep" onClick={onToggle} />
@@ -428,15 +430,10 @@ export function MemoryUpkeepCard({
           </button>
           <span className="text-[12.5px] text-ink-secondary">
             {status?.lastTidy ? `Last tidy-up ${relativeTime(status.lastTidy.at)}: ${tidySummary(status.lastTidy).toLowerCase()}.` : "Not tidied yet."}
-            {status?.lastCapture?.added ? ` Last noticed ${status.lastCapture.added} fact${status.lastCapture.added === 1 ? "" : "s"} ${relativeTime(status.lastCapture.at)}.` : ""}
+            {status?.lastCapture && noticedCount(status.lastCapture) ? ` Last noticed ${noticedCount(status.lastCapture)} fact${noticedCount(status.lastCapture) === 1 ? "" : "s"} ${relativeTime(status.lastCapture.at)}.` : ""}
           </span>
         </div>
       )}
-      {enabled && status?.pendingSuggestions ? (
-        <p className="mt-2 text-[12.5px] text-ink">
-          {status.pendingSuggestions === 1 ? "1 suggestion" : `${status.pendingSuggestions} suggestions`} about you waiting in Settings → General → About me.
-        </p>
-      ) : null}
     </div>
   );
 }

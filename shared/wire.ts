@@ -300,8 +300,9 @@ export interface WireBot {
   /** Whether this bot gets the app's built-in browser. */
   browser?: boolean;
   /** Memory upkeep: the harness captures facts from finished chats into
-   * MEMORY.md, tidies it nightly and suggests About me additions. Off
-   * unless switched on; every change is journaled and can be undone. */
+   * MEMORY.md and topic files, adds facts about the person to About me and
+   * tidies nightly. On unless explicitly false; every change is journaled
+   * and can be undone. */
   memoryUpkeep?: boolean;
   /** Which of the app-wide MCP servers this bot mounts, by name. */
   mcpServers?: string[];

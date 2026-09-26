@@ -83,30 +83,41 @@ through `session_search`, which discloses it. `features.autoRecall: false` in
 
 ## Memory upkeep
 
-**Bot Settings → Memory → Memory upkeep** is off by default. Switched on, the
-app keeps the notes in shape without the bot having to decide to:
+**Bot Settings → Memory → Memory upkeep** is on for every bot unless switched
+off. It keeps the notes in shape without the bot having to decide to:
 
 - **Noticing facts.** When a 1:1 chat has been quiet for two minutes
   (`memory.captureQuietMs`), or after six turns, or just before a long chat is
   compacted, one quick model call reads those turns — the person's words and
-  the bot's under different rules — beside `MEMORY.md` and proposes new facts.
-  New ones are appended as ordinary entries marked `(noticed)`:
-  `- 2026-09-25 · from chat "Plans" (noticed) · The person is vegetarian`.
-  A temporary one gets its `until` date. Turns started by another bot or by
-  the harness, rooms and failed turns are never read.
-- **About me suggestions.** A lasting fact about the person is also offered
-  under **Settings → About me**, which every bot reads. Nothing is added
-  there until the person presses **Add**; **Dismiss** stops it coming back.
-  Only the owner's own messages can produce a suggestion.
+  the bot's under different rules — beside `MEMORY.md` and the list of topic
+  files, and files what is new:
+  - a core fact the bot needs in every conversation goes to `MEMORY.md`,
+    marked `(noticed)`:
+    `- 2026-09-25 · from chat "Plans" (noticed) · The person is vegetarian`;
+  - everything else goes to a topic file for its subject — a person, a
+    project or client, food, travel — reusing an existing topic or creating
+    one with a header (`title`, `aliases`: the other words someone would ask
+    with), so recall finds it later.
+  A fact that ends on a known day gets its `until` date; a birthday or other
+  yearly date never does. Turns started by another bot or by the harness,
+  rooms and failed turns are never read.
+- **About me.** A lasting fact about the person, taken from their own words,
+  is added to **Settings → General → About me**, which every bot reads, as a
+  dated line `- 2026-09-25 · learned by Scout · …`. **Added by your bots**
+  under About me lists each one with **Remove**; a removed fact is never
+  added again. On a shared installation, another person's messages never add
+  to the owner's About me.
 - **Nightly tidy-up.** Once a day after 3 am (`memory.tidyHour`), or at the
   next check if the computer was asleep, never while the bot is working, and
-  on **Tidy up now**: expired entries move to `memory/archive.md`; of two
-  entries with exactly the same fact the newer stays; and one model call
-  looks for pairs that cannot both be true, striking the older through
-  (`~~…~~ · superseded <date>`) rather than deleting it; when that line also
-  held something still true ("lives in Pune and prefers short replies"), that
-  part is kept as its own entry `from tidy-up`. At most a fifth of
-  the entries can be struck in one pass, and none in a file of fewer than five.
+  on **Tidy up now**: expired entries move to `memory/archive.md` (from
+  `MEMORY.md` and topic files); of two entries with exactly the same fact the
+  newer stays; and in `MEMORY.md` one model call looks for pairs that cannot
+  both be true, striking the older through (`~~…~~ · superseded <date>`)
+  rather than deleting it; when that line also held something still true
+  ("lives in Pune and prefers short replies"), that part is kept as its own
+  entry `from tidy-up`. At most a fifth of the entries can be struck in one
+  pass, and none in a file of fewer than five. The archive is written before
+  the file it came from, so undoing the newest change never loses a line.
 
 "Exactly the same fact" is narrow on purpose: spacing, a bullet and a final
 full stop are ignored, nothing else — `Balance is -10` and `Balance is 10`,
@@ -236,8 +247,8 @@ free form, or one you rewrite by hand, works the same.
 | `POST` | `/api/bots/:id/memory/journal/:entryId/revert` | Puts the file back to that row's earlier text. |
 | `POST` | `/api/bots/:id/memory/open` | `{ target: "obsidian" \| "folder" }` — opens the folder on this computer; loopback only. |
 | `GET` | `/api/bots/:id/memory/upkeep` | Whether upkeep is on, whether the engine can run the model steps, and the last tidy-up and capture. |
-| `POST` | `/api/bots/:id/memory/tidy` | Runs the tidy-up now (`409` while upkeep is off) and returns its report. |
-| `GET` | `/api/profile/suggestions` | About me suggestions waiting for the person. |
-| `POST` | `/api/profile/suggestions/:id` | `{ action: "add" \| "dismiss" }`; add appends a dated, attributed line to About me. |
+| `POST` | `/api/bots/:id/memory/tidy` | Runs the tidy-up now (`409` when upkeep is switched off) and returns its report. |
+| `GET` | `/api/profile/learned` | Facts bots added to About me on their own, newest first. |
+| `POST` | `/api/profile/learned/:id/remove` | Takes that line out of About me; the fact is never added again. |
 
 All of them need the owner (admin) session, like the other bot-settings routes.

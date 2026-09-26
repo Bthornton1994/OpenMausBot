@@ -1,9 +1,9 @@
 # Memory: recall, upkeep and the tidy-up
 
-Automatic recall, the topic index and until dates are on for every bot and
-only read memory. Memory upkeep (background capture, About me suggestions and
-the nightly tidy-up) is a per-bot switch, off by default, and writes only
-journaled, undoable rows. See [the memory guide](../memory.md).
+Automatic recall, the topic index and until dates only read memory. Memory
+upkeep (background capture into MEMORY.md and topic files, About me learned
+from the person's words, and the nightly tidy-up) is on unless a bot's switch
+is off, and every memory write is a journaled, undoable row. See [the memory guide](../memory.md).
 
 ## Exercise the real path
 
@@ -24,10 +24,10 @@ Evidence covers:
 - A topic file is listed with its title and aliases, and found by an alias the text never uses.
 - A fact said in one chat is recalled in a new chat, named by its source.
 - An entry past its until date leaves the prompt; one without a date stays.
-- Upkeep off: nothing is captured and **Tidy up now** is refused.
-- Upkeep on: facts are appended as dated, `(noticed)` entries with their until date, journaled as upkeep.
+- A new bot has upkeep on; switched off, nothing is captured and **Tidy up now** is refused.
+- Upkeep on: core facts are appended as dated, `(noticed)` entries with their until date; detail is filed into a topic file created with a title and aliases; all journaled as upkeep.
 - `Balance is -10` captured twice is kept once; `Balance is 10` is a different fact.
-- A fact about the person waits as a suggestion; Add writes a dated, attributed line to About me that reaches the prompt; a second Add is refused.
+- A fact about the person reaches About me on its own as a dated, attributed line in the prompt; Remove takes it out and a second Remove is refused.
 - The tidy-up archives the expired entry and strikes the contradicted one, reports it, and Undo restores the file.
 
 Unit tests add the share limit on small notebooks (no contradiction change below

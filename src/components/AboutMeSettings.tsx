@@ -43,7 +43,7 @@ export function AboutMeSettings() {
         onBlur={() => void flush()}
         className="min-h-[120px] w-full resize-y rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink focus:border-hairline focus:outline-none"
       />
-      <ProfileSuggestions onAdded={(aboutMe) => { controller.confirm(aboutMe); dispatch({ type: "profileSaved", profile: { aboutMe } }); }} />
+      <LearnedFacts onChanged={(aboutMe) => { controller.confirm(aboutMe); dispatch({ type: "profileSaved", profile: { aboutMe } }); }} />
       <div className="min-h-4 text-[12px]" role="status">
         {status === "saving" && <span className="text-ink-secondary">{t("settings.profile.saving")}</span>}
         {status === "saved" && <span className="text-success">{t("settings.profile.saved")}</span>}
@@ -55,36 +55,36 @@ export function AboutMeSettings() {
   );
 }
 
-interface ProfileSuggestion {
+interface LearnedFact {
   id: string;
   text: string;
   botName: string;
+  at: number;
 }
 
-/** Facts bots with Memory upkeep noticed about the person, waiting for a
- * yes or no: About me reaches every bot, so nothing is added without one. */
-function ProfileSuggestions({ onAdded }: { onAdded: (aboutMe: string) => void }) {
-  const [suggestions, setSuggestions] = useState<ProfileSuggestion[]>([]);
+/** What bots with Memory upkeep added to About me on their own, newest
+ * first, each with Remove: About me reaches every bot, so the person can
+ * always see and take back what was added for them. */
+function LearnedFacts({ onChanged }: { onChanged: (aboutMe: string) => void }) {
+  const [facts, setFacts] = useState<LearnedFact[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    api<{ suggestions: ProfileSuggestion[] }>("/api/profile/suggestions")
-      .then((result) => { if (!cancelled) setSuggestions(result.suggestions); })
+    api<{ learned: LearnedFact[] }>("/api/profile/learned")
+      .then((result) => { if (!cancelled) setFacts(result.learned); })
       .catch(() => undefined);
     return () => { cancelled = true; };
   }, []);
 
-  const resolve = async (id: string, action: "add" | "dismiss") => {
+  const remove = async (id: string) => {
     setBusy(id);
     setError(false);
     try {
-      const result = await api<{ aboutMe: string; suggestions: ProfileSuggestion[] }>(`/api/profile/suggestions/${encodeURIComponent(id)}`, {
-        method: "POST", body: JSON.stringify({ action }),
-      });
-      setSuggestions(result.suggestions);
-      if (action === "add") onAdded(result.aboutMe);
+      const result = await api<{ aboutMe: string; learned: LearnedFact[] }>(`/api/profile/learned/${encodeURIComponent(id)}/remove`, { method: "POST" });
+      setFacts(result.learned);
+      onChanged(result.aboutMe);
     } catch {
       setError(true);
     } finally {
@@ -92,30 +92,26 @@ function ProfileSuggestions({ onAdded }: { onAdded: (aboutMe: string) => void })
     }
   };
 
-  if (!suggestions.length) return null;
+  if (!facts.length) return null;
   return (
     <div className="mt-1 rounded-lg border border-hairline/40 bg-inset p-3">
-      <div className="text-[13px] font-medium text-ink">{t("settings.profile.suggestions.title")}</div>
-      <p className="mt-0.5 text-[12px] text-ink-secondary">{t("settings.profile.suggestions.hint")}</p>
+      <div className="text-[13px] font-medium text-ink">{t("settings.profile.learned.title")}</div>
+      <p className="mt-0.5 text-[12px] text-ink-secondary">{t("settings.profile.learned.hint")}</p>
       <ul className="mt-2 flex flex-col gap-2">
-        {suggestions.map((suggestion) => (
-          <li key={suggestion.id} className="flex flex-wrap items-center gap-2 text-[13px] text-ink">
+        {facts.map((fact) => (
+          <li key={fact.id} className="flex flex-wrap items-center gap-2 text-[13px] text-ink">
             <span className="min-w-0 flex-1">
-              {suggestion.text}{" "}
-              <span className="text-[12px] text-ink-secondary">{t("settings.profile.suggestions.from", { name: suggestion.botName })}</span>
+              {fact.text}{" "}
+              <span className="text-[12px] text-ink-secondary">{t("settings.profile.learned.from", { name: fact.botName })}</span>
             </span>
-            <button type="button" disabled={busy === suggestion.id} onClick={() => void resolve(suggestion.id, "add")}
-              className="rounded-md bg-control px-2.5 py-1 text-[12.5px] text-ink hover:bg-raised-hover disabled:opacity-50">
-              {t("settings.profile.suggestions.add")}
-            </button>
-            <button type="button" disabled={busy === suggestion.id} onClick={() => void resolve(suggestion.id, "dismiss")}
+            <button type="button" disabled={busy === fact.id} onClick={() => void remove(fact.id)}
               className="rounded-md px-2 py-1 text-[12.5px] text-ink-secondary hover:bg-control hover:text-ink disabled:opacity-50">
-              {t("settings.profile.suggestions.dismiss")}
+              {t("settings.profile.learned.remove")}
             </button>
           </li>
         ))}
       </ul>
-      {error && <div className="mt-2 text-[12px] text-danger">{t("settings.profile.suggestions.error")}</div>}
+      {error && <div className="mt-2 text-[12px] text-danger">{t("settings.profile.learned.error")}</div>}
     </div>
   );
 }

@@ -119,3 +119,49 @@ export function renderTopicIndex(topics: ReadonlyArray<{ name: string; header: T
   if (omitted) lines.push(`- …and ${omitted} more in memory/`);
   return lines.join("\n");
 }
+
+const LEAD = /^(?:\s*\r?\n|#{1,6}[ \t]+[^\r\n]*\r?\n)*/;
+const HEADER_BLOCK = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
+
+function aliasList(aliases: readonly string[]): string {
+  return `[${aliases.join(", ")}]`;
+}
+
+/** A topic file with new entry lines appended and new aliases merged into its
+ * header — created, header first, when it does not exist yet. The header is
+ * what the topic index and recall read, so a topic the bot files for itself
+ * is found by the other words it was given. */
+export function mergeTopicText(existing: string | null, input: { title: string; aliases: readonly string[]; lines: readonly string[] }): string {
+  const lines = input.lines.join("\n");
+  if (existing === null || !existing.trim()) {
+    const aliases = [...new Set(input.aliases)].slice(0, 12);
+    return `---\ntitle: ${input.title}\n${aliases.length ? `aliases: ${aliasList(aliases)}\n` : ""}---\n\n${lines}\n`;
+  }
+  const lead = LEAD.exec(existing)?.[0] ?? "";
+  const rest = existing.slice(lead.length);
+  const block = HEADER_BLOCK.exec(rest);
+  let text: string;
+  if (!block) {
+    const aliases = [...new Set(input.aliases)].slice(0, 12);
+    text = `---\ntitle: ${parseTopicHeader(existing).title ?? input.title}\n${aliases.length ? `aliases: ${aliasList(aliases)}\n` : ""}---\n\n${existing}`;
+  } else {
+    const known = parseTopicHeader(existing).aliases;
+    const lower = new Set(known.map((alias) => alias.toLowerCase()));
+    const added = input.aliases.filter((alias) => !lower.has(alias.toLowerCase()));
+    if (!added.length) text = existing;
+    else {
+      const merged = [...known, ...added].slice(0, 12);
+      const body = block[1].split(/\r?\n/);
+      const at = body.findIndex((line) => /^aliases\s*:/.test(line));
+      if (at === -1) body.push(`aliases: ${aliasList(merged)}`);
+      else {
+        // a multi-line list under aliases: is replaced by the one-line form
+        let end = at + 1;
+        while (end < body.length && /^\s*-\s+/.test(body[end]!)) end += 1;
+        body.splice(at, end - at, `aliases: ${aliasList(merged)}`);
+      }
+      text = `${lead}---\n${body.join("\n")}\n---\n${rest.slice(block[0].length)}`;
+    }
+  }
+  return `${text}${text.endsWith("\n") ? "" : "\n"}${lines}\n`;
+}

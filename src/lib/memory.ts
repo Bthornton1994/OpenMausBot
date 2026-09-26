@@ -118,8 +118,12 @@ export interface TidyReport {
 
 export interface CaptureReport {
   at: number;
+  /** Facts appended to MEMORY.md. */
   added: number;
-  suggested: number;
+  /** Facts filed into topic files. */
+  topics?: number;
+  /** Facts added to About me. */
+  aboutMe?: number;
   note?: string;
 }
 
@@ -129,8 +133,11 @@ export interface UpkeepStatus {
   modelSteps: boolean;
   lastTidy?: TidyReport;
   lastCapture?: CaptureReport;
-  /** About me suggestions from this bot still waiting for the person. */
-  pendingSuggestions?: number;
+}
+
+/** "3 facts" noticed last time, across MEMORY.md and topic files. */
+export function noticedCount(report: CaptureReport | undefined): number {
+  return report ? report.added + (report.topics ?? 0) : 0;
 }
 
 export function fetchUpkeepStatus(botId: string): Promise<UpkeepStatus> {

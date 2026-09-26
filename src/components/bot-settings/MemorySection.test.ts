@@ -147,7 +147,7 @@ describe("MemoryUpkeepCard", () => {
   it("explains the switch and hides the tidy button while off", () => {
     const markup = render(createElement(MemoryUpkeepCard, { enabled: false, status: null, tidying: false, onToggle: noop, onTidy: noop }));
     expect(markup).toContain("Memory upkeep");
-    expect(markup).toContain("nothing is added there without you");
+    expect(markup).toContain("you can remove any");
     expect(markup).not.toContain("Tidy up now");
   });
 
@@ -162,7 +162,7 @@ describe("MemoryUpkeepCard", () => {
     expect(markup).toContain("Tidy up now");
     expect(markup).toContain("archived 1 expired note, merged 2 duplicates");
     expect(markup).toContain("can't make the quick background model call");
-    const waiting = render(createElement(MemoryUpkeepCard, { enabled: true, status: { enabled: true, modelSteps: true, pendingSuggestions: 2 }, tidying: false, onToggle: noop, onTidy: noop }));
-    expect(waiting).toContain("2 suggestions about you waiting in Settings → General → About me.");
+    const noticed = render(createElement(MemoryUpkeepCard, { enabled: true, status: { enabled: true, modelSteps: true, lastCapture: { at: Date.now() - 60_000, added: 1, topics: 2, aboutMe: 1 } }, tidying: false, onToggle: noop, onTidy: noop }));
+    expect(noticed).toContain("Last noticed 3 facts");
   });
 });

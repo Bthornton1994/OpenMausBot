@@ -6,13 +6,14 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import { CaptureBuffer, capturePrompt, newCandidates, parseCandidates } from "./memory-capture.ts";
+import { CaptureBuffer, capturePrompt, newCandidates, parseCandidates, topicFileName } from "./memory-capture.ts";
+import { mergeTopicText, parseTopicHeader } from "./memory-topics.ts";
 import { flushMemoryJournal, readMemoryJournal } from "./memory-journal.ts";
 import { applyTidy, contradictionBudget, contradictionCandidates, parseContradictions, planTidy } from "./memory-tidy.ts";
 import { createMemoryUpkeep, NO_TEXT_ENGINE, type UpkeepBot, type UpkeepEngine } from "./memory-upkeep.ts";
 import { closeMessageDb } from "./message-db.ts";
-import { aboutMeLine, appendAboutMe, listProfileSuggestions, resolveProfileSuggestion, suggestProfileFacts } from "./profile-suggestions.ts";
-import { ensureWorkspace, readMemoryTopic, workspaceDir, writeMemoryFile, WORKSPACES_DIR } from "./workspace.ts";
+import { aboutMeLine, appendAboutMe, commitLearned, listLearnedFacts, planLearned, removeLearned } from "./profile-learned.ts";
+import { ensureWorkspace, readMemoryTopic, workspaceDir, writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
 
 const TODAY = "2026-09-25";
 
@@ -134,26 +135,48 @@ describe("tidy plan", () => {
   });
 });
 
-describe("About me suggestions", () => {
+describe("About me, learned on its own", () => {
   beforeEach(() => rmSync(DATA_DIR, { recursive: true, force: true }));
 
-  it("adds new facts once, skips what About me says, and remembers a dismissal", () => {
+  it("adds each new fact once, skips what About me says, and never re-adds a removed one", () => {
     const from = { botId: "b1", botName: "Scout" };
-    const added = suggestProfileFacts(from, ["Is vegetarian", "Lives in Pune", "Is vegetarian"], "- 2026-09-01 · learned by Scout · Lives in Pune");
-    expect(added.map((s) => s.text)).toEqual(["Is vegetarian"]);
-    expect(suggestProfileFacts(from, ["Is vegetarian"], "")).toEqual([]);
-    expect(resolveProfileSuggestion(added[0]!.id, "dismiss")?.text).toBe("Is vegetarian");
-    expect(listProfileSuggestions()).toEqual([]);
-    expect(suggestProfileFacts(from, ["Is vegetarian"], "")).toEqual([]);
-    expect(suggestProfileFacts(from, ["api_key: sk-abcdefghijklmnopqrstuvwxyz123456"], "")[0]?.text).not.toContain("sk-abcdefghijklmnop");
+    const planned = planLearned(from, ["Is vegetarian", "Lives in Pune", "Is vegetarian"], "- 2026-09-01 · learned by Scout · Lives in Pune", TODAY);
+    expect(planned.map((f) => f.line)).toEqual(["- 2026-09-25 · learned by Scout · Is vegetarian"]);
+    commitLearned(planned);
+    const aboutMe = appendAboutMe("I run a studio.", planned.map((f) => f.line))!;
+    expect(planLearned(from, ["Is vegetarian"], aboutMe, TODAY)).toEqual([]);
+    const removed = removeLearned(planned[0]!.id, aboutMe)!;
+    expect(removed.aboutMe).toBe("I run a studio.");
+    expect(listLearnedFacts()).toEqual([]);
+    expect(planLearned(from, ["Is vegetarian"], removed.aboutMe, TODAY)).toEqual([]);
+    expect(planLearned(from, ["api_key: sk-abcdefghijklmnopqrstuvwxyz123456"], "", TODAY)[0]?.text).not.toContain("sk-abcdefghijklmnop");
   });
 
   it("formats and bounds the About me line", () => {
-    const line = aboutMeLine({ id: "x", text: "Is vegetarian", botId: "b", botName: "Scout · Bot", at: 0 }, TODAY);
-    expect(line).toBe("- 2026-09-25 · learned by Scout - Bot · Is vegetarian");
-    expect(appendAboutMe("I run a studio.\n\n", line)).toBe(`I run a studio.\n${line}`);
-    expect(appendAboutMe("", line)).toBe(line);
-    expect(appendAboutMe("x".repeat(24_000), line)).toBeNull();
+    expect(aboutMeLine({ text: "Is vegetarian", botName: "Scout · Bot" }, TODAY)).toBe("- 2026-09-25 · learned by Scout - Bot · Is vegetarian");
+    expect(appendAboutMe("I run a studio.\n\n", ["- x"])).toBe("I run a studio.\n- x");
+    expect(appendAboutMe("", ["- x"])).toBe("- x");
+    expect(appendAboutMe("x".repeat(24_000), ["- y"])).toBeNull();
+  });
+});
+
+describe("topic files the bot keeps", () => {
+  it("names a topic safely and never as the archive", () => {
+    expect(topicFileName("Food & Drink")).toBe("food-drink.md");
+    expect(topicFileName("asha.md")).toBe("asha.md");
+    expect(topicFileName("archive")).toBeNull();
+    expect(topicFileName("../etc")).toBe("etc.md");
+    expect(topicFileName(42)).toBeNull();
+  });
+
+  it("creates a topic with a header, and merges new aliases into an existing one", () => {
+    const created = mergeTopicText(null, { title: "food", aliases: ["restaurants", "dinner"], lines: ["- 2026-09-25 · Loves pasta"] });
+    expect(created).toBe("---\ntitle: food\naliases: [restaurants, dinner]\n---\n\n- 2026-09-25 · Loves pasta\n");
+    const merged = mergeTopicText(created, { title: "food", aliases: ["Dinner", "lunch"], lines: ["- 2026-09-26 · Hates olives"] });
+    expect(parseTopicHeader(merged).aliases).toEqual(["restaurants", "dinner", "lunch"]);
+    expect(merged.endsWith("- 2026-09-25 · Loves pasta\n- 2026-09-26 · Hates olives\n")).toBe(true);
+    const handWritten = mergeTopicText("# Dining\n\n- Loves pasta\n", { title: "dining", aliases: ["food"], lines: ["- x"] });
+    expect(parseTopicHeader(handWritten)).toEqual({ title: "Dining", aliases: ["food"] });
   });
 });
 
@@ -164,13 +187,17 @@ describe("the upkeep loop", () => {
   let engine: UpkeepEngine | null;
   let busy: boolean;
   let clock: Date;
+  let aboutMeAdded: string[];
 
   const upkeep = () => createMemoryUpkeep({
     bots: () => [BOT],
     bot: (id) => (id === BOT.id ? BOT : undefined),
     engine: () => engine,
     busy: () => busy,
-    aboutMe: () => "",
+    addToAboutMe: (_from, texts) => {
+      aboutMeAdded.push(...texts);
+      return texts.length;
+    },
     sourceLabel: () => 'chat "Plans"',
     quietMs: () => 60_000,
     tidyHour: () => 3,
@@ -184,7 +211,8 @@ describe("the upkeep loop", () => {
     answers = [];
     prompts = [];
     busy = false;
-    BOT.memoryUpkeep = true;
+    aboutMeAdded = [];
+    BOT.memoryUpkeep = undefined;
     clock = new Date(2026, 8, 25, 10, 0);
     engine = {
       generateText: async (prompt) => {
@@ -196,37 +224,59 @@ describe("the upkeep loop", () => {
 
   const memory = () => readFileSync(join(workspaceDir(BOT.id), "MEMORY.md"), "utf8");
 
-  it("captures new facts as dated, sourced entries, journaled as upkeep, and suggests About me lines", async () => {
+  it("captures new facts as dated, sourced entries, journaled as upkeep, and adds About me lines", async () => {
     ensureWorkspace(BOT.id);
     answers.push(JSON.stringify([
       { text: "The person is vegetarian", kind: "preference", aboutUser: true, confidence: 0.9 },
       { text: "The person has exams this weekend", kind: "fact", until: "2026-09-27", confidence: 0.9 },
     ]));
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I'm vegetarian and I have exams this weekend", bot: "Good luck!" }] });
-    expect(report).toMatchObject({ added: 2, suggested: 1 });
+    expect(report).toMatchObject({ added: 2, topics: 0, aboutMe: 1 });
     expect(memory()).toContain('- 2026-09-25 · from chat "Plans" (noticed) · The person is vegetarian\n');
     expect(memory()).toContain("The person has exams this weekend · until 2026-09-27");
     await flushMemoryJournal(BOT.id);
     expect(readMemoryJournal(BOT.id, 5)[0]).toMatchObject({ actor: "upkeep", via: "capture", threadId: "t1", path: "MEMORY.md" });
-    expect(listProfileSuggestions().map((s) => s.text)).toEqual(["The person is vegetarian"]);
+    expect(aboutMeAdded).toEqual(["The person is vegetarian"]);
   });
 
-  it("suggests a fact the notebook already holds, without appending it again", async () => {
+  it("adds to About me a fact the notebook already holds, without appending it again", async () => {
     ensureWorkspace(BOT.id);
     writeMemoryFile(BOT.id, "- 2026-09-25 · The user's company is called Northwind Studio.\n");
     answers.push(JSON.stringify([{ text: "The user's company is Northwind Studio", kind: "fact", aboutUser: true, noted: true }]));
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "My company is Northwind Studio", bot: "Noted." }] });
-    expect(report).toMatchObject({ added: 0, suggested: 1 });
+    expect(report).toMatchObject({ added: 0, aboutMe: 1 });
     expect(memory().match(/Northwind/g)).toHaveLength(1);
   });
 
-  it("does not suggest About me lines from another person's message", async () => {
-    answers.push(JSON.stringify([{ text: "Is vegetarian", kind: "preference", aboutUser: true }]));
-    const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I'm vegetarian", bot: "ok", owner: false }] });
-    expect(report).toMatchObject({ added: 1, suggested: 0 });
+  it("files detail into a topic it creates, with other words for it", async () => {
+    ensureWorkspace(BOT.id);
+    answers.push(JSON.stringify([
+      { text: "The person loves pasta", kind: "preference", topic: "Food", topicAliases: ["restaurants", "dinner"] },
+      { text: "Sister Asha lives in Delhi", kind: "fact", topic: "family", topicAliases: ["sister", "asha"] },
+      { text: "The person is vegetarian", kind: "preference" },
+    ]));
+    const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I love pasta, I'm vegetarian, my sister Asha lives in Delhi", bot: "Noted." }] });
+    expect(report).toMatchObject({ added: 1, topics: 2 });
+    expect(memory()).toContain("The person is vegetarian");
+    expect(memory()).not.toContain("pasta");
+    const food = readMemoryTopic(BOT.id, "food.md")!;
+    expect(parseTopicHeader(food)).toEqual({ title: "food", aliases: ["restaurants", "dinner"] });
+    expect(food).toContain('from chat "Plans" (noticed) · The person loves pasta');
+    expect(readMemoryTopic(BOT.id, "family.md")).toContain("Sister Asha lives in Delhi");
+    // the same fact again adds nothing; a hand-made "Food.md" is reused by name
+    answers.push(JSON.stringify([{ text: "The person loves pasta", kind: "preference", topic: "food" }]));
+    expect((await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "pasta again", bot: "ok" }] })).topics).toBe(0);
+    await flushMemoryJournal(BOT.id);
+    expect(readMemoryJournal(BOT.id, 10).filter((row) => row.via === "capture").map((row) => row.path).sort()).toEqual(["MEMORY.md", "memory/family.md", "memory/food.md"]);
   });
 
-  it("does nothing when the switch is off, and says so on an engine without a text call", async () => {
+  it("does not add About me lines from another person's message", async () => {
+    answers.push(JSON.stringify([{ text: "Is vegetarian", kind: "preference", aboutUser: true }]));
+    const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I'm vegetarian", bot: "ok", owner: false }] });
+    expect(report).toMatchObject({ added: 1, aboutMe: 0 });
+  });
+
+  it("is on by default, does nothing when switched off, and says so on an engine without a text call", async () => {
     BOT.memoryUpkeep = false;
     expect((await upkeep().capture({ botId: BOT.id, threadId: "t", turns: [{ person: "x", bot: "y" }] })).note).toBe("upkeep is off");
     BOT.memoryUpkeep = true;
@@ -263,6 +313,17 @@ describe("the upkeep loop", () => {
     expect(rows.filter((row) => row.actor === "upkeep" && row.via === "tidy").map((row) => row.path)).toEqual(["MEMORY.md", "memory/archive.md"]);
     // newest first: undoing the top row puts MEMORY.md back, and the archive keeps its copy
     expect(rows[0]!.path).toBe("MEMORY.md");
+  });
+
+  it("tidies topic files too: expired lines to the archive, duplicates merged", async () => {
+    ensureWorkspace(BOT.id);
+    writeMemoryTopic(BOT.id, "travel.md", "---\ntitle: travel\n---\n\n- 2026-09-01 · In Goa · until 2026-09-07\n- 2026-09-02 · Likes window seats\n- 2026-09-03 · Likes window seats\n");
+    const report = await upkeep().tidy(BOT.id);
+    expect(report).toMatchObject({ expired: 1, duplicates: 1 });
+    const travel = readMemoryTopic(BOT.id, "travel.md")!;
+    expect(travel).not.toContain("In Goa");
+    expect(travel.match(/window seats/g)).toHaveLength(1);
+    expect(readMemoryTopic(BOT.id, "archive.md")).toContain("In Goa · until 2026-09-07 · expired 2026-09-25");
   });
 
   it("skips the model step on small notebooks and on engines without a text call", async () => {
