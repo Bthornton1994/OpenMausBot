@@ -80,6 +80,9 @@ describe("topic headers and the index", () => {
     });
     expect(parseTopicHeader("---\naliases:\n  - food\n  - lunch\ntags: dining\n---\n").aliases).toEqual(["food", "lunch", "dining"]);
     expect(parseTopicHeader("no frontmatter here")).toEqual({ aliases: [] });
+    // the panel's old new-topic text put a heading first
+    expect(parseTopicHeader("# Dining\n\n---\naliases: [Bhel, Irani Cafe]\n---\n- Loves pasta\n")).toEqual({ title: "Dining", aliases: ["Bhel", "Irani Cafe"] });
+    expect(parseTopicHeader("# Dining\n\n- Loves pasta\n")).toEqual({ title: "Dining", aliases: [] });
   });
 
   it("lists topics by name, the archive last, and caps the list", () => {
@@ -123,10 +126,10 @@ describe("memory with until dates and topics, on disk", () => {
     writeMemoryTopic(BOT, "dining.md", "---\ntitle: Dining\naliases: [food, lunch, restaurants]\n---\n- Loves pasta\n");
     writeFileSync(join(WORKSPACES_DIR, BOT, "memory", "notes.md"), "plain topic\n");
     const prompt = memorySystemPrompt(BOT, { managedWrites: true, fileTools: true });
-    expect(prompt).toContain("Your topic notes (not loaded; read one with your file tools when it is relevant):");
+    expect(prompt).toContain("Your topic notes (not loaded; when a request touches one of these topics, read that file with your file tools before you answer):");
     expect(prompt).toContain("- memory/dining.md — Dining (also: food, lunch, restaurants)");
     expect(prompt).toContain("- memory/notes.md");
-    expect(memorySystemPrompt(BOT, { fileTools: false })).toContain("find what is in them with session_search");
+    expect(memorySystemPrompt(BOT, { fileTools: false })).toContain("look it up with session_search before you answer");
     expect(searchMemoryFiles(BOT, "restaurants").map((hit) => hit.file)).toContain("memory/dining.md");
   });
 });

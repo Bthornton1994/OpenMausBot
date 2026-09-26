@@ -10,7 +10,9 @@
 // content; passages are numbered and dated; fence markers inside a passage
 // are neutralised so a note cannot close the block; the block is capped.
 import { recallMessages, recallTerms, type MemoryHit, type RecallHit } from "./message-db.ts";
-import { searchMemoryFiles } from "./workspace.ts";
+import { parseTopicHeader, readTopicHead, topicBody, topicWords } from "./memory-topics.ts";
+import { listMemoryTopics, readMemoryTopic, searchMemoryFiles, workspaceDir } from "./workspace.ts";
+import { join } from "node:path";
 
 /** Below this many characters a message is a nod, not a question. */
 export const RECALL_MIN_CHARS = 8;
@@ -113,6 +115,41 @@ export interface RecallInput {
   author: (hit: RecallHit) => string;
 }
 
+const TOPIC_PASSAGE_CHARS = 600;
+
+/** Whether a message word and a topic word are the same word, allowing an
+ * ending ("restaurant"/"restaurants", "dine"/"dining" do not; "cafe"/"cafes" do). */
+function sameWord(term: string, word: string): boolean {
+  if (term === word) return true;
+  if (!/^\p{L}{4,}$/u.test(term) || word.length < 4) return false;
+  const stem = term.length > 4 && term.endsWith("s") && !term.endsWith("ss") ? term.slice(0, -1) : term;
+  return word.startsWith(stem) || (stem.startsWith(word) && stem.length - word.length <= 3);
+}
+
+/** Topics whose name, title, description or aliases share a word with the
+ * message: the alias mechanism, matched directly rather than through the
+ * full-text index, so a topic answers to what it is called. */
+export function topicPassages(botId: string, query: string): RecallPassage[] {
+  const terms = recallTerms(query);
+  if (!terms.length) return [];
+  const dir = join(workspaceDir(botId), "memory");
+  const out: RecallPassage[] = [];
+  try {
+    for (const topic of listMemoryTopics(botId)) {
+      if (topic.name === "archive.md") continue;
+      const words = topicWords(topic.name, parseTopicHeader(readTopicHead(join(dir, topic.name))));
+      if (!terms.some((term) => words.some((word) => sameWord(term, word)))) continue;
+      const body = topicBody(readMemoryTopic(botId, topic.name) ?? "");
+      if (!body) continue;
+      out.push({ source: "memory", label: `memory/${topic.name}`, snippet: body.length > TOPIC_PASSAGE_CHARS ? `${body.slice(0, TOPIC_PASSAGE_CHARS)}…` : body });
+      if (out.length >= MEMORY_HITS) break;
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
 export function memoryPassages(botId: string, query: string): RecallPassage[] {
   let hits: MemoryHit[] = [];
   try {
@@ -149,5 +186,8 @@ export function conversationPassages(input: RecallInput, query: string): RecallP
 export function buildRecall(input: RecallInput): RecallResult | null {
   const query = recallQuery(input.message);
   if (!query) return null;
-  return renderRecall([...memoryPassages(input.botId, query), ...conversationPassages(input, query)]);
+  const topics = topicPassages(input.botId, query);
+  const named = new Set(topics.map((passage) => passage.label));
+  const notes = [...topics, ...memoryPassages(input.botId, query).filter((passage) => !named.has(passage.label))].slice(0, MEMORY_HITS);
+  return renderRecall([...notes, ...conversationPassages(input, query)]);
 }

@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import { closeMessageDb, recallMatchTerm, recallTerms } from "./message-db.ts";
-import { buildRecall, enoughMatches, memoryPassages, RECALL_CLOSE, RECALL_OPEN, recallQuery, renderRecall } from "./recall.ts";
+import { buildRecall, enoughMatches, memoryPassages, RECALL_CLOSE, RECALL_OPEN, recallQuery, renderRecall, topicPassages } from "./recall.ts";
 import { appendMemoryLog, writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
 
 const BOT = "bot-recall-test";
@@ -80,6 +80,17 @@ describe("recall from memory files", () => {
     expect(recallMatchTerm("tea")).toBe('"tea"');
     writeMemoryTopic(BOT, "dining.md", "---\naliases: [food, restaurants]\n---\n- Loves pasta\n");
     expect(memoryPassages(BOT, "suggest a restaurant for tonight").map((p) => p.label)).toEqual(["memory/dining.md"]);
+  });
+
+  it("recalls a topic by its name, title or alias even when its text never says the word", () => {
+    writeMemoryTopic(BOT, "Dining.md", "# Dining\n\n---\naliases: [Bhel, Irani Cafe]\n---\n- Loves pasta\n");
+    writeMemoryTopic(BOT, "family.md", "---\ntitle: Family\n---\n- Sister Asha lives in Delhi\n");
+    expect(topicPassages(BOT, "any good dining spots tonight?").map((p) => p.snippet)).toEqual(["- Loves pasta"]);
+    expect(topicPassages(BOT, "where can I get bhel?").map((p) => p.label)).toEqual(["memory/Dining.md"]);
+    expect(topicPassages(BOT, "an Irani cafe nearby").map((p) => p.label)).toEqual(["memory/Dining.md"]);
+    expect(topicPassages(BOT, "is my family visiting?").map((p) => p.label)).toEqual(["memory/family.md"]);
+    // word matching has a limit: nothing here says "restaurant"
+    expect(topicPassages(BOT, "suggest a restaurant")).toEqual([]);
   });
 
   it("never recalls a daily log, which repeats what was just said", () => {

@@ -636,6 +636,8 @@ export function memorySystemPrompt(botId: string, opts: { managedWrites?: boolea
 function topicIndexBlock(botId: string, fileTools: boolean): string {
   const index = memoryTopicIndex(botId);
   if (!index) return "";
-  const how = fileTools ? "read one with your file tools when it is relevant" : "find what is in them with session_search";
+  const how = fileTools
+    ? "when a request touches one of these topics, read that file with your file tools before you answer"
+    : "when a request touches one of these topics, look it up with session_search before you answer";
   return `\n\nYour topic notes (not loaded; ${how}):\n${index}`;
 }

@@ -175,7 +175,7 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
     }
     setNewTopic("");
     await open(`memory/${name}`);
-    setEditing((current) => (current ? { ...current, dirty: true, text: current.text || `# ${name.replace(/\.md$/, "")}\n\n` } : current));
+    setEditing((current) => (current ? { ...current, dirty: true, text: current.text || topicTemplate(name) } : current));
   };
 
   const revert = async (row: MemoryJournalRow) => {
@@ -378,6 +378,13 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
       {error && <div className="text-[12.5px] text-danger">{error}</div>}
     </div>
   );
+}
+
+/** A new topic's starting text: the header the topic index and recall read,
+ * so the other words a person would use for it are one line to fill in. */
+export function topicTemplate(fileName: string): string {
+  const title = fileName.replace(/\.md$/, "");
+  return `---\ntitle: ${title}\ndescription: \naliases: []\n---\n\n`;
 }
 
 // ── presentational pieces (tested through renderToStaticMarkup) ─────────

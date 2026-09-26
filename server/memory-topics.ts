@@ -26,8 +26,16 @@ function unquote(value: string): string {
  * reads as an empty header — a hand-written topic is still listed by name. */
 export function parseTopicHeader(text: string): TopicHeader {
   const header: TopicHeader = { aliases: [] };
-  const m = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
-  if (!m) return header;
+  // People write a "# Title" first and the block under it (the panel's own
+  // new-topic text used to), so a heading and blank lines may come before the
+  // block; the heading is the title when the block names none.
+  const lead = /^(?:\s*\r?\n|#{1,6}[ \t]+[^\r\n]*\r?\n)*/.exec(text)?.[0] ?? "";
+  const heading = /^#{1,6}[ \t]+([^\r\n]+)/m.exec(lead)?.[1]?.trim();
+  const m = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text.slice(lead.length));
+  if (!m) {
+    if (heading) header.title = heading.slice(0, 160);
+    return header;
+  }
   const lines = m[1].split(/\r?\n/);
   for (let i = 0; i < lines.length; i += 1) {
     const field = /^(title|description|aliases|tags)\s*:\s*(.*)$/.exec(lines[i]);
@@ -51,7 +59,22 @@ export function parseTopicHeader(text: string): TopicHeader {
     }
   }
   header.aliases = header.aliases.slice(0, 12);
+  if (!header.title && heading) header.title = heading.slice(0, 160);
   return header;
+}
+
+/** The words a topic answers to: its file name, title, description and
+ * aliases, lower-cased, for matching a message against without a search. */
+export function topicWords(name: string, header: TopicHeader): string[] {
+  const text = [name.replace(/\.md$/i, "").replace(/[-_.]+/g, " "), header.title ?? "", header.description ?? "", ...header.aliases].join(" ");
+  return [...new Set(text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 3))];
+}
+
+/** A topic's text without its header block, for a recalled passage. */
+export function topicBody(text: string): string {
+  const lead = /^(?:\s*\r?\n|#{1,6}[ \t]+[^\r\n]*\r?\n)*/.exec(text)?.[0] ?? "";
+  const rest = text.slice(lead.length).replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "");
+  return rest.trim();
 }
 
 export function readTopicHead(path: string): string {
