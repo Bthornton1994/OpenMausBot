@@ -87,8 +87,7 @@ through `session_search`, which discloses it. `features.autoRecall: false` in
 off. It keeps the notes in shape without the bot having to decide to:
 
 - **Noticing facts.** When a 1:1 chat has been quiet for two minutes
-  (`memory.captureQuietMs`), or after six turns, or just before a long chat is
-  compacted, one quick model call reads those turns — the person's words and
+  (`memory.captureQuietMs`), or after six turns, one quick model call reads those turns — the person's words and
   the bot's under different rules — beside `MEMORY.md` and the list of topic
   files, and files what is new:
   - a core fact the bot needs in every conversation goes to `MEMORY.md`,

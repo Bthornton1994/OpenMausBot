@@ -108,9 +108,9 @@ MEMORY.md, and returns up to 8 JSON candidates `{text, kind, until?, aboutUser?,
 Candidates are deduplicated against the notebook with the exact identity
 rule, appended through `updateMemory` with source `chat "Title" (noticed)`,
 and journaled with `recordMemoryChange(actor: "upkeep", via: "capture")`.
-Over-budget appends stop and are left for the tidy-up. A compaction flushes
-that thread's buffer first, so facts in the folded part are captured before
-they are summarised away.
+Over-budget appends stop and are left for the tidy-up. The buffer holds the
+turns' own text, so a compaction folding the transcript loses nothing from it
+(an earlier draft flushed at compaction; it only raced the summary call).
 
 ### Topic files (`server/memory-topics.ts` `mergeTopicText`)
 

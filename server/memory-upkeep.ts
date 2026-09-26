@@ -144,7 +144,7 @@ export const NO_TEXT_ENGINE = "This bot's engine cannot make the quick backgroun
 export interface MemoryUpkeep {
   /** A finished 1:1 turn of an upkeep bot, for capture. */
   noteTurn(botId: string, threadId: string, turn: CaptureTurn): void;
-  /** Capture a thread's waiting turns now (before a compaction). */
+  /** Capture a thread's waiting turns now, without waiting for the quiet spell. */
   flushThread(threadId: string): void;
   /** Forget a bot's waiting turns (switch turned off, bot deleted). */
   dropBot(botId: string): void;
