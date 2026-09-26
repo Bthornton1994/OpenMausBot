@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { DATA_DIR } from "./config.ts";
 import { CaptureBuffer, capturePrompt, newCandidates, parseCandidates, topicFileName } from "./memory-capture.ts";
 import { mergeTopicText, parseTopicHeader } from "./memory-topics.ts";
+import { applyMoves, organizeCandidates, ORGANIZE_MARKER, parseMoves } from "./memory-organize.ts";
 import { flushMemoryJournal, readMemoryJournal } from "./memory-journal.ts";
 import { applyTidy, contradictionBudget, contradictionCandidates, parseContradictions, planTidy } from "./memory-tidy.ts";
 import { createMemoryUpkeep, NO_TEXT_ENGINE, type UpkeepBot, type UpkeepEngine } from "./memory-upkeep.ts";
@@ -160,6 +161,19 @@ describe("About me, learned on its own", () => {
   });
 });
 
+describe("organizing MEMORY.md", () => {
+  it("parses moves defensively and never moves the same line twice", () => {
+    const text = "- 2026-09-26 · A\n- 2026-09-26 · B\n- 2026-09-20 · Trip · until 2026-09-21\n";
+    const candidates = organizeCandidates(text, TODAY, new Set(["A"]));
+    expect(candidates.map((e) => e.body)).toEqual(["B"]);
+    expect(parseMoves('{"moves":[{"i":0,"topic":"x"},{"i":0,"topic":"y"},{"i":5,"topic":"z"},{"i":0}]}', candidates).map((m) => m.topic)).toEqual(["x.md"]);
+    expect(parseMoves("nonsense", candidates)).toEqual([]);
+    const { text: left, byTopic } = applyMoves(text, parseMoves('{"moves":[{"i":0,"topic":"x","aliases":["q"]}]}', candidates));
+    expect(left).toBe("- 2026-09-26 · A\n- 2026-09-20 · Trip · until 2026-09-21\n");
+    expect(byTopic.get("x.md")).toEqual({ lines: ["- 2026-09-26 · B"], aliases: ["q"] });
+  });
+});
+
 describe("topic files the bot keeps", () => {
   it("names a topic safely and never as the archive", () => {
     expect(topicFileName("Food & Drink")).toBe("food-drink.md");
@@ -188,6 +202,8 @@ describe("the upkeep loop", () => {
   let busy: boolean;
   let clock: Date;
   let aboutMeAdded: string[];
+  let organizeAnswer: string;
+  let organizePrompts: string[];
 
   const upkeep = () => createMemoryUpkeep({
     bots: () => [BOT],
@@ -214,8 +230,15 @@ describe("the upkeep loop", () => {
     aboutMeAdded = [];
     BOT.memoryUpkeep = undefined;
     clock = new Date(2026, 8, 25, 10, 0);
+    organizeAnswer = '{"moves": []}';
+    organizePrompts = [];
     engine = {
       generateText: async (prompt) => {
+        // the organize step has its own answer, so scripted answers stay in order
+        if (prompt.includes(ORGANIZE_MARKER)) {
+          organizePrompts.push(prompt);
+          return organizeAnswer;
+        }
         prompts.push(prompt);
         return answers.shift() ?? "[]";
       },
@@ -313,6 +336,45 @@ describe("the upkeep loop", () => {
     expect(rows.filter((row) => row.actor === "upkeep" && row.via === "tidy").map((row) => row.path)).toEqual(["MEMORY.md", "memory/archive.md"]);
     // newest first: undoing the top row puts MEMORY.md back, and the archive keeps its copy
     expect(rows[0]!.path).toBe("MEMORY.md");
+  });
+
+  it("moves detail the bot wrote itself out of MEMORY.md into topics, keeping core facts", async () => {
+    ensureWorkspace(BOT.id);
+    writeMemoryFile(BOT.id, [
+      "- 2026-09-26 · from chat \"Food\" · The user is allergic to peanuts.",
+      "- 2026-09-26 · from chat \"Food\" · The user's sister Asha is a doctor in Delhi.",
+      "- 2026-09-26 · from chat \"Food\" · The user loves Irani cafes.",
+      "",
+    ].join("\n"));
+    writeMemoryTopic(BOT.id, "Dining.md", "# Dining\n\n- Loves pasta\n");
+    organizeAnswer = '{"moves":[{"i":1,"topic":"Asha","aliases":["sister","family"]},{"i":2,"topic":"dining","aliases":["restaurants"]}]}';
+    const report = await upkeep().tidy(BOT.id);
+    expect(report.organized).toBe(2);
+    expect(organizePrompts[0]).toContain("[0] The user is allergic to peanuts.");
+    expect(memory()).toBe("- 2026-09-26 · from chat \"Food\" · The user is allergic to peanuts.\n");
+    const asha = readMemoryTopic(BOT.id, "asha.md")!;
+    expect(parseTopicHeader(asha)).toEqual({ title: "asha", aliases: ["sister", "family"] });
+    expect(asha).toContain('- 2026-09-26 · from chat "Food" · The user\'s sister Asha is a doctor in Delhi.');
+    const dining = readMemoryTopic(BOT.id, "Dining.md")!;
+    expect(parseTopicHeader(dining).aliases).toEqual(["restaurants"]);
+    expect(dining).toContain("The user loves Irani cafes.");
+    // the core line was judged once and is not asked about again
+    organizePrompts = [];
+    await upkeep().tidy(BOT.id);
+    expect(organizePrompts).toEqual([]);
+    await flushMemoryJournal(BOT.id);
+    const rows = readMemoryJournal(BOT.id, 10).filter((row) => row.via === "organize");
+    expect(rows[0]!.path).toBe("MEMORY.md");
+    expect(rows.map((row) => row.path).sort()).toEqual(["MEMORY.md", "memory/Dining.md", "memory/asha.md"]);
+  });
+
+  it("organizes right after a capture, whoever wrote the line", async () => {
+    ensureWorkspace(BOT.id);
+    writeMemoryFile(BOT.id, "- 2026-09-26 · The client Acme wants logo revisions.\n");
+    organizeAnswer = '{"moves":[{"i":0,"topic":"acme","aliases":["client"]}]}';
+    const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "hi", bot: "hello" }] });
+    expect(report.organized).toBe(1);
+    expect(readMemoryTopic(BOT.id, "acme.md")).toContain("The client Acme wants logo revisions.");
   });
 
   it("tidies topic files too: expired lines to the archive, duplicates merged", async () => {

@@ -208,7 +208,7 @@ if (argAfter("--output-format") === "text") {
   });
   // Memory upkeep's background one-shots (on for every bot) never overwrite
   // the shared turn dump a test reads; FAKE_CLAUDE_TEXT_DUMP still records them.
-  const upkeepCall = /You are the (?:CAPTURE|TIDY) step of a memory system/.test(prompt);
+  const upkeepCall = /You are the (?:CAPTURE|TIDY|ORGANIZE) step of a memory system/.test(prompt);
   const oneShotDump = process.env.FAKE_CLAUDE_TEXT_DUMP ?? (upkeepCall ? undefined : process.env.FAKE_CLAUDE_DUMP);
   if (oneShotDump) {
     writeFileSync(

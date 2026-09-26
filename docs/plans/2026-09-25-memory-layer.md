@@ -215,3 +215,14 @@ and Undo restored the file.
   (Dining gained "restaurants"). Negative replay still `[]`.
 - **M7 — undo after a tidy-up must not lose a line.** The archive is written
   before the file the line left, so the newest row is that file.
+- **M8 — organize whatever lands in MEMORY.md.** Hand test: the bot saved
+  "sister Asha is a doctor in Delhi" itself with memory_update, so capture
+  (correctly) added nothing and no topic appeared. New `server/memory-organize.ts`:
+  after each capture and in the tidy-up, one call over MEMORY.md lines not
+  judged before moves detail into topic files (line unchanged, topics written
+  first). Replayed on the hand-test notebook against claude-haiku-4-5: the
+  first wording moved "vegetarian" and "allergic to peanuts" out of the core
+  (1 of 3 runs); with core spelled out (name, home, company, diet, allergies,
+  health, reply style) and "when in doubt, keep", 4/4 kept every core line and
+  moved Asha → asha, food → Dining, the Goa trip → travel, the codename → a
+  project topic.

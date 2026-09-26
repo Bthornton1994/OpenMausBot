@@ -100,6 +100,16 @@ off. It keeps the notes in shape without the bot having to decide to:
   A fact that ends on a known day gets its `until` date; a birthday or other
   yearly date never does. Turns started by another bot or by the harness,
   rooms and failed turns are never read.
+- **Organizing.** Whoever wrote a line in `MEMORY.md` — the bot with
+  `memory_update`, the person, or capture — after each capture and in the
+  nightly tidy-up one quick model call looks at lines not judged before and
+  moves the ones that are detail about a subject (another person, a project
+  or client, a trip, likes in one domain) into that subject's topic file,
+  unchanged, creating it with a header and other words for it. Core facts —
+  the person's name, where they live, their company, diet, allergies and
+  health needs, how they like replies — always stay; a line judged core is
+  not asked about again. At most 20 lines move in one pass; each file's change
+  is a journal row (*filed into topics*) that can be undone.
 - **About me.** A lasting fact about the person, taken from their own words,
   is added to **Settings → General → About me**, which every bot reads, as a
   dated line `- 2026-09-25 · learned by Scout · …`. **Added by your bots**

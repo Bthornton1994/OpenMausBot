@@ -21,8 +21,9 @@ import { join } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { CaptureBuffer, capturePrompt, newCandidates, parseCandidates, type Candidate, type CaptureBatch, type CaptureTurn } from "./memory-capture.ts";
-import { factIdentity, notebookIdentities } from "./memory-entries.ts";
+import { factIdentity, lineFactIdentity, notebookIdentities } from "./memory-entries.ts";
 import { mergeTopicText } from "./memory-topics.ts";
+import { applyMoves, organizeCandidates, organizePrompt, parseMoves } from "./memory-organize.ts";
 import { recordMemoryChange } from "./memory-journal.ts";
 import { applyTidy, contradictionCandidates, contradictionPrompt, parseContradictions, planChanges, planTidy, type Contradiction } from "./memory-tidy.ts";
 import { ensureWorkspace, listMemoryTopics, memoryDate, memoryEntry, memoryTopicIndex, updateMemory, workspaceDir, writeMemoryFile, writeMemoryTopic } from "./workspace.ts";
@@ -74,6 +75,8 @@ export interface TidyReport {
   duplicates: number;
   superseded: number;
   deferred: number;
+  /** MEMORY.md entries moved into topic files. */
+  organized?: number;
   /** Whether the contradiction step ran (needs a text engine and five entries). */
   contradictionsChecked: boolean;
   /** Why it did not run, in the person's words. */
@@ -88,12 +91,17 @@ export interface CaptureReport {
   topics: number;
   /** Facts added to the shared About me. */
   aboutMe: number;
+  /** MEMORY.md entries moved into topic files afterwards. */
+  organized?: number;
   note?: string;
 }
 
 interface UpkeepState {
-  bots: Record<string, { lastTidy?: TidyReport; lastCapture?: CaptureReport }>;
+  bots: Record<string, { lastTidy?: TidyReport; lastCapture?: CaptureReport; core?: string[] }>;
 }
+
+/** How many "this entry is core" judgements are remembered per bot. */
+const MAX_CORE = 500;
 
 function statePath(): string {
   return join(DATA_DIR, "memory-upkeep.json");
@@ -267,7 +275,10 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     // own memory, and About me is where every other bot learns it.
     const owner = batch.turns.every((turn) => turn.owner !== false);
     const aboutMe = owner ? deps.addToAboutMe({ botId: bot.id, botName: bot.name }, parsed.filter((c) => c.aboutUser).map((c) => c.text)) : 0;
-    const report: CaptureReport = { at, added, topics, aboutMe, ...(full ? { note: "MEMORY.md is full; the tidy-up or a person needs to make room." } : {}) };
+    // whoever wrote MEMORY.md — the bot, the person or this capture — detail
+    // that is not core moves to its topic now, not only at night
+    const organized = await organize(bot.id);
+    const report: CaptureReport = { at, added, topics, aboutMe, organized, ...(full ? { note: "MEMORY.md is full; the tidy-up or a person needs to make room." } : {}) };
     record(bot.id, { lastCapture: report });
     if (added || topics || aboutMe) log(`memory upkeep: noticed ${added} fact(s) for MEMORY.md, ${topics} for topic files and ${aboutMe} for About me — ${bot.name} (${bot.id}) from ${batch.threadId}`);
     return report;
@@ -285,6 +296,51 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     },
   });
 
+  /** Move MEMORY.md entries that are not core into their topic files. One
+   * model call over entries not judged before; lines move unchanged, topics
+   * first so undoing the newest row (MEMORY.md) never loses one. */
+  async function organize(botId: string): Promise<number> {
+    const engine = deps.engine(botId);
+    if (!engine?.generateText) return 0;
+    const today = memoryDate(now());
+    const state = loadState();
+    const core = new Set(state.bots[botId]?.core ?? []);
+    const first = readRaw(botId, "MEMORY.md") ?? "";
+    const candidates = organizeCandidates(first, today, core);
+    if (!candidates.length) return 0;
+    const answer = await askModel(engine, organizePrompt(candidates, memoryTopicIndex(botId)));
+    if (answer === null || paused || !upkeepEnabled(deps.bot(botId))) return 0;
+    // the line numbers are the file's as read; a write since means ask again later
+    const before = readRaw(botId, "MEMORY.md") ?? "";
+    if (before !== first) return 0;
+    const moves = parseMoves(answer, candidates);
+    const moved = new Set(moves.map((move) => move.entry.line));
+    const judgedCore = candidates.filter((entry) => !moved.has(entry.line)).map((entry) => factIdentity(entry.body));
+    const saved = loadState();
+    saved.bots[botId] = { ...saved.bots[botId], core: [...new Set([...(saved.bots[botId]?.core ?? []), ...judgedCore])].slice(-MAX_CORE) };
+    saveState(saved);
+    if (!moves.length) return 0;
+    const { text, byTopic } = applyMoves(before, moves);
+    const existing = new Map(listMemoryTopics(botId).map((topic) => [topic.name.toLowerCase(), topic.name]));
+    let count = 0;
+    for (const [wanted, group] of byTopic) {
+      const name = existing.get(wanted) ?? wanted;
+      const path = `memory/${name}`;
+      const current = readRaw(botId, path);
+      const seen = notebookIdentities(current ?? "");
+      const lines = group.lines.filter((line) => !seen.has(lineFactIdentity(line)));
+      count += group.lines.length;
+      if (!lines.length) continue;
+      writeMemoryTopic(botId, name, mergeTopicText(current, { title: name.replace(/\.md$/, "").replace(/-/g, " "), aliases: group.aliases, lines }));
+      recordMemoryChange(botId, { path, actor: "upkeep", via: "organize", before: current, after: readRaw(botId, path) });
+      existing.set(name.toLowerCase(), name);
+    }
+    writeMemoryFile(botId, text);
+    recordMemoryChange(botId, { path: "MEMORY.md", actor: "upkeep", via: "organize", before, after: readRaw(botId, "MEMORY.md") });
+    log(`memory upkeep: moved ${count} entr${count === 1 ? "y" : "ies"} from MEMORY.md into topic files for ${deps.bot(botId)?.name ?? botId}`);
+    return count;
+  }
+
   function appendArchive(botId: string, archived: readonly string[]): void {
     const archivePath = `memory/${ARCHIVE_TOPIC}`;
     const archiveBefore = readRaw(botId, archivePath);
@@ -298,6 +354,7 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     const at = now().getTime();
     const today = memoryDate(now());
     ensureWorkspace(botId);
+    const organized = await organize(botId);
     const first = readRaw(botId, "MEMORY.md") ?? "";
     const engine = deps.engine(botId);
     const candidates = contradictionCandidates(first, today);
@@ -357,11 +414,12 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
       duplicates: plan.duplicates.length + topicDuplicates,
       superseded: plan.superseded.length,
       deferred: plan.deferred,
+      ...(organized ? { organized } : {}),
       contradictionsChecked,
       ...(note ? { note } : {}),
     };
     record(botId, { lastTidy: report });
-    if (report.expired || report.duplicates || report.superseded) log(`memory upkeep: tidied ${bot?.name ?? botId} — ${report.expired} expired, ${report.duplicates} duplicate(s), ${report.superseded} contradicted`);
+    if (report.expired || report.duplicates || report.superseded || organized) log(`memory upkeep: tidied ${bot?.name ?? botId} — ${report.expired} expired, ${report.duplicates} duplicate(s), ${report.superseded} contradicted`);
     return report;
   }
 
