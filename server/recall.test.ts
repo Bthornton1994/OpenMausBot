@@ -15,6 +15,11 @@ describe("recall terms and query", () => {
     expect(recallTerms("What is my balance, -10 or 10? Do you remember C++ v2.1!")).toEqual(["balance", "-10", "10", "c++", "v2.1"]);
   });
 
+  it("drops greetings, so a hello never recalls a bot's own greeting", () => {
+    expect(recallTerms("Hi! Quick intro: I'm Omkar")).toEqual(["intro", "omkar"]);
+    expect(recallQuery("hello there, thanks!")).toBeNull();
+  });
+
   it("does not search a nod or a message with only filler", () => {
     expect(recallQuery("ok")).toBeNull();
     expect(recallQuery("can you tell me about it?")).toBeNull();

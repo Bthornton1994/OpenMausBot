@@ -607,7 +607,7 @@ export type SearchMode = "all" | "any";
 
 /** Words that go at the end of a question and say nothing about its topic. */
 const RECALL_FILLER = new Set(
-  "about again also any anything can could does don't know me my please remember remind should tell there they us would".split(" "),
+  "about again also any anything can could does don't know me my please remember remind should tell there they us would hi hello hey thanks thank ok okay yes yeah no i'm im i've i'll i'd you're quick just".split(" "),
 );
 
 /** The content words of a message, for an any-term recall: lower-cased,
