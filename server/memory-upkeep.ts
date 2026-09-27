@@ -462,8 +462,9 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     capture: (batch) => track(capture(batch)),
     tidy,
     status(botId) {
-      const saved = loadState().bots[botId] ?? {};
-      return { ...saved, modelSteps: Boolean(deps.engine(botId)?.generateText) };
+      // the core judgements are upkeep's own bookkeeping, not status
+      const { lastTidy, lastCapture } = loadState().bots[botId] ?? {};
+      return { ...(lastTidy ? { lastTidy } : {}), ...(lastCapture ? { lastCapture } : {}), modelSteps: Boolean(deps.engine(botId)?.generateText) };
     },
     tick,
     start() {
