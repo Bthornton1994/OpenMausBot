@@ -10,14 +10,16 @@ Cloud authentication is optional; its failure never blocks free local use.
 The installed desktop uses only `https://cloud.openmausbot.com`. The renderer
 cannot supply an origin, callback URL, account credential, checkout URL or Pro
 flag. Explicitly injected HTTP loopback is available only to isolated fixtures.
+These endpoints belong to the remote Cloud service, not the local app server.
 
-- `POST /api/cloud/desktop/authorize` accepts `deviceName`, `platform` and
-  optional `appVersion`. It returns `cloudContractVersion: 1`, a private
+- `POST https://cloud.openmausbot.com/api/cloud/desktop/authorize` accepts
+  `deviceName`, `platform` and optional `appVersion`. It returns `cloudContractVersion: 1`, a private
   `deviceCode`, a display `userCode`, `expiresIn` (at most 600 seconds),
   `interval` (5–60 seconds), and the exact same-origin browser destination
   `/cloud/desktop?code=<userCode>`.
 - The browser completes email-code authentication and explicit device approval.
-  Electron polls `POST /api/cloud/desktop/token` with the private device code.
+  Electron polls `POST https://cloud.openmausbot.com/api/cloud/desktop/token`
+  with the private device code.
   A successful response has `cloudContractVersion: 1`, `accessToken` (`omc_`
   plus 43 base64url characters), `expiresAt`, `device: {id}` and
   `account: {id,email}`. Pending/slow-down/denied/expired replies follow the
@@ -25,7 +27,8 @@ flag. Explicitly injected HTTP loopback is available only to isolated fixtures.
 - Electron persists only the credential and identity in a separate OS-encrypted
   `cloud-account.bin`. It never persists Pro, writes the local workspace config,
   or sends this token to renderer JavaScript, organization services or engines.
-- `GET /api/cloud/desktop/session` with the bearer returns the same identity,
+- `GET https://cloud.openmausbot.com/api/cloud/desktop/session` with the bearer
+  returns the same identity,
   contract version and expiry, plus
   `entitlement: {plan: "free" | "pro", status: "active" | "inactive",
   expiresAt: number | null, version: number}`. Timestamps are integer Unix
@@ -38,8 +41,9 @@ flag. Explicitly injected HTTP loopback is available only to isolated fixtures.
   restored from disk. The browser dashboard is the fixed `/cloud` URL. Opening
   it does not activate Pro. Refresh checks the server after a purchase.
 - Sign-out independently deletes the local credential and requests
-  `DELETE /api/cloud/desktop/session`. A failed remote revocation is disclosed;
-  failure to clear the durable record blocks a new sign-in until cleanup works.
+  `DELETE https://cloud.openmausbot.com/api/cloud/desktop/session`. A failed
+  remote revocation is disclosed; failure to clear the durable record blocks
+  a new sign-in until cleanup works.
   Sign-out does not cancel the subscription or disconnect the organization.
 
 There is no credential-bearing deep link and no checkout-result callback.
