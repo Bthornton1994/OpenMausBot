@@ -25,12 +25,12 @@ import { BOT_PROFILE_LIMITS } from "../shared/bot-profile.ts";
 import { CLOUD_COMPUTER_BUSY_ERROR } from "../shared/computer-contention.ts";
 import {
   approvalModeFor,
-  supportsApprovalMode,
   modelSwitchNeedsAsk,
   isEmergencyApprovalDowngrade,
   isApprovalMode,
   type ApprovalMode,
 } from "../shared/approval-mode.ts";
+import { createApprovalModeSupport } from "./harness-capabilities.ts";
 import { escapeAttribute } from "../src/lib/composer-attachments.ts";
 import {
   CREDENTIAL_TARGETS,
@@ -183,6 +183,7 @@ import { describeSpawnFailure, execCli } from "./procs.ts";
 import { blockedTarget, buildNotification, buildSpendNotification, type Notification } from "./notify.ts";
 import {
   isModelVariant,
+  TurnNotStartedError,
   type ModelSelection,
   type RequestOutcome,
   type RuntimeEvent,
@@ -190,6 +191,7 @@ import {
   newId,
 } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
+import { recoveryCapabilityError } from "./automatic-recovery.ts";
 import { decodeGeneratedImage } from "./generated-image.ts";
 import {
   MAX_MCP_SERVERS,
@@ -379,7 +381,7 @@ import {
   ROUTINE_PROMPT,
   ROUTINE_EXECUTION_PROMPT,
   WEBHOOK_PROMPT,
-  type ComputerPromptKind,
+  resolveComputerPromptKind,
 } from "./system-prompt.ts";
 import { readCuaConnection, readCuaUnavailableReason, gatedLocalComputer } from "./local-computer.ts";
 import {
@@ -679,6 +681,10 @@ function customDomainStatus() {
   };
 }
 const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
+// The approval gates below hand this their model selection — or a driver
+// view they already hold — and let the registry resolve the driver, instead
+// of each site unwrapping registry.cliTarget(...)?.driverKind itself.
+const supportsApprovalMode = createApprovalModeSupport(registry);
 // Engines installed from Settings live under the data directory and win over
 // any other copy on PATH.
 registerEnginesBinDir();
@@ -2758,14 +2764,13 @@ function previewSystemPrompt(bot: BotRecord) {
   const caps = instance?.adapter.capabilities;
   const teamComputer = inheritedTeamComputer(bot);
   const previewComputer = teamComputer ? "cloud" : bot.computer;
-  const computerPromptKind: ComputerPromptKind | null =
-    previewComputer === "vm"
-      ? caps?.computerMcp ? localVmMode(cfg) === "per-bot" ? "vm-private" : "vm-shared" : null
-      : previewComputer === "cloud"
-        ? instance?.driverKind === "boxAgent" ? "box-agent" : caps?.computerMcp ? bot.cloudBackend === "vps" ? "vps" : caps.cloudComputerMcp ? "box-chat" : "box" : null
-        : previewComputer === "local"
-          ? caps?.localComputerMcp ? "local" : null
-          : null;
+  const computerPromptKind = resolveComputerPromptKind({
+    kind: previewComputer === "vm" ? "vm" : previewComputer === "cloud"
+      ? bot.cloudBackend === "vps" ? "vps" : "box" : previewComputer === "local" ? "local" : null,
+    driverKind: instance?.driverKind,
+    cloudComputerMcp: caps?.cloudComputerMcp,
+    vmPrivate: localVmMode(cfg) === "per-bot",
+  });
   const peers = reachablePeers(store.bots, bot);
   const coordination = bot.chiefOfStaff
     ? chiefOfStaffSystemPrompt(bot.id, store.bots, true, openMausStatusSystemPrompt())
@@ -2907,7 +2912,7 @@ async function botOverview(bot: BotRecord): Promise<BotOverview> {
  * person gave the Chief covers the work the Chief hands out. */
 const approvalModeForTurn = (bot: BotRecord, peerInitiated = false): ApprovalMode => {
   const mode = approvalModeForOrigin(approvalModeFor(bot), { peerInitiated });
-  if (!supportsApprovalMode(registry.cliTarget(bot.modelSelection.instanceId)?.driverKind, mode)) {
+  if (!supportsApprovalMode(bot.modelSelection, mode)) {
     return "ask";
   }
   return mode;
@@ -2983,9 +2988,9 @@ function handleDesktopTrustedApprovalMessage(raw: unknown): boolean {
     ? threadBusy(bot.id, bot.approvalGrant.threadId!) : bot.busy ||
       Boolean(bot.approvalGrant?.allThreads && store.tasks(bot.id).some(task => threadBusy(bot.id, task.threadId)));
   const grantSupported = (bot: BotRecord, mode: ApprovalMode) => supportsApprovalMode(
-    registry.cliTarget(grantTarget(bot)?.modelSelection.instanceId ?? "")?.driverKind, mode) &&
+    grantTarget(bot)?.modelSelection, mode) &&
     (!bot.approvalGrant?.allThreads || store.tasks(bot.id).every(task => supportsApprovalMode(
-      registry.cliTarget((task.modelSelection ?? bot.modelSelection).instanceId)?.driverKind, mode)));
+      task.modelSelection ?? bot.modelSelection, mode)));
   const clearGrant = (bot: BotRecord) => store.patchBot(bot.id, {
     ...(!bot.approvalGrant?.threadOnly ? { approvalMode: "ask" as const, autoApprove: false } : {}),
     approvalGrant: undefined,
@@ -3218,8 +3223,8 @@ function handleDesktopTrustedApprovalMessage(raw: unknown): boolean {
     return true;
   }
   if (message.allThreads === true && (existing.approvalGrant || store.tasks(botId).some(task =>
-    threadBusy(botId, task.threadId) || !supportsApprovalMode(
-      registry.cliTarget((task.modelSelection ?? existing.modelSelection).instanceId)?.driverKind, mode)))) {
+      threadBusy(botId, task.threadId) || !supportsApprovalMode(
+        task.modelSelection ?? existing.modelSelection, mode)))) {
     respond({ ok: false, error: "Finish this bot's active turns and approval changes first. Every thread's provider must support Full access." });
     return true;
   }
@@ -3239,7 +3244,7 @@ function handleDesktopTrustedApprovalMessage(raw: unknown): boolean {
       respond({ ok: false, error: "Stop this thread and finish its pending approval change first" });
       return true;
     }
-    if (!supportsApprovalMode(registry.cliTarget(target.modelSelection.instanceId)?.driverKind, mode)) {
+    if (!supportsApprovalMode(target.modelSelection, mode)) {
       respond({ ok: false, error: "This thread's provider does not support that approval level" });
       return true;
     }
@@ -3294,7 +3299,7 @@ function handleDesktopTrustedApprovalMessage(raw: unknown): boolean {
     respond({ ok: false, error: "Stop this bot's turn before changing its approval level" });
     return true;
   }
-  if (!supportsApprovalMode(registry.cliTarget(existing.modelSelection.instanceId)?.driverKind, mode)) {
+  if (!supportsApprovalMode(existing.modelSelection, mode)) {
     respond({
       ok: false,
       error: mode === "full"
@@ -5538,7 +5543,7 @@ function turnProvider(bot: BotRecord, runOn?: RoutineRunOn, threadId?: string): 
   if (runOn === "cloud" || inheritedTeamComputer(bot)) return "box";
   const wants = turnSurfacePlan(bot, runOn, threadId).computer;
   if (wants !== undefined && wants !== "cloud") return null;
-  if (registry.get(bot.modelSelection.instanceId)?.driverKind === "boxAgent") return "box";
+  if (registry.get(bot.modelSelection.instanceId)?.adapter.capabilities.remoteAgent === true) return "box";
   return bot.cloudBackend === "vps" ? "vps" : wants === "cloud" ? "box" : null;
 }
 
@@ -5567,7 +5572,7 @@ async function computerPreviewSurface(bot: BotRecord, threadId?: string) {
   const plan = turnSurfacePlan(bot, undefined, threadId);
   if (plan.computer !== undefined) return plan.computer === "off" && plan.browser ? "browser" : plan.computer;
   const instance = registry.get(bot.modelSelection.instanceId);
-  if (instance?.driverKind === "boxAgent") return "cloud";
+  if (instance?.adapter.capabilities.remoteAgent === true) return "cloud";
   if (bot.cloudBackend === "vps") {
     const remote = await vps.vpsComputerStatus(cfg, bot.id);
     if (remote.ready) return "cloud";
@@ -5588,7 +5593,7 @@ async function computerPreviewSurface(bot: BotRecord, threadId?: string) {
 async function selectableComputers(bot: BotRecord) {
   const caps = registry.get(bot.modelSelection.instanceId)?.adapter.capabilities;
   const off = bot.computer === "off";
-  const localEngine = registry.get(bot.modelSelection.instanceId)?.driverKind !== "boxAgent";
+  const localEngine = caps?.remoteAgent !== true;
   return Promise.all((["cloud", "vm", "local", "browser"] as const).map(async surface => {
     let ready = false;
     let canStart = false;
@@ -5604,7 +5609,7 @@ async function selectableComputers(bot: BotRecord) {
             status.image && status.imageMatches && status.network === "private" && status.mounts === "none" && status.security === "hardened");
           canCreate = Boolean(status?.configured && status.daemonUp && status.container === "missing");
           reason = status?.problem ?? reason;
-        } else if (box.boxConfigured(cfg) && (caps?.cloudComputerMcp || registry.instances().some(instance => instance.driverKind === "boxAgent"))) {
+        } else if (box.boxConfigured(cfg) && (caps?.usesCloudComputer === true || registry.instances().some(instance => instance.driverKind === "boxAgent"))) {
           const status = await box.boxStatus(cfg, bot.id);
           const lifecycle = box.boxTurnLifecycleAction({ explicitCloud: true, canMount: true, state: status.box?.state ?? null });
           ready = lifecycle === "attach";
@@ -7570,6 +7575,8 @@ async function startTurn(
     onDispatchError?: (message: string) => void;
     /** Summarize this conversation without asking the agent to do more work. */
     compactOnly?: boolean;
+    /** Harness-only: never follow a backup failure with another attempt. */
+    automaticRecoveryAttempted?: boolean;
     /** Queue receipts outlive the dispatch acknowledgment until this exact turn settles. */
     onTurnSettled?: () => void;
     coordination?: { id: string; resumed: boolean; settle: (outcome: { ok: boolean; text: string }) => void };
@@ -7731,6 +7738,9 @@ async function startTurn(
           sender: opts?.sender,
         });
   }
+  const recoveryUserMessageId = opts?.coordination
+    ? store.activePath(threadId).findLast(m => m.role === "user" && m.kind === "text")?.id
+    : userMessage.id;
   // Admitted: every refusal above has passed and no other turn runs on this
   // thread, so this is the one moment the ledger's "who asked" may change.
   if (opts?.trigger) turnTriggers.set(threadId, opts.trigger);
@@ -8043,7 +8053,6 @@ async function startTurn(
       const teamComputer = inheritedTeamComputer(bot);
       const cloudBackend = teamComputer || opts?.runOn === "cloud" || bot.cloudBackend !== "vps" ? "box" : "vps";
       const mountsComputerMcp = instance.adapter.capabilities.computerMcp === true;
-      const mountsCloudComputer = instance.driverKind === "boxAgent" || instance.adapter.capabilities.cloudComputerMcp === true;
       const mountsLocalComputer = instance.adapter.capabilities.localComputerMcp === true;
       // Where this turn's hands may land. The bot's "Works on" choice is
       // strict; a browser-only bot gets no computer at all, and a bot whose
@@ -8056,7 +8065,7 @@ async function startTurn(
       // choice, so those ignore the pin.
       const dispatchTask = store.taskByThread(bot.id, threadId);
       if (plan.clearPin && dispatchTask) store.patchTask(bot.id, threadId, { surface: undefined });
-      if (plan.computer !== undefined && plan.computer !== "cloud" && instance.driverKind === "boxAgent") {
+      if (plan.computer !== undefined && plan.computer !== "cloud" && instance.adapter.capabilities.remoteAgent === true) {
         throw new Error("the Computer engine works on the cloud computer — set Works on to Cloud, or choose another engine");
       }
       const wants = plan.computer;
@@ -8184,7 +8193,7 @@ async function startTurn(
       // be recreated on demand after idling away — and never creates a first
       // VM on its own; every failure there is a quiet "not this place".
       const attachLocalVm = async (strict: boolean): Promise<boolean> => {
-        if (!mountsComputerMcp || instance.driverKind === "boxAgent") {
+        if (!mountsComputerMcp || instance.adapter.capabilities.remoteAgent === true) {
           if (!strict) return false;
           throw new Error("this model engine cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
         }
@@ -8230,7 +8239,7 @@ async function startTurn(
                 // guard as dispatch: a poller started after its own
                 // turn.completed would never be torn down.
                 if (previewCapture && threadBusy(bot.id, threadId)) {
-                  const touched = screenPollers.get(threadId)?.touched ?? instance.driverKind === "boxAgent";
+                  const touched = screenPollers.get(threadId)?.touched ?? instance.adapter.capabilities.remoteAgent === true;
                   stopScreenPoller(bot.id, threadId);
                   startScreenPoller(
                     bot.id,
@@ -8324,16 +8333,17 @@ async function startTurn(
       // Cloud is strict when selected. Native Box and drivers with a Box
       // bridge may also reuse an already-ready Box on Auto.
       if (teamComputer) {
-        const attached = await attachTeamBox(teamComputer, bot.id, resourceOwner, mountsCloudComputer, instance.driverKind === "boxAgent");
+        const attached = await attachTeamBox(teamComputer, bot.id, resourceOwner,
+          instance.adapter.capabilities.usesCloudComputer === true, instance.adapter.capabilities.remoteAgent === true);
         integrations.computer = attached.integration;
         previewCapture = attached.capture;
         computerKind = "box";
       }
-      if (!teamComputer && mountsCloudComputer && (wants === "cloud" || wants === undefined) && cloudBackend === "box" && box.boxConfigured(cfg)) {
+      if (!teamComputer && instance.adapter.capabilities.usesCloudComputer === true && (wants === "cloud" || wants === undefined) && cloudBackend === "box" && box.boxConfigured(cfg)) {
         const attached = await attachBotBox(bot, resourceOwner, {
           explicitCloud: wants === "cloud",
-          canMount: mountsCloudComputer,
-          remoteAgent: instance.driverKind === "boxAgent",
+          canMount: instance.adapter.capabilities.usesCloudComputer === true,
+          remoteAgent: instance.adapter.capabilities.remoteAgent === true,
         });
         if (attached) {
           previewCapture = attached.capture;
@@ -8531,16 +8541,12 @@ async function startTurn(
       if (!markDirectTurnDispatching(bot.id, dispatchClaimId, threadId)) {
         throw new DirectTurnSetupCancelled("turn stopped before dispatch");
       }
-      const computerPromptKind: ComputerPromptKind | null =
-        computerKind === "vm"
-          ? localVmMode(cfg) === "per-bot" ? "vm-private" : "vm-shared"
-          : computerKind === "box"
-            ? instance.driverKind === "boxAgent" ? "box-agent" : instance.adapter.capabilities.cloudComputerMcp ? "box-chat" : "box"
-            : computerKind === "vps"
-              ? "vps"
-              : computerKind === "local"
-                ? "local"
-                : null;
+      const computerPromptKind = resolveComputerPromptKind({
+        kind: computerKind,
+        driverKind: instance.driverKind,
+        cloudComputerMcp: instance.adapter.capabilities.cloudComputerMcp,
+        vmPrivate: localVmMode(cfg) === "per-bot",
+      });
       const coordinationNode = opts?.coordination ? roomHandoffs.nodes.get(opts.coordination.id) : undefined;
       if (opts?.coordination && (!coordinationNode || coordinationNode.status !== "running" || roomHandoffProblem(coordinationNode,
         coordinationNode.parentId ? roomHandoffs.nodes.get(coordinationNode.parentId) : undefined))) {
@@ -8604,6 +8610,7 @@ async function startTurn(
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: bot.id,
+        startupRecovery: cfg.automaticRecovery?.enabled === true && !opts?.automaticRecoveryAttempted,
         text: dispatchContext.turnText,
         refreshSystemPrompt: true,
         images: turnImages,
@@ -8669,7 +8676,7 @@ async function startTurn(
           bot.id,
           threadId,
           { ...(previewCapture ? { computer: previewCapture } : {}), ...(browserCapture ? { browser: browserCapture } : {}) },
-          { screenIsTheWork: instance.driverKind === "boxAgent" },
+          { screenIsTheWork: instance.adapter.capabilities.remoteAgent === true },
         );
       }
       // An adapter may publish completion synchronously just before its
@@ -8685,7 +8692,16 @@ async function startTurn(
         drainTeamSetupResumes();
         drainDelegationWakes();
       }
-    } catch (e) {
+    } catch (cause) {
+      let e = cause;
+      // Only the driver can prove that a task was never submitted and its
+      // old process is gone. A timeout/error string alone is not that proof.
+      const mayRecover = e instanceof TurnNotStartedError &&
+        directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId);
+      if (e instanceof TurnNotStartedError) {
+        retireProviderTurn(e.turnId);
+        if (!mayRecover) e = new DirectTurnSetupCancelled("turn stopped during provider setup");
+      }
       handoffs.abandon(threadId, dispatchClaimId);
       if (computerSelectionTurns.get(threadId)?.generation === dispatchClaimId) computerSelectionTurns.delete(threadId);
       clearCancelledProviderHandshake(threadId, `direct:${dispatchClaimId}`);
@@ -8694,6 +8710,8 @@ async function startTurn(
       const ownsLatestGeneration = directTurnGenerationByThread.get(threadId) === dispatchClaimId;
       releaseTurnResources(resourceOwner);
       if (ownsLatestGeneration) {
+        runningTurnEngines.delete(threadId);
+        endMemoryTurn(threadId);
         clearTurnDigestState(threadId);
         releaseLocalVmThread(threadId);
         vpsThreadEnded(bot.id, threadId);
@@ -8722,8 +8740,47 @@ async function startTurn(
         settleDirectFollowup(dispatchClaimId);
         return;
       }
-      const message = e instanceof Error ? e.message : String(e);
-settleDirectFollowup(dispatchClaimId, { ok: false, text: message });
+      let message = e instanceof Error ? e.message : String(e);
+      const backup = cfg.automaticRecovery?.enabled ? cfg.automaticRecovery.backup : undefined;
+      const current = store.projectBotForTask(bot.id, threadId);
+      if (mayRecover && backup && current && !opts?.automaticRecoveryAttempted && (!opts?.cardContinuation || opts.coordination) &&
+          !directRequestOwners.get(threadId)?.stopped && !hasQueuedSteeredMessages(bot.id, threadId) &&
+          JSON.stringify(current.modelSelection) === JSON.stringify(bot.modelSelection) &&
+          (backup.instanceId !== instanceId || backup.model !== model) &&
+          store.activePath(threadId).findLast(m => m.role === "user" && m.kind === "text")?.id === recoveryUserMessageId) {
+        // No await between releasing the failed attempt and admitting its
+        // replacement: a newer send or Stop must never lose to a stale retry.
+        store.setTaskActivity(bot.id, threadId, "idle");
+        directTurnBots.delete(threadId);
+        const checked = checkedTaskModelSwitch(current, backup, false, false, true);
+        const target = checked.ok ? registry.get(checked.selection.instanceId) : null;
+        const refusal = !checked.ok ? checked.error : !target || !target.enabled ? "The backup engine is unavailable."
+          : !store.taskByThread(bot.id, threadId)?.cwd ? "This older thread has no pinned working folder. Choose its backup manually."
+          : policyModelRefusal(target) ?? recoveryCapabilityError(
+            { driverKind: instance.driverKind, capabilities: instance.adapter.capabilities },
+            { driverKind: target.driverKind, capabilities: target.adapter.capabilities });
+        if (!refusal && checked.ok && target) {
+          try {
+            assertWithinBudget(cfg, DATA_DIR);
+            store.switchTaskModel(bot.id, threadId, checked.selection, false, false, {
+              ...hostedModels?.resetTask(current.modelSelection, checked.selection), rewound: true,
+            });
+            store.appendMessage(threadId, { role: "bot", kind: "activity", tool: {
+              name: `recovery: Automatic recovery: ${instance.displayName || instance.driverKind} could not start. Trying ${target.displayName || target.driverKind} · ${checked.selection.model} once in this thread.`, ok: true,
+            } });
+            await startTurn(bot.id, text, { ...opts, threadId, userMessage, editedMessageId: undefined,
+              automaticRecoveryAttempted: true });
+            // The backup now owns these callbacks; don't publish a failed
+            // routine/peer result or release a queued receipt in between.
+            directFollowupSettlers.delete(dispatchClaimId);
+            directCoordinationSettlers.delete(dispatchClaimId);
+            return;
+          } catch (failure) {
+            message += ` Backup could not start: ${failure instanceof Error ? failure.message : String(failure)}`;
+          }
+        } else if (refusal) message = `Automatic recovery unavailable: ${refusal} Original error: ${message}`;
+      }
+      settleDirectFollowup(dispatchClaimId, { ok: false, text: message });
       // The wait already wrote its failure resolution; keep all dispatch
       // failure bookkeeping below without adding the same error twice.
       if (!(e instanceof ComputerWaitGaveUp)) store.appendMessage(threadId, {
@@ -9428,7 +9485,7 @@ const validateModelProposal = (selection: ModelSelection, current?: BotRecord): 
   if (current) {
     const mode = approvalModeFor(current);
     const driver = registry.cliTarget(selection.instanceId)?.driverKind;
-    if (!supportsApprovalMode(driver, mode) || ((mode === "full" || mode === "custom") && driver !== registry.cliTarget(current.modelSelection.instanceId)?.driverKind)) {
+    if (!supportsApprovalMode(selection, mode) || ((mode === "full" || mode === "custom") && driver !== registry.cliTarget(current.modelSelection.instanceId)?.driverKind)) {
       return `@${current.name}'s existing permissions are incompatible with that provider. Change its permissions in bot settings, then propose the model change again.`;
     }
   }
@@ -10310,7 +10367,7 @@ async function runGroupMemberTurn(
   if (roomPlaceRefusal) throw Object.assign(new Error(roomPlaceRefusal), { code: "managed_policy" });
   // The Computer engine runs on the Box; this computer has no tools it can
   // reach, exactly as a bot thread refuses it.
-  if (roomPlan.computer === "local" && instance.driverKind === "boxAgent") {
+  if (roomPlan.computer === "local" && instance.adapter.capabilities.remoteAgent === true) {
     throw new Error("the Computer engine works on the cloud computer — set Works on to Cloud, or choose another engine");
   }
   // One place per room turn as well: a team computer reached on Auto means
@@ -10332,11 +10389,11 @@ async function runGroupMemberTurn(
 
   if (roomTeamComputer) {
     const attached = await attachTeamBox(roomTeamComputer, readyBot.id, resourceOwner,
-      instance.driverKind === "boxAgent" || instance.adapter.capabilities.cloudComputerMcp === true, instance.driverKind === "boxAgent");
+      instance.adapter.capabilities.usesCloudComputer === true, instance.adapter.capabilities.remoteAgent === true);
     if (isCancelled?.() || groupSpeakers.get(threadId) !== roomSpeaker ||
         activeInternalGenerationByThread.get(threadId) !== internalGeneration) return false;
     integrations.computer = attached.integration;
-    startScreenPoller(readyBot.id, threadId, { computer: attached.capture }, { screenIsTheWork: instance.driverKind === "boxAgent" });
+    startScreenPoller(readyBot.id, threadId, { computer: attached.capture }, { screenIsTheWork: instance.adapter.capabilities.remoteAgent === true });
   }
 
   // The speaker's own explicit place, mounted exactly as its bot thread
@@ -10372,9 +10429,9 @@ async function runGroupMemberTurn(
       roomComputerKind = "vps";
     } else {
       if (!box.boxConfigured(cfg)) throw new Error("Cloud box is not configured — add a Box API key or choose Local VM");
-      const remoteAgent = instance.driverKind === "boxAgent";
+      const remoteAgent = instance.adapter.capabilities.remoteAgent === true;
       const attached = await attachBotBox(readyBot, resourceOwner, { explicitCloud: true,
-        canMount: remoteAgent || instance.adapter.capabilities.cloudComputerMcp === true, remoteAgent });
+        canMount: instance.adapter.capabilities.usesCloudComputer === true, remoteAgent });
       if (!roomSetupIsCurrent()) return false;
       if (!attached?.integration) throw new Error("the cloud computer could not be created or reached");
       integrations.computer = attached.integration;
@@ -10387,7 +10444,7 @@ async function runGroupMemberTurn(
   // Room and Goal turns use the speaker's desktop, never the coordinator's.
   // Claim the same lease as direct turns before asynchronous VM setup.
   if (readyBot.computer === "vm") {
-    if (instance.adapter.capabilities.computerMcp !== true || instance.driverKind === "boxAgent") {
+    if (instance.adapter.capabilities.computerMcp !== true || instance.adapter.capabilities.remoteAgent === true) {
       throw new Error("this model engine cannot use the Local VM");
     }
     // A distinct identity fences cleanup even in shared mode on the same room thread.
@@ -10505,6 +10562,11 @@ async function runGroupMemberTurn(
   // (#754) the room is told, once per source thread, rather than the
   // crossing being blocked.
   const recentLines = recentWork(recentWorkSources(bot), bot, { userName, currentThreadId: threadId });
+  const roomComputerPromptKind = resolveComputerPromptKind({
+    kind: roomTeamComputer || roomComputerKind === "box" ? "box" : roomVmTarget ? "vm" : roomComputerKind,
+    driverKind: instance.driverKind, cloudComputerMcp: instance.adapter.capabilities.cloudComputerMcp,
+    vmPrivate: localVmMode(cfg) === "per-bot",
+  });
   {
     const crossing = claimRecallCrossings(threadId, recentLines.filter((line) => line.private).map((line) => line.threadId));
     if (crossing.count) {
@@ -10520,7 +10582,7 @@ async function runGroupMemberTurn(
     { id: "user-profile", label: "About the user", text: userProfileSystemPrompt(cfg.profile) },
     { id: "files", label: "File locations", text: workspace ? workspaceLocationsPrompt(bot.id, cwd, readyBot.cwd) : "" },
     { id: "mcp", label: "MCP servers", text: customMcpPrompt(Object.keys(integrations.custom ?? {})) },
-    { id: "computer", label: "Computer", text: computerPrompt(roomTeamComputer || roomComputerKind === "box" ? instance.driverKind === "boxAgent" ? "box-agent" : instance.adapter.capabilities.cloudComputerMcp ? "box-chat" : "box" : roomVmTarget ? localVmMode(cfg) === "per-bot" ? "vm-private" : "vm-shared" : roomComputerKind) },
+    { id: "computer", label: "Computer", text: computerPrompt(roomComputerPromptKind) },
     { id: "team-computer", label: "Team computer", text: teamComputerPrompt(roomTeamComputer) },
     { id: "plan", label: "Surface", text: surfacePrompt({ computer: roomTeamComputer ? "cloud" : roomVmTarget ? "vm" : surfaceOfComputerKind(roomComputerKind), browser: Boolean(integrations.browser) }, { note: roomPlan.note }) },
     { id: "browser", label: "Browser", text: integrations.browser ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
@@ -12587,6 +12649,7 @@ function configStatus() {
     // not a secret — the settings picker shows it; "" = follow the system
     language: cfg.language ?? "",
     rooms: { turnTimeoutMinutes: roomTurnTimeoutMinutes(cfg) },
+    automaticRecovery: cfg.automaticRecovery ?? { enabled: false },
     // absent effort = no level is sent, so clients can tell it from any level
     newBots: cfg.newBots?.effort ? { effort: cfg.newBots.effort } : {},
     threads: {
@@ -17656,7 +17719,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if ([existing, selected].some((owner) => {
         const mode = approvalModeFor(owner);
         return (mode === "full" || mode === "custom") &&
-          (!supportsApprovalMode(registry.cliTarget(checked.selection.instanceId)?.driverKind, mode) ||
+          (!supportsApprovalMode(checked.selection, mode) ||
             registry.cliTarget(checked.selection.instanceId)?.driverKind !== registry.cliTarget(owner.modelSelection.instanceId)?.driverKind);
       })) {
         return json(res, 400, {
@@ -17986,7 +18049,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (normalizedSelection && selectedTask) {
         const mode = approvalModeFor(selectedTask);
         if ((mode === "full" || mode === "custom") &&
-          (!supportsApprovalMode(registry.cliTarget(normalizedSelection.instanceId)?.driverKind, mode) ||
+          (!supportsApprovalMode(normalizedSelection, mode) ||
             registry.cliTarget(normalizedSelection.instanceId)?.driverKind !== registry.cliTarget(selectedTask.modelSelection.instanceId)?.driverKind)) {
           return json(res, 400, { error: "Choose Ask for the selected thread before changing providers with elevated permissions" });
         }
@@ -17994,7 +18057,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (
         (requestedApprovalMode === "full" || requestedApprovalMode === "custom") &&
         (body.approvalMode !== undefined || normalizedSelection !== undefined) &&
-        (!targetSelection || !supportsApprovalMode(registry.cliTarget(targetSelection.instanceId)?.driverKind, requestedApprovalMode) ||
+        (!targetSelection || !supportsApprovalMode(targetSelection, requestedApprovalMode) ||
           (existingBot && normalizedSelection && registry.cliTarget(normalizedSelection.instanceId)?.driverKind !== registry.cliTarget(existingBot.modelSelection.instanceId)?.driverKind))
       ) {
         return json(res, 400, {
@@ -19438,7 +19501,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 403, { error: "New Full tasks require the operator's dedicated shared-workspace policy" });
         }
         if (bot.approvalGrant) return json(res, 409, { error: "the bot's approval mode is still being confirmed" });
-        if (!supportsApprovalMode(registry.cliTarget(bot.modelSelection.instanceId)?.driverKind, "full")) {
+        if (!supportsApprovalMode(bot.modelSelection, "full")) {
           return json(res, 400, { error: "This provider does not support Full access" });
         }
       }
@@ -19555,7 +19618,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // thread settings PATCH cannot manufacture that grant.
         if (mode !== "ask" && mode !== "auto" && mode !== "edits") return json(res, 403, { error: "Full and Custom access require trusted desktop confirmation" });
         if (approvalModeFor(current) === "custom") return json(res, 403, { error: "Leaving Custom approval requires confirmation in the packaged desktop app" });
-        if (!supportsApprovalMode(registry.cliTarget((patch.modelSelection ?? current.modelSelection).instanceId)?.driverKind, mode)) {
+        if (!supportsApprovalMode(patch.modelSelection ?? current.modelSelection, mode)) {
           return json(res, 400, { error: "This provider does not support the selected approval level" });
         }
         if (threadBusy(current.id, current.threadId)) return json(res, 409, { error: "stop this thread before changing its approval mode" });
@@ -20544,6 +20607,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (hostedModels && patch.defaultModelSelection) {
         const checked = checkedModelSelection(patch.defaultModelSelection);
         if (!checked.ok) return json(res, checked.status, { error: checked.error });
+      }
+      if (patch.automaticRecovery?.enabled) {
+        const checked = checkedModelSelection(patch.automaticRecovery.backup, undefined, true);
+        if (!checked.ok) return json(res, checked.status, { error: checked.error });
+        const target = registry.get(checked.selection.instanceId)!;
+        if (!target.enabled) return json(res, 400, { error: "Enable the backup engine before selecting it for recovery." });
+        const refusal = policyModelRefusal(target);
+        if (refusal) return json(res, 403, { error: refusal, code: "managed_policy" });
+        patch.automaticRecovery.backup = checked.selection;
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       const changingVoiceProvider = patch.tts?.provider !== undefined
