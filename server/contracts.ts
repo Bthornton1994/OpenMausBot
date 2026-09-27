@@ -41,6 +41,18 @@ export class ProviderError extends Error {
   }
 }
 
+/** The driver proved this attempt never reached a prompt or client-side action,
+ * and its owned process has stopped. The harness may safely recover it. */
+export class TurnNotStartedError extends Error {
+  readonly turnId: TurnId;
+
+  constructor(turnId: TurnId, message: string) {
+    super(message);
+    this.name = "TurnNotStartedError";
+    this.turnId = turnId;
+  }
+}
+
 
 /** Variants are opaque provider IDs, not the cross-engine effort enum. */
 export function isModelVariant(value: unknown): value is string {
@@ -116,6 +128,9 @@ export interface SendTurnInput {
    * process. Takes precedence over resumeCursor. The runtime supplies the
    * active conversation in text/transcript when rebuilding a session. */
   sessionReset?: boolean;
+  /** Hold the startup ACK until prompt dispatch; a safely retired transient
+   * setup failure may reject with TurnNotStartedError instead of completing. */
+  startupRecovery?: boolean;
   /** The turn with the conversation so far replayed inline, attached only
    * alongside resumeCursor. A cursor-resuming driver sends it once, on a
    * fresh session, when the provider refuses the cursor before reading the
@@ -249,6 +264,17 @@ export interface ProviderAdapter {
     computerMcp?: boolean;
     /** Consumes the leased Box descriptor without switching to Box's model. */
     cloudComputerMcp?: boolean;
+    /** True when the whole turn executes on the cloud computer (the Box native
+     * agent — POST /boxes/{id}/prompt) instead of in the host harness. Such a
+     * driver claims the box exclusively, cannot use host or Local VM surfaces,
+     * and every tool call acts on that machine's screen (screen pollers start
+     * with screenIsTheWork). Implies a cloud-computer turn even though the
+     * driver mounts no computer descriptor — cloudComputerMcp stays false. */
+    remoteAgent?: boolean;
+    /** True when this driver's turn can run against a cloud computer — natively
+     * (remoteAgent) or by mounting the leased Box descriptor (cloudComputerMcp).
+     * Gates every cloud attach path (attachBotBox / attachTeamBox canMount). */
+    usesCloudComputer?: boolean;
     /** True when the driver mounts turn.integrations.composio (the user's
      * connected apps). Same rule again: a key in the config says the user
      * HAS those connections, not that this driver can reach them. */
@@ -436,6 +462,36 @@ export interface ModelCatalog {
     /** Discovery hints; the native session revalidates these before each turn. */
     variants?: ModelVariantOption[];
   }>;
+}
+
+/** The picker label for a model id when the catalog row carries no display
+ * name: split on the word breaks the catalog treats as separators and
+ * capitalize each part ("gpt-5.4-mini" → "Gpt 5.4 Mini"). Each harness
+ * passes its own break class so existing labels stay byte-for-byte. */
+export function titleCaseModelId(id: string, wordBreaks: RegExp): string {
+  return id
+    .split(wordBreaks)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+/** A picker label that carries a second facet — a display name, a provider
+ * host — beside the model id, unless the facet is already what the id says.
+ * `redundantWhen` decides what counts as "already said" and `decorate` how
+ * the facet is appended, so every harness's labels stay exactly what they
+ * were while the shape is written once. */
+export function qualifiedModelLabel(
+  id: string,
+  qualifier: string | null | undefined,
+  options: {
+    redundantWhen?: (id: string, qualifier: string) => boolean;
+    decorate?: (qualifier: string) => string;
+  } = {},
+): string {
+  const { redundantWhen = () => false, decorate = (facet) => ` — ${facet}` } = options;
+  if (!qualifier || redundantWhen(id, qualifier)) return id;
+  return `${id}${decorate(qualifier)}`;
 }
 
 export interface DriverCreateInput<Config> {
