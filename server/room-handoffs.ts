@@ -7,6 +7,7 @@ const nodeSchema = z.object({
   id: z.string(), rootId: z.string(), parentId: z.string().optional(),
   groupId: z.string().optional(), threadId: z.string(), botId: z.string(),
   key: z.string(), text: z.string(), createdAt: z.number(),
+  requestBatchKey: z.string().optional(),
   status: z.enum(["source", "queued", "running", "waiting", "resume", "completed", "failed", "cancelled"]),
   result: z.string().default(""), reported: z.boolean().default(false),
   executions: z.number().int().nonnegative().default(0), startedAt: z.number().optional(),
@@ -165,7 +166,7 @@ export class RoomHandoffs {
 
   enqueue(source: RoomAddress, generation: string, parentId: string | undefined,
     target: RoomAddress, key: string, text: string, approvalGranted = false,
-    rework = false, sourceText = ""): { node: RoomHandoff; duplicate: boolean } {
+    rework = false, sourceText = "", requestBatchKey?: string): { node: RoomHandoff; duplicate: boolean } {
     if (this.loadError) throw new Error(this.loadError);
     let parent = parentId ? this.nodes.get(parentId) : this.nodes.get(generation);
     if (parentId && (!parent || parent.status !== "running")) throw new Error("The originating room task is no longer running");
@@ -182,8 +183,13 @@ export class RoomHandoffs {
     const existing = this.children(parent.id).find(n => n.key === key);
     if (existing) {
       if (existing.groupId !== target.groupId || existing.botId !== target.botId || existing.text !== text ||
-        existing.kind !== kind) throw new Error("request_key was already used for different work");
+        existing.kind !== kind || existing.requestBatchKey !== requestBatchKey) throw new Error("request_key was already used for different work");
       return { node: existing, duplicate: true };
+    }
+    if (requestBatchKey && target.groupId) {
+      const batch = this.children(parent.id).filter(n => n.requestBatchKey === requestBatchKey && n.groupId === target.groupId);
+      if (batch.some(n => n.text !== text || n.threadId !== target.threadId)) throw new Error("request_key was already used for different room work");
+      if (batch.some(n => n.startedAt !== undefined)) throw new Error("This shared room request has already started; use a new request_key for additional recipients");
     }
     if (!rework && this.children(parent.id).some(n => n.kind === kind &&
       n.groupId === target.groupId && n.botId === target.botId && n.status === "completed")) {
@@ -217,7 +223,7 @@ export class RoomHandoffs {
     }
     const node: RoomHandoff = { ...target, id: randomUUID(), rootId: parent.rootId, parentId: parent.id,
       key, text, createdAt: this.now(), status: "queued", result: "", reported: false, executions: 0, approvalGranted,
-      kind };
+      kind, ...(target.groupId && requestBatchKey ? { requestBatchKey } : {}) };
     const problem = this.hooks.validate(node, parent);
     if (problem) throw new Error(problem);
     if (fresh) this.nodes.set(parent.id, parent);
@@ -226,11 +232,24 @@ export class RoomHandoffs {
     return { node, duplicate: false };
   }
 
+  /** A room brief is displayed once; each recipient keeps its own execution and result. */
+  sharedRequest(node: RoomHandoff): { id: string; botIds: string[] } {
+    const batch = node.groupId && node.requestBatchKey && node.parentId
+      ? this.children(node.parentId).filter(n => n.requestBatchKey === node.requestBatchKey &&
+        n.groupId === node.groupId && n.threadId === node.threadId && n.text === node.text)
+      : [node];
+    return { id: batch[0]?.id ?? node.id, botIds: batch.map(n => n.botId) };
+  }
+
   sourceSettled(generation: string, ok: boolean) {
     const node = this.nodes.get(generation);
     if (!node || node.status !== "source") return;
-    if (!ok) this.cancelTree(node, "The originating room turn did not finish", "failed");
-    else { node.status = "waiting"; this.publish(node); }
+    // An accepted assignment belongs to the queue, not the provider that
+    // submitted it. A failed/expired source turn must not erase that work.
+    // Explicit Stop, deletion and revoked routes still cancel separately.
+    if (!ok) node.result = "The originating turn ended before its teammates returned.";
+    node.status = "waiting";
+    this.publish(node);
   }
 
   cancelTree(node: RoomHandoff, reason: string, status: "failed" | "cancelled" = "cancelled") {
@@ -312,8 +331,10 @@ export class RoomHandoffs {
         if (children.length && children.every(c => terminal(c) && c.reported)) { n.status = "resume"; this.publish(n); }
       }
       if (n.status !== "queued" && n.status !== "resume") continue;
-      // A newly queued child starts only after its author has settled.
-      if (parent && (parent.status === "source" || parent.status === "running")) continue;
+      // Independent conversations can start as soon as work is accepted.
+      // Same-room speakers still serialize; never overlap their shared chat.
+      if (parent && (parent.status === "source" || parent.status === "running") &&
+        (parent.threadId === n.threadId || (n.groupId && n.groupId === parent.groupId))) continue;
       // A stopped source stops waiting; only work that never started is
       // dropped with it. A teammate mid-turn keeps its process and reports.
       if (parent && terminal(parent) && n.status === "queued") { this.cancelTree(n, "Originating request has ended"); continue; }
@@ -335,15 +356,23 @@ export class RoomHandoffs {
       void this.hooks.run(n, resumed, controller.signal).then(result => {
         if (terminal(n)) return;
         n.result = result.text.slice(0, 12_000);
-        if (!result.ok) this.cancelTree(n, n.result || "Room agent failed", "failed");
-        else if (this.children(n.id).length > childCount) n.status = "waiting";
+        if (this.children(n.id).length > childCount) n.status = "waiting";
+        else if (!result.ok) this.cancelTree(n, n.result || "Room agent failed", "failed");
         else n.status = "completed";
         // Close the paused span with the settlement itself: work enqueued
         // before the next periodic tick must be admitted against the aged
         // budget, not the still-open pause's overstated runway.
         this.trackExecutionPauses();
         this.publish(n);
-      }).catch(e => { this.cancelTree(n, String(e).slice(0, 1000), "failed"); })
+      }).catch(e => {
+        if (terminal(n)) return;
+        n.result = String(e).slice(0, 1000);
+        if (this.children(n.id).length > childCount) {
+          n.status = "waiting";
+          this.trackExecutionPauses();
+          this.publish(n);
+        } else this.cancelTree(n, n.result, "failed");
+      })
         .finally(() => this.controllers.delete(n.id));
     }
   }

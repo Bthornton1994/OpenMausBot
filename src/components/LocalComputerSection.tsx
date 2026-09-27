@@ -17,6 +17,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Card, CommandLine } from "./SettingsPrimitives";
+import { MacLocalControl } from "./MacLocalControl";
 import { cn } from "@/lib/cn";
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
@@ -852,6 +853,9 @@ export function LocalComputerSection() {
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const response = await fetch(...computerInventoryRequest("status", signal));
     const body = await response.json().catch(() => ({}));
+    // The poll loop can be cleaned up mid-flight; a resolved-but-stale read
+    // must never overwrite the state of whoever unmounted us.
+    if (signal?.aborted) return;
     if (!response.ok) throw new Error(body.error ?? t("vm.err.status", { code: response.status }));
     setStatus(body as Status);
     setError(null);
@@ -1009,18 +1013,15 @@ export function LocalComputerSection() {
     setStatus(body as Status);
   };
 
+  const confirmAction = (message: string) => window.ogb?.confirm ? window.ogb.confirm(message) : window.confirm(message);
+
   const act = async (action: Action) => {
-    if (
-      action === "remove" &&
-      !window.confirm(t("vm.confirm.deleteShared"))
-    ) return;
-    if (
-      action === "recreate" &&
-      !window.confirm(t("vm.confirm.recreate"))
-    ) return;
+    if (pending !== null) return;
     setPending(action);
     setError(null);
     try {
+      if (action === "remove" && !(await confirmAction(t("vm.confirm.deleteShared")))) return;
+      if (action === "recreate" && !(await confirmAction(t("vm.confirm.recreate")))) return;
       if (action === "recreate") {
         await post("remove");
         await post("run");
@@ -1250,6 +1251,8 @@ export function LocalComputerSection() {
         onRemove={(instance) => void removeVpsComputer(instance)}
       />
 
+      <MacLocalControl />
+
       <Card
         title={t("vm.main.title")}
         subtitle={perBot
@@ -1323,21 +1326,24 @@ export function LocalComputerSection() {
             </button>
           ))}
         </div>
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <div>
-            <div className="text-[13px] text-ink">{t("vm.isolation.max")}</div>
-            <div className="text-[11.5px] text-ink-secondary">{t("vm.isolation.maxDetail")}</div>
+        {/* The cap only applies to per-bot VMs; shared mode runs exactly one. */}
+        {perBot && (
+          <div className="mt-3 flex items-center justify-between gap-3">
+            <div>
+              <div className="text-[13px] text-ink">{t("vm.isolation.max")}</div>
+              <div className="text-[11.5px] text-ink-secondary">{t("vm.isolation.maxDetail")}</div>
+            </div>
+            <select
+              aria-label={t("vm.isolation.maxAria")}
+              value={status?.max_instances ?? 2}
+              disabled={!status || policyPending}
+              onChange={(event) => void savePolicy(status?.mode ?? "shared", Number(event.target.value))}
+              className="rounded-lg border border-hairline/40 bg-control px-2.5 py-1.5 text-[13px] text-ink disabled:opacity-50"
+            >
+              {[1, 2, 3, 4, 5, 6, 7, 8].map((value) => <option key={value} value={value}>{value}</option>)}
+            </select>
           </div>
-          <select
-            aria-label={t("vm.isolation.maxAria")}
-            value={status?.max_instances ?? 2}
-            disabled={!status || policyPending}
-            onChange={(event) => void savePolicy(status?.mode ?? "shared", Number(event.target.value))}
-            className="rounded-lg border border-hairline/40 bg-control px-2.5 py-1.5 text-[13px] text-ink disabled:opacity-50"
-          >
-            {[1, 2, 3, 4].map((value) => <option key={value} value={value}>{value}</option>)}
-          </select>
-        </div>
+        )}
         {policyPending && <div className="mt-2 flex items-center gap-1.5 text-[12px] text-ink-secondary"><Loader2 size={12} className="animate-spin" /> {t("vm.saving")}</div>}
       </Card>
 
@@ -1415,7 +1421,10 @@ export function LocalComputerSection() {
             ) : status?.container === "running" ? (
               <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> {t("vm.setup.waiting")}</div>
             ) : status?.image ? (
-              <ActionButton action="run" pending={pending} onClick={() => void act("run")}>{t("vm.setup.create")}</ActionButton>
+              <>
+                <ActionButton action="run" pending={pending} onClick={() => void act("run")}>{t("vm.setup.start")}</ActionButton>
+                <p className="text-[13px] leading-relaxed text-ink-secondary">{t("vm.setup.idleHint")}</p>
+              </>
             ) : null}
             {c?.run && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">{t("vm.setup.showCommand")}</summary><div className="mt-2"><CommandLine command={c.run} /></div></details>}
           </Step>

@@ -105,6 +105,154 @@ describe("createOpenAIChatRuntime tool approvals", () => {
   it("answers for the person under Full access, so no card is raised", async () => {
     expect(await cardRaisedFor("full")).toBe(false);
   }, 20_000);
+
+  it("still holds an ask_user card for a person under Full access and returns the reply verbatim", async () => {
+    const askBody = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"ask1","type":"function","function":{"name":"ask_user","arguments":'
+      + JSON.stringify(JSON.stringify({ questions: [{ question: "Ship the fixture?", options: [{ label: "Yes" }, { label: "No" }] }] }))
+      + '}}]}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n';
+    const finalBody = 'data: {"choices":[{"index":0,"delta":{"content":"Shipped."}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n';
+    const bodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(String(init?.body));
+      return new Response(bodies.length === 1 ? askBody : finalBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "compat", displayName: "Compat", enabled: true,
+      config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.com/v1", apiKeyEnv: "K", model: "m" }),
+      environment: { K: "secret" },
+    });
+    const events: RuntimeEvent[] = [];
+    instance.adapter.onEvent((event) => events.push(event));
+    await instance.adapter.sendTurn({ threadId: "thread", text: "hi", approvalMode: "full" });
+    const opened = await vi.waitFor(() => {
+      const found = events.find((event) => event.type === "request.opened");
+      if (!found) throw new Error("waiting for the question card");
+      return found;
+    }, { timeout: 10_000 });
+    expect(opened).toMatchObject({
+      requestType: "question", tool: "ask_user", summary: "Ship the fixture?",
+      questions: [{ question: "Ship the fixture?", options: [{ label: "Yes" }, { label: "No" }] }],
+      choices: ["Yes", "No"],
+    });
+    expect(bodies[0]).toContain('"ask_user"');
+    const reply = "The user answered your questions.\n\nQ: Ship the fixture?\nA: Yes";
+    expect(await instance.adapter.respondToRequest("thread", opened.requestId!, { behavior: "answer", message: reply })).toBe("answered");
+    await vi.waitFor(() => {
+      if (!events.some((event) => event.type === "turn.completed")) throw new Error("turn still running");
+    }, { timeout: 10_000 });
+    await instance.dispose();
+    // Full access answered every permission on this turn; it must not have
+    // touched the question, and no permission card may stand in for it.
+    expect(events.filter((event) => event.type === "request.opened")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "request.resolved")).toEqual([
+      expect.objectContaining({ behavior: "answer", source: "user" }),
+    ]);
+    const toolMessage = JSON.parse(bodies[1]!).messages.at(-1);
+    expect(toolMessage).toMatchObject({ role: "tool", tool_call_id: "ask1" });
+    expect(JSON.parse(toolMessage.content)).toEqual({ ok: true, result: reply });
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+  }, 20_000);
+});
+
+describe("createOpenAIChatRuntime mid-turn steer", () => {
+  const mcpDir: string[] = [];
+  afterEach(() => { for (const d of mcpDir.splice(0)) rmSync(d, { recursive: true, force: true }); });
+
+  const toolServer = () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-chat-steer-"));
+    mcpDir.push(dir);
+    const script = join(dir, "fake-mcp.mjs");
+    writeFileSync(script, `#!/usr/bin/env node
+      const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+      let buffer = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (chunk) => {
+        buffer += chunk;
+        let nl;
+        while ((nl = buffer.indexOf("\\n")) !== -1) {
+          const line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+          const m = JSON.parse(line);
+          if (m.method === "initialize") send({jsonrpc:"2.0",id:m.id,result:{protocolVersion:"2024-11-05",capabilities:{tools:{}}}});
+          else if (m.method === "tools/list") send({jsonrpc:"2.0",id:m.id,result:{tools:[{name:"write",description:"Fixture write",inputSchema:{type:"object",properties:{},additionalProperties:false}}]}});
+          else if (m.method === "tools/call") send({jsonrpc:"2.0",id:m.id,result:{content:[{type:"text",text:"done"}]}});
+        }
+      });
+    `);
+    chmodSync(script, 0o755);
+    return { command: script, args: [], env: {} };
+  };
+
+  it("declares queueing and refuses steer with no running turn", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } })));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "compat", displayName: "Compat", enabled: true,
+      config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.com/v1", apiKeyEnv: "K", model: "m" }),
+      environment: { K: "secret" },
+    });
+    expect(instance.adapter.capabilities.queueing).toBe(true);
+    await expect(instance.adapter.steer!("thread", "peer context")).resolves.toBe("refused");
+    await instance.dispose();
+  });
+
+  it("delivers mid-turn asides into the next completion request after the tool round", async () => {
+    const toolCallBody = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"fx_write","arguments":"{}"}}]}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n';
+    const finalBody = 'data: {"choices":[{"index":0,"delta":{"content":"done."}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n';
+    const bodies: string[] = [];
+    let release!: (response: Response) => void;
+    const gate = new Promise<Response>((resolve) => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      bodies.push(String(init?.body));
+      return bodies.length === 1
+        ? await gate
+        : new Response(finalBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "compat", displayName: "Compat", enabled: true,
+      config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.com/v1", apiKeyEnv: "K", model: "m" }),
+      environment: { K: "secret" },
+    });
+    const events: RuntimeEvent[] = [];
+    instance.adapter.onEvent((event) => events.push(event));
+    await instance.adapter.sendTurn({
+      threadId: "t", text: "hi", approvalMode: "full",
+      integrations: { custom: { fx: toolServer() } },
+    });
+    // Wait until request 1 is genuinely in flight (the gated fetch was
+    // called), then park two asides mid-turn: they must stay out of the
+    // active request — they belong to the next round.
+    await vi.waitFor(() => {
+      if (bodies.length < 1) throw new Error("first request not sent yet");
+    }, { timeout: 10_000 });
+    const aside = "[aside from @Peer — peer context, not steering]\nheads up\n[end aside]";
+    await expect(instance.adapter.steer!("t", aside)).resolves.toBe("steered");
+    await expect(instance.adapter.steer!("t", "second aside")).resolves.toBe("steered");
+    release(new Response(toolCallBody, { status: 200, headers: { "content-type": "text/event-stream" } }));
+    await vi.waitFor(() => {
+      if (!events.some((event) => event.type === "turn.completed")) throw new Error("turn still running");
+    }, { timeout: 10_000 });
+    await instance.dispose();
+    type ChatMessage = { role: string; content?: unknown };
+    const first = JSON.parse(bodies[0]!).messages as ChatMessage[];
+    const second = JSON.parse(bodies[1]!).messages as ChatMessage[];
+    expect(first.some((message) => typeof message.content === "string" && message.content.includes("aside from @Peer"))).toBe(false);
+    // The aside rides after the tool result as the newest input for round 2,
+    // and both parked asides batch into that one user message.
+    const toolIndex = second.map((message) => message.role).lastIndexOf("tool");
+    const asideIndex = second.findIndex((message) => message.role === "user" && typeof message.content === "string" && message.content.includes("aside from @Peer"));
+    expect(toolIndex).toBeGreaterThan(-1);
+    expect(asideIndex).toBe(second.length - 1);
+    expect(asideIndex).toBeGreaterThan(toolIndex);
+    expect(second[asideIndex]!.content).toContain("[end aside]\n\nsecond aside");
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+    // Once the turn settled the seam refuses: late words go back to the queue.
+    await expect(instance.adapter.steer!("t", "late")).resolves.toBe("refused");
+  }, 20_000);
 });
 
 describe("createOpenAIChatRuntime stream termination", () => {

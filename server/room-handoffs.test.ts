@@ -18,6 +18,43 @@ async function fixture(test: (engine: RoomHandoffs, hooks: RoomHandoffHooks, fil
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 
 describe("addressed room request tree", () => {
+  it("starts independent work before its author settles, but resumes only after settlement", () => fixture(async (engine, hooks) => {
+    const source = { botId: "chief", threadId: "chief-chat" };
+    const child = engine.enqueue(source, "turn", undefined, { botId: "builder", threadId: "builder-chat" }, "build", "Build it").node;
+    engine.tick(); await flush(); engine.tick();
+    expect(child.status).toBe("completed");
+    expect(engine.nodes.get("turn")?.status).toBe("source");
+    expect(hooks.run).toHaveBeenCalledTimes(1);
+    engine.sourceSettled("turn", false);
+    engine.tick(); await flush();
+    expect(hooks.run).toHaveBeenCalledTimes(2);
+    expect(engine.nodes.get("turn")?.status).toBe("completed");
+  }));
+  it("keeps same-room work queued until the current speaker settles", () => fixture(async (engine, hooks) => {
+    const child = engine.enqueue(addr("A"), "turn", undefined, { ...addr("A"), botId: "peer" }, "review", "Review it").node;
+    engine.tick(); await flush();
+    expect(child.status).toBe("queued");
+    expect(hooks.run).not.toHaveBeenCalled();
+    engine.sourceSettled("turn", true); engine.tick(); await flush();
+    expect(child.status).toBe("completed");
+  }));
+  it.each([false, true])("keeps accepted nested work when its lead fails (throws: %s)", throws => fixture(async (engine, hooks) => {
+    const chief = { botId: "chief", threadId: "chief" };
+    const lead = { botId: "lead", threadId: "lead" };
+    hooks.run = vi.fn(async (node, resumed) => {
+      if (node.botId === lead.botId && !resumed) {
+        engine.enqueue(lead, "unused", node.id, { botId: "reviewer", threadId: "reviewer" }, "review", "Verify it");
+        if (throws) throw new Error("Lead provider disconnected");
+        return { ok: false, text: "Lead provider disconnected" };
+      }
+      return { ok: true, text: "Verified result" };
+    });
+    engine.enqueue(chief, "source", undefined, lead, "build", "Build it");
+    engine.sourceSettled("source", true);
+    for (let i = 0; i < 8; i++) { engine.tick(); await flush(); }
+    expect([...engine.nodes.values()].every(node => node.status === "completed")).toBe(true);
+    expect(hooks.run).toHaveBeenCalledTimes(4);
+  }));
   it("treats group-less tasks as bounded work, deduplicates pinned threads and rejects direct or mixed cycles", () => fixture(engine => {
     const source = { botId: "clive", threadId: "clive-chat" };
     const target = { botId: "lead", threadId: "lead-task" };
@@ -109,7 +146,7 @@ describe("addressed room request tree", () => {
     engine.enqueue(addr("X"), "other", undefined, addr("Y"), "work", "build", false, false, "x".repeat(20_000));
     expect(engine.nodes.get("other")?.text).toHaveLength(12_000);
   }));
-  it("releases the middle turn before starting its child, then returns and resumes both ancestors", () => fixture(async (engine, hooks) => {
+  it("starts independent children immediately, then returns and resumes both ancestors", () => fixture(async (engine, hooks) => {
     const order: string[] = [];
     hooks.run = async (node, resumed) => {
       order.push(`${node.groupId}:${resumed}`);
@@ -117,7 +154,7 @@ describe("addressed room request tree", () => {
       return { ok: true, text: `${node.groupId} done` };
     };
     engine.enqueue(addr("A"), "turn", undefined, addr("B"), "develop", "build");
-    engine.tick(); expect(order).toEqual([]);
+    engine.tick(); expect(order).toEqual(["B:false", "C:false"]);
     engine.sourceSettled("turn", true);
     for (let i = 0; i < 12; i++) { engine.tick(); await flush(); }
     expect(order).toEqual(["B:false", "C:false", "B:true", "A:true"]);
@@ -168,10 +205,10 @@ describe("addressed room request tree", () => {
     }
     expect(() => engine.enqueue(source, "second-root", parentId, addr("too-deep"), "work", "build")).toThrow("depth");
   }));
-  it("cancels queued work when its source fails and never runs a revoked route", () => fixture(async (engine, hooks) => {
+  it("retains accepted work when its source fails but never runs a revoked route", () => fixture(async (engine, hooks) => {
     engine.enqueue(addr("A"), "turn", undefined, addr("B"), "work", "build");
     engine.sourceSettled("turn", false); engine.tick(); await flush();
-    expect(hooks.run).not.toHaveBeenCalled();
+    expect(hooks.run).toHaveBeenCalledTimes(1);
     const { node } = engine.enqueue(addr("C"), "turn2", undefined, addr("D"), "work", "build");
     engine.sourceSettled("turn2", true);
     hooks.validate = n => n.id === node.id ? "route revoked" : undefined;
@@ -475,4 +512,38 @@ describe("room handoff lifetime budget", () => {
       expect(engine.nodes.get("turn")?.status).not.toBe("failed");
     }, () => nowMs);
   });
+});
+
+
+describe("shared room request display", () => {
+  it("shares one identity across recipients and rejects late additions after real dispatch and restart", () => fixture(async (engine, hooks, file) => {
+    const source = addr("A");
+    const one = engine.enqueue(source, "turn", undefined, addr("B"), "work:b", "Review", false, false, "", "work").node;
+    const two = engine.enqueue(source, "turn", undefined, { ...addr("B"), botId: "c" }, "work:c", "Review", false, false, "", "work").node;
+    expect(engine.sharedRequest(one)).toEqual({ id: one.id, botIds: [one.botId, two.botId] });
+    expect(engine.sharedRequest(two)).toEqual(engine.sharedRequest(one));
+    engine.tick();
+    expect(one.status).toBe("running");
+    expect(one.startedAt).toBeDefined();
+    expect(() => engine.enqueue(source, "turn", undefined, { ...addr("B"), botId: "late" }, "work:late", "Review", false, false, "", "work")).toThrow("already started");
+    await flush();
+    expect(one.status).toBe("completed");
+    expect(one.executions).toBe(0); // The root, not this child, owns the execution counter.
+    expect(engine.enqueue(source, "turn", undefined, addr("B"), "work:b", "Review", false, false, "", "work").duplicate).toBe(true);
+    expect(() => engine.enqueue(source, "turn", undefined, { ...addr("B"), botId: "late" }, "work:late", "Review", false, false, "", "work")).toThrow("already started");
+    const restarted = new RoomHandoffs(file, hooks);
+    expect(restarted.sharedRequest(restarted.nodes.get(two.id)!)).toEqual(engine.sharedRequest(two));
+    expect(() => restarted.enqueue(source, "turn", undefined, { ...addr("B"), botId: "late" }, "work:late", "Review", false, false, "", "work")).toThrow("already started");
+    expect(restarted.sharedRequest(restarted.nodes.get(one.id)!)).toEqual({ id: one.id, botIds: [one.botId, two.botId] });
+  }));
+  it("does not merge different requests, conversations, senders or direct assignments", () => fixture(engine => {
+    const a = engine.enqueue(addr("A"), "turn", undefined, addr("B"), "one:b", "Review", false, false, "", "one").node;
+    const b = engine.enqueue(addr("A"), "turn", undefined, { ...addr("B"), botId: "c" }, "two:c", "Review", false, false, "", "two").node;
+    const c = engine.enqueue(addr("A"), "other-turn", undefined, addr("B"), "one:b", "Review", false, false, "", "one").node;
+    const d = engine.enqueue(addr("A"), "turn", undefined, addr("D"), "one:d", "Review", false, false, "", "one").node;
+    const direct = engine.enqueue(addr("A"), "turn", undefined, { botId: "direct", threadId: "direct" }, "one:direct", "Review").node;
+    for (const node of [a,b,c,d,direct]) expect(engine.sharedRequest(node)).toEqual({ id: node.id, botIds: [node.botId] });
+    expect(() => engine.enqueue(addr("A"), "turn", undefined, { ...addr("B"), botId: "different" }, "one:different", "Changed", false, false, "", "one")).toThrow("different room work");
+    expect(() => engine.enqueue(addr("A"), "turn", undefined, { ...addr("B"), threadId: "new", botId: "different" }, "one:different", "Review", false, false, "", "one")).toThrow("different room work");
+  }));
 });

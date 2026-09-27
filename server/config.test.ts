@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JsonValue } from "./schema.ts";
 
 import { customMcpServers,
@@ -31,6 +31,7 @@ import { customMcpServers,
   browserProfilePartitionTarget,
   browserProfileReplacementConflict,
   browserProfileRoutingConflict,
+  stripControlPlaneEnv,
   stripWorkspaceCredentialEnv,
   syncCredentialEnv,
   vpsSshAlias,
@@ -41,6 +42,41 @@ import { customMcpServers,
 } from "./config.ts";
 
 describe("configuration boundaries", () => {
+  it("requires an explicit backup to opt into automatic recovery without reloading engines", () => {
+    expect(parseStoredConfig({}).automaticRecovery).toBeUndefined();
+    expect(parseConfigPatch({ automaticRecovery: { enabled: false } })).toEqual({ automaticRecovery: { enabled: false } });
+    const automaticRecovery = { enabled: true, backup: { instanceId: "codex", model: "backup", effort: "high" } };
+    expect(parseStoredConfig({ automaticRecovery }).automaticRecovery).toEqual(automaticRecovery);
+    expect(parseConfigPatch({ automaticRecovery }).automaticRecovery).toEqual(automaticRecovery);
+    expect(providerReloadKeys({ automaticRecovery })).toEqual([]);
+    const invalidSettings: JsonValue[] = [{ enabled: true }, { backup: { instanceId: "codex", model: "m" } },
+      { enabled: "true" }, { enabled: true, backup: { instanceId: "", model: "m" } },
+      { enabled: true, backup: { instanceId: "codex", model: "m", effort: "high", variant: "v" } },
+      { enabled: false, maxRetries: 2 }];
+    for (const invalid of invalidSettings) {
+      expect(() => parseConfigPatch({ automaticRecovery: invalid })).toThrow("automaticRecovery");
+    }
+  });
+  it("accepts shared user context, including clearing, without reloading providers", () => {
+    const profile = { aboutMe: "I prefer short answers.\nMy time zone is Europe/Berlin." };
+    expect(parseConfigPatch({ profile })).toEqual({ profile });
+    expect(parseStoredConfig({ profile })).toEqual({ profile });
+    expect(parseConfigPatch({ profile: { aboutMe: "" } })).toEqual({ profile: { aboutMe: "" } });
+    expect(providerReloadKeys({ profile })).toEqual([]);
+    expect(() => parseConfigPatch({ profile: { aboutMe: "x".repeat(24_001) } })).toThrow();
+  });
+  it("validates context budgets and keeps changes independent of provider reload", () => {
+    const context = { autoCompact: false, compactAt: 0.7, rebuildBytes: 32_000 };
+    expect(parseStoredConfig({ context })).toEqual({ context });
+    expect(parseConfigPatch({ context })).toEqual({ context });
+    expect(providerReloadKeys({ context })).toEqual([]);
+    for (const value of [0, -1, "10", null, Infinity]) {
+      expect(() => parseConfigPatch({ context: { compactAt: value } })).toThrow();
+    }
+    for (const value of [512, 1_024.1, 1_000_001]) {
+      expect(() => parseConfigPatch({ context: { rebuildBytes: value } })).toThrow();
+    }
+  });
   it("keeps Fish Audio and ElevenLabs voice credentials separate", () => {
     const parsed = parseConfigPatch({
       tts: { provider: "fish", key: "eleven-key", fishKey: "fish-key", voice: "fish-voice" },
@@ -68,7 +104,10 @@ describe("configuration boundaries", () => {
     expect(threadEventLogMaxBytes({ threads: { maxConcurrentPerBot: 3 } })).toBeNull();
     const parsed = parseStoredConfig({ threads: { maxConcurrentPerBot: 3, eventLogMaxBytes: 50 * 1024 * 1024 } });
     expect(threadEventLogMaxBytes(parsed)).toBe(50 * 1024 * 1024);
-    for (const value of [0, -1, 256 * 1024 - 1, 1.5, "1000", null]) {
+    // the knob patches on its own and null is the explicit clear marker
+    expect(parseConfigPatch({ threads: { eventLogMaxBytes: 50 * 1024 * 1024 } })).toEqual({ threads: { eventLogMaxBytes: 50 * 1024 * 1024 } });
+    expect(parseConfigPatch({ threads: { eventLogMaxBytes: null } })).toEqual({ threads: { eventLogMaxBytes: null } });
+    for (const value of [0, -1, 256 * 1024 - 1, 1.5, "1000"]) {
       expect(() => parseConfigPatch({ threads: { maxConcurrentPerBot: 3, eventLogMaxBytes: value } })).toThrow("threads.eventLogMaxBytes");
     }
   });
@@ -78,7 +117,10 @@ describe("configuration boundaries", () => {
     expect(threadEventLogRetentionDays(parseStoredConfig({ threads: { maxConcurrentPerBot: 2 } }))).toBeNull();
     const configured = parseStoredConfig({ threads: { maxConcurrentPerBot: 2, eventLogRetentionDays: 30 } });
     expect(threadEventLogRetentionDays(configured)).toBe(30);
-    for (const value of [0, -1, 1.5, "30", null, 3660]) {
+    // the knob patches on its own and null is the explicit clear marker
+    expect(parseConfigPatch({ threads: { eventLogRetentionDays: 30 } })).toEqual({ threads: { eventLogRetentionDays: 30 } });
+    expect(parseConfigPatch({ threads: { eventLogRetentionDays: null } })).toEqual({ threads: { eventLogRetentionDays: null } });
+    for (const value of [0, -1, 1.5, "30", 3660]) {
       expect(() => parseConfigPatch({ threads: { maxConcurrentPerBot: 2, eventLogRetentionDays: value } })).toThrow("threads.eventLogRetentionDays");
     }
   });
@@ -128,6 +170,14 @@ describe("configuration boundaries", () => {
     const expected = { defaultModelSelection: { instanceId: "codex", model: "chosen-model", effort: "high" } };
     expect(parseStoredConfig(input)).toEqual(expected);
     expect(parseConfigPatch(input)).toEqual(expected);
+  });
+
+  it("accepts a new-bot effort default and clears it with null", () => {
+    expect(parseStoredConfig({ newBots: { effort: "medium" } })).toEqual({ newBots: { effort: "medium" } });
+    expect(parseConfigPatch({ newBots: { effort: "medium" } })).toEqual({ newBots: { effort: "medium" } });
+    expect(parseConfigPatch({ newBots: { effort: null } })).toEqual({ newBots: { effort: null } });
+    expect(() => parseConfigPatch({ newBots: { effort: "turbo" } })).toThrow("newBots");
+    expect(() => parseConfigPatch({ newBots: { approvalMode: "full" } })).toThrow("newBots");
   });
 
   it("round-trips an opaque model variant without converting omission to none", () => {
@@ -436,6 +486,12 @@ describe("configuration boundaries", () => {
     expect(parseConfigPatch({ localVm: { mode: "per-bot", maxInstances: 4 } })).toEqual({
       localVm: { mode: "per-bot", maxInstances: 4 },
     });
+    expect(parseConfigPatch({ localVm: { maxInstances: 5 } })).toEqual({
+      localVm: { maxInstances: 5 },
+    });
+    expect(parseConfigPatch({ localVm: { mode: "per-bot", maxInstances: 8 } })).toEqual({
+      localVm: { mode: "per-bot", maxInstances: 8 },
+    });
     expect(localVmMode({ localVm: { mode: "per-bot" } })).toBe("per-bot");
     expect(localVmMaxInstances({ localVm: { maxInstances: 3 } })).toBe(3);
   });
@@ -499,7 +555,7 @@ describe("configuration boundaries", () => {
     expect(showToolCallsEnabled({ features: { showToolCalls: true } })).toBe(true);
   });
 
-  it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
+  it.each([0, 1.5, 9, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
     expect(() => parseConfigPatch({ localVm: { maxInstances } })).toThrow("localVm.maxInstances");
   });
 
@@ -531,9 +587,56 @@ describe("saving the newer sections", () => {
       rmSync(path, { force: true });
     }
   });
+
+  it("clears a thread event-log knob with null while other keys survive", () => {
+    const path = join(DATA_DIR, "config.json");
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(path, JSON.stringify({}));
+    try {
+      saveConfig({ threads: { maxConcurrentPerBot: 3, eventLogRetentionDays: 30, eventLogMaxBytes: 50 * 1024 * 1024 } });
+      // clearing one knob leaves the sibling knob and the concurrency limit alone
+      saveConfig({ threads: { eventLogRetentionDays: null } });
+      let disk = JSON.parse(readFileSync(path, "utf8"));
+      expect(disk.threads).toEqual({ maxConcurrentPerBot: 3, eventLogMaxBytes: 50 * 1024 * 1024 });
+      saveConfig({ threads: { eventLogMaxBytes: null } });
+      disk = JSON.parse(readFileSync(path, "utf8"));
+      expect(disk.threads).toEqual({ maxConcurrentPerBot: 3 });
+      expect(parseStoredConfig(disk).threads).toEqual({ maxConcurrentPerBot: 3 });
+      expect(threadEventLogRetentionDays(parseStoredConfig(disk))).toBeNull();
+      expect(threadEventLogMaxBytes(parseStoredConfig(disk))).toBeNull();
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
+
+  it("seeds the concurrency default when the first threads save is an event-log knob", () => {
+    const path = join(DATA_DIR, "config.json");
+    mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(path, JSON.stringify({}));
+    try {
+      saveConfig({ threads: { eventLogRetentionDays: 30 } });
+      const disk = JSON.parse(readFileSync(path, "utf8"));
+      expect(disk.threads).toEqual({ maxConcurrentPerBot: 3, eventLogRetentionDays: 30 });
+      // the persisted section must survive the stricter boot-time parse
+      expect(parseStoredConfig(disk).threads).toEqual({ maxConcurrentPerBot: 3, eventLogRetentionDays: 30 });
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
 });
 
 describe("default fleet", () => {
+  it("adds Mistral to product fleets and scopes its saved credential to Mistral", () => {
+    const map = instanceConfigs({ mistral: { key: "mistral-fixture" }, instances: { codex: { driver: "codex" } } });
+    expect(map.mistral).toEqual({ driver: "mistral", environment: { MISTRAL_API_KEY: "mistral-fixture" } });
+    expect(map.codex.environment).toEqual({});
+    expect(instanceConfigs({ instances: { standalone: { driver: "fake" } } })).not.toHaveProperty("mistral");
+    expect(parseConfigPatch({ mistral: { key: "" } })).toEqual({ mistral: { key: "" } });
+    const env = { MISTRAL_API_KEY: "mistral-fixture", KEEP: "yes" };
+    stripWorkspaceCredentialEnv(env);
+    expect(env).toEqual({ KEEP: "yes" });
+  });
+
   it("ships Qwen and Hermes as custom-only engines", () => {
     const map = instanceConfigs({});
     expect(map.qwen).toEqual({ driver: "qwenAgent", environment: {} });
@@ -933,6 +1036,25 @@ describe("credential env preference", () => {
     expect(() => parseConfigPatch({ onboarding: { unknown: true } })).toThrow();
   });
 
+  it("replaces automatic recovery atomically, clears an omitted backup and keeps unrelated settings", () => {
+    const backup = { instanceId: "codex", model: "backup", effort: "high" as const };
+    saveConfig({ automaticRecovery: { enabled: true, backup }, profile: { name: "Recovery fixture" } });
+    expect(loadConfig().automaticRecovery).toEqual({ enabled: true, backup });
+    saveConfig({ automaticRecovery: { enabled: true, backup: { instanceId: "claude", model: "other" } } });
+    expect(loadConfig().automaticRecovery).toEqual({ enabled: true, backup: { instanceId: "claude", model: "other" } });
+    expect(() => saveConfig({ automaticRecovery: { enabled: true } })).toThrow();
+    expect(loadConfig().automaticRecovery?.backup?.model).toBe("other");
+    saveConfig({ automaticRecovery: { enabled: false } });
+    expect(loadConfig().automaticRecovery).toEqual({ enabled: false });
+    expect(loadConfig().profile).toEqual({ name: "Recovery fixture" });
+  });
+
+  it("persists a context change without losing the other context preferences", () => {
+    saveConfig({ context: { rebuildBytes: 32_000, autoCompact: false } });
+    saveConfig({ context: { compactAt: 0.75 } });
+    expect(loadConfig().context).toEqual({ rebuildBytes: 32_000, autoCompact: false, compactAt: 0.75 });
+  });
+
   it("falls back to the config file when the env var is unset (dev mode)", () => {
     writeFileSync(
       join(DATA_DIR, "config.json"),
@@ -967,6 +1089,30 @@ describe("credential env preference", () => {
     expect(loadConfig().defaultModelSelection).toEqual(replacement);
     expect(loadConfig().profile).toEqual({ name: "Ada", email: "ada@example.com" });
     expect(loadConfig().instances).toEqual(existing.instances);
+  });
+
+  it("rejects oversized default model changes before writing the template", () => {
+    saveConfig({ newBotDefaults: { profile: { modelSelection: { instanceId: "codex", model: "valid" } }, memory: {}, skills: [], routines: [] } });
+    const path = join(DATA_DIR, "config.json");
+    const before = readFileSync(path, "utf8");
+    for (const selection of [{ instanceId: "x".repeat(201), model: "valid" }, { instanceId: "codex", model: "x".repeat(501) }]) {
+      expect(() => saveConfig({ defaultModelSelection: selection })).toThrow();
+      expect(readFileSync(path, "utf8")).toBe(before);
+      expect(loadConfig().newBotDefaults?.profile.modelSelection?.model).toBe("valid");
+    }
+  });
+
+  it("rejects a valid model selection that would overflow the complete defaults template", () => {
+    const defaults = { profile: { modelSelection: { instanceId: "codex", model: "valid" } },
+      memory: { "memory/a.md": "a".repeat(225_000), "memory/b.md": "b".repeat(225_000),
+        "memory/c.md": "c".repeat(225_000), "memory/d.md": "" }, skills: [], routines: [] };
+    defaults.memory["memory/d.md"] = "d".repeat(899_990 - Buffer.byteLength(JSON.stringify(defaults), "utf8"));
+    saveConfig({ newBotDefaults: defaults });
+    const path = join(DATA_DIR, "config.json");
+    const before = readFileSync(path, "utf8");
+    expect(() => saveConfig({ defaultModelSelection: { instanceId: "codex", model: "m".repeat(500) } })).toThrow("900 KB");
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(loadConfig().newBotDefaults).toEqual(defaults);
   });
 
   it("replaces instance membership and known settings while preserving retained extension fields", () => {
@@ -1175,6 +1321,29 @@ describe("workspace credential env strip", () => {
     expect(env).toEqual({ PATH: "/usr/bin", MY_FLAG: "1" });
   });
 
+  it("keeps a hosted tenant's control-plane secrets out of every child env, and only those", () => {
+    // What the hosting control plane and a fleet put in the server's
+    // environment. `OMB_CLOUD_FUTURE_SECRET` stands for a name added later.
+    const operator = {
+      OMB_CLOUD_READY_TOKEN: "ready", OMB_CLOUD_BOOTSTRAP: "bootstrap", OMB_CLOUD_GATEWAY_TOKEN: "gateway",
+      OMB_CLOUD_MODELS: "models", OMB_CLOUD_REVISION: "revision", OMB_CLOUD_FUTURE_SECRET: "later",
+      OMB_LICENSE_KEY: "license", OMB_INSTALLATION_CREDENTIAL: "fleet", omb_cloud_ready_token: "windows-spelling",
+    };
+    // What an engine deliberately receives (server/hosted-models.ts passes the
+    // hosted model token as the provider key), plus look-alike names.
+    const engine = {
+      PATH: "/usr/bin", ANTHROPIC_API_KEY: "hosted-token", ANTHROPIC_AUTH_TOKEN: "hosted-token",
+      ANTHROPIC_BASE_URL: "https://admin.example.test/api/gateway/w/anthropic", OPENMAUSBOT_COMPANY_API_KEY: "hosted-token",
+      OMB_MANAGED_CODEX_TOKEN: "hosted-token", CODEX_HOME: "/data/codex", OMB_HOOK_TOKEN_FILE: "/data/hook-tokens/a.token",
+      OMB_CLOUDFLARED_PATH: "/usr/local/bin/cloudflared", OMB_CLOUD: "not-prefixed", MY_OMB_CLOUD_NOTE: "user",
+    };
+    for (const strip of [stripControlPlaneEnv, stripWorkspaceCredentialEnv]) {
+      const env: Record<string, string | undefined> = { ...operator, ...engine };
+      strip(env);
+      expect(env).toEqual(engine);
+    }
+  });
+
   it("covers in-process secrets and private app-state paths", () => {
     // These secrets have no per-driver ACP allowlist entry anywhere — they are
     // consumed in-process (Computer driver / voice module), never by a CLI
@@ -1284,5 +1453,72 @@ describe("customMcpServers with url entries", () => {
       docs: { type: "sse", url: "https://docs.example/sse", headers: { Authorization: "Bearer t" } },
       notes: { command: "npx", args: [], env: {} },
     });
+  });
+});
+
+describe("loadConfig with an unusable config.json", () => {
+  const path = join(DATA_DIR, "config.json");
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(path, { force: true });
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    loadConfig(); // reset the once-per-problem memory with a clean run
+    warn.mockClear();
+  });
+  afterEach(() => {
+    warn.mockRestore();
+    rmSync(path, { force: true });
+  });
+
+  it("stays quiet on a first run with no file", () => {
+    expect(loadConfig().instances).toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("names the file and the failing field when one schema error drops the whole file", () => {
+    // threads without maxConcurrentPerBot fails the stored schema, which drops
+    // every other section (here: the Claude instance) along with it.
+    writeFileSync(path, JSON.stringify({
+      instances: { claude: { driver: "claudeAgent", displayName: "Claude (work)" } },
+      threads: { eventLogMaxBytes: 1_000_000 },
+    }));
+    expect(loadConfig().instances).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = String(warn.mock.calls[0]?.[0]);
+    expect(message).toContain(path);
+    expect(message).toContain("maxConcurrentPerBot");
+  });
+
+  it("warns about invalid JSON too, and only once while the file stays broken", () => {
+    writeFileSync(path, "{ not json");
+    loadConfig();
+    loadConfig();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("using defaults");
+  });
+
+  it("never logs credential fragments from a JSON parser error", () => {
+    writeFileSync(path, "sk-fixture");
+    loadConfig();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("invalid JSON");
+    expect(String(warn.mock.calls[0]?.[0])).not.toContain("sk-fixture");
+  });
+
+  it("warns again after a repaired or removed file becomes broken", () => {
+    for (const recovered of ["{}", null]) {
+      writeFileSync(path, "{ not json");
+      loadConfig();
+      warn.mockClear();
+      if (recovered === null) rmSync(path);
+      else writeFileSync(path, recovered);
+      loadConfig();
+      expect(warn).not.toHaveBeenCalled();
+      writeFileSync(path, "{ not json");
+      loadConfig();
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockClear();
+    }
   });
 });

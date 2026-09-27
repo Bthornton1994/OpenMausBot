@@ -434,6 +434,8 @@ private fun LoadedChat(
     val transcript = remember(rawTranscript, activityDetail) {
         transcriptRows(rawTranscript, activityDetail)
     }
+    var expandedTurns by remember(threadId) { mutableStateOf(emptySet<String>()) }
+    var revealedTurnMessageId by remember(threadId) { mutableStateOf<String?>(null) }
     val predictiveChips = remember(quickReplies) {
         quickReplies.map { PredictiveChip(title = it.title, prompt = it.prompt, icon = it.icon) }
     }
@@ -441,7 +443,7 @@ private fun LoadedChat(
     val reasoning = state.reasoning[threadId]
     // Stream, then reasoning, then the bare fact of being busy — the order in
     // `ChatView.swift`, and the reason it is a rule rather than three `if`s here.
-    val tail = LiveTail.of(streaming = streaming, reasoning = reasoning, busy = chat.busy)
+    val tail = LiveTail.of(streaming = streaming, reasoning = reasoning, busy = chat.busy, detail = activityDetail)
     val liveText = streaming?.takeIf { tail == TranscriptTail.STREAM }
     val liveReasoning = reasoning?.takeIf { tail == TranscriptTail.REASONING }
     val hasMore = state.hasMore[threadId] == true
@@ -532,6 +534,11 @@ private fun LoadedChat(
     LaunchedEffect(showingProfile) { if (showingProfile) dictation.stop() }
     LaunchedEffect(showingCall) { if (showingCall) dictation.stop() }
 
+    val connection by session.connection.collectAsState()
+    LaunchedEffect(chatId, threadId, connection?.id) {
+        environment.chatPreferences.rememberThread(chat, connection?.id)
+    }
+
     // Opening a chat is what marks it read, exactly as on the desktop — and a
     // message can arrive while it is already on screen, so this keys on the bit
     // rather than running once.
@@ -578,12 +585,19 @@ private fun LoadedChat(
     LaunchedEffect(focusedMessageId, transcript.size) {
         val target = focusedMessageId ?: return@LaunchedEffect
         val index = transcript.indexOfFirst { row ->
-            row.id == target ||
-                (row as? TranscriptRow.ActivityRun)?.items?.any { it.id == target } == true
+            row.id == target || row.containsMessage(target)
         }
         if (index < 0) return@LaunchedEffect
+        val turn = transcript[index] as? TranscriptRow.AssistantTurn
+        if (turn != null) expandedTurns = expandedTurns + turn.turnId
         listState.scrollToItem(headerCount + index)
-        session.consumeFocus(target)
+        if (turn != null) {
+            // The fold can span several screens. Its child brings the actual
+            // search hit into view before retiring the pending focus.
+            revealedTurnMessageId = target
+        } else {
+            session.consumeFocus(target)
+        }
         settled = true
     }
 
@@ -808,10 +822,7 @@ private fun LoadedChat(
                                             activityDetail,
                                         )
                                         val index = freshRows.indexOfFirst { row ->
-                                            row.id == anchor ||
-                                                (row as? TranscriptRow.ActivityRun)
-                                                    ?.items
-                                                    ?.any { it.id == anchor } == true
+                                            row.id == anchor || row.containsMessage(anchor)
                                         }
                                         if (index < 0) return@launch
                                         // The "load earlier" row is item 0 for as
@@ -858,6 +869,23 @@ private fun LoadedChat(
                                     openThread = ::openThread,
                                 )
                                 is TranscriptRow.ActivityRun -> ActivityRunChip(message.items, ::openThread)
+                                is TranscriptRow.AssistantTurn -> AssistantTurnChip(
+                                    turn = message,
+                                    chat = chat,
+                                    expanded = message.turnId in expandedTurns,
+                                    revealMessageId = revealedTurnMessageId,
+                                    onRevealed = { target ->
+                                        session.consumeFocus(target)
+                                        if (revealedTurnMessageId == target) revealedTurnMessageId = null
+                                    },
+                                    onToggle = {
+                                        expandedTurns = if (message.turnId in expandedTurns) expandedTurns - message.turnId
+                                            else expandedTurns + message.turnId
+                                    },
+                                    openLink = ::openLink,
+                                    openAttachment = ::openAttachment,
+                                    openThread = ::openThread,
+                                )
                             }
                         }
                     }
@@ -943,6 +971,20 @@ private fun LoadedChat(
                 onSteer = steerNow,
                 onCancelQueued = { queued ->
                     scope.launch { session.cancelQueued(queued, chat) }
+                },
+                onEditQueued = { queued ->
+                    // The computer drops it from the queue first; only a
+                    // confirmed removal hands the words back, so a send that
+                    // already joined the turn is never resent. The composer is
+                    // this conversation's cached draft, so a thread switch
+                    // mid-request still lands the words in the right place.
+                    val target = composer
+                    scope.launch {
+                        if (session.cancelQueued(queued, chat)) {
+                            target.onTypedChange(queued.editDraft(keeping = target.text))
+                            publishFrom(target)
+                        }
+                    }
                 },
                 openingFileName = openingFileName,
                 attachmentError = fileOpenError ?: attachmentError,
@@ -1424,6 +1466,7 @@ private fun Composer(
     steering: Boolean,
     onSteer: (() -> Unit)?,
     onCancelQueued: (QueuedSend) -> Unit,
+    onEditQueued: (QueuedSend) -> Unit,
     openingFileName: String?,
     attachmentError: String?,
     onRemoveAttachment: (PendingMessageAttachment) -> Unit,
@@ -1496,6 +1539,7 @@ private fun Composer(
                 send = queued,
                 onSteer = onSteer,
                 steering = steering,
+                onEdit = { onEditQueued(queued) },
                 onCancel = { onCancelQueued(queued) },
                 modifier = Modifier.fillMaxWidth(),
             )

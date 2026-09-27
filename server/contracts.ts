@@ -41,6 +41,18 @@ export class ProviderError extends Error {
   }
 }
 
+/** The driver proved this attempt never reached a prompt or client-side action,
+ * and its owned process has stopped. The harness may safely recover it. */
+export class TurnNotStartedError extends Error {
+  readonly turnId: TurnId;
+
+  constructor(turnId: TurnId, message: string) {
+    super(message);
+    this.name = "TurnNotStartedError";
+    this.turnId = turnId;
+  }
+}
+
 
 /** Variants are opaque provider IDs, not the cross-engine effort enum. */
 export function isModelVariant(value: unknown): value is string {
@@ -112,6 +124,13 @@ export interface SendTurnInput {
   effort?: EffortLevel;
   variant?: string;
   resumeCursor?: unknown;
+  /** Start without the previous native context, including any retained idle
+   * process. Takes precedence over resumeCursor. The runtime supplies the
+   * active conversation in text/transcript when rebuilding a session. */
+  sessionReset?: boolean;
+  /** Hold the startup ACK until prompt dispatch; a safely retired transient
+   * setup failure may reject with TurnNotStartedError instead of completing. */
+  startupRecovery?: boolean;
   /** The turn with the conversation so far replayed inline, attached only
    * alongside resumeCursor. A cursor-resuming driver sends it once, on a
    * fresh session, when the provider refuses the cursor before reading the
@@ -127,14 +146,20 @@ export interface SendTurnInput {
   /** Bot persona (name/title/description) as a system prompt. */
   system?: string;
   /** `system` split at the sections that legitimately change mid-conversation
-   * (memory today): `systemStable` is everything else, `systemVolatile` is
+   * (memory, mentions, outstanding teammate work, recent work): `systemStable` is everything else, `systemVolatile` is
    * those sections' text. A driver that keeps one CLI process per thread keys
    * that process on the stable half, so a memory edit no longer respawns the
    * session and makes the provider re-cache the entire prompt; the changed half
    * is delivered inside the next turn instead. Drivers that rebuild their
-   * request every turn ignore both and keep reading `system`. */
+   * request every turn keep only the stable half in their system message and
+   * carry the volatile half inside the newest user message, so the resent
+   * prefix stays byte-identical. */
   systemStable?: string;
   systemVolatile?: string;
+  /** True when this turn's user message tags teammates: the mentions part of
+   * systemVolatile describes this turn even when its text is unchanged from
+   * the previous turn, so digest-based delivery must not suppress the note. */
+  mentionTurn?: boolean;
   /** Coordinated teammate turns may resume a Claude conversation whose
    * earlier system prompt contained a different assignment. Refresh that
    * prompt when the provider supports it; the current brief also arrives
@@ -146,9 +171,8 @@ export interface SendTurnInput {
      * bridge harness-controlled lets it turn connection requests into trusted
      * chat cards consistently across provider CLIs. */
     composio?: { command: string; args: string[]; env: Record<string, string> };
-    /** Box's native agent runner input. Only the Box driver consumes this;
-     * CLI engines cannot use it as an MCP server. Other computers use the
-     * stdio descriptor below. */
+    /** Box's native runner or an explicitly capable driver consumes this
+     * leased descriptor. Other computers use the stdio descriptor below. */
     computer?: {
       kind?: "box";
       boxId: string;
@@ -167,6 +191,12 @@ export interface SendTurnInput {
       generation?: string;
       scope?: "local-computer";
     };
+    /** Engine lifecycle hooks (Claude Code hooks today): the harness's
+     * loopback URL and a turn-scoped bearer the engine's hook helper presents
+     * on POST /api/internal/hook. A driver that declares `capabilities.hooks`
+     * registers the helper with its engine; the harness only ever observes
+     * and injects context through this channel, never decides state. */
+    hooks?: { url: string; token: string };
     /** Peer-agent comms: an MCP proxy (list_bots / ask_bot) that routes back
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */
@@ -232,6 +262,19 @@ export interface ProviderAdapter {
      * told it has a computer whose tools its driver cannot mount — it
      * burns turns hunting for tools that aren't there. */
     computerMcp?: boolean;
+    /** Consumes the leased Box descriptor without switching to Box's model. */
+    cloudComputerMcp?: boolean;
+    /** True when the whole turn executes on the cloud computer (the Box native
+     * agent — POST /boxes/{id}/prompt) instead of in the host harness. Such a
+     * driver claims the box exclusively, cannot use host or Local VM surfaces,
+     * and every tool call acts on that machine's screen (screen pollers start
+     * with screenIsTheWork). Implies a cloud-computer turn even though the
+     * driver mounts no computer descriptor — cloudComputerMcp stays false. */
+    remoteAgent?: boolean;
+    /** True when this driver's turn can run against a cloud computer — natively
+     * (remoteAgent) or by mounting the leased Box descriptor (cloudComputerMcp).
+     * Gates every cloud attach path (attachBotBox / attachTeamBox canMount). */
+    usesCloudComputer?: boolean;
     /** True when the driver mounts turn.integrations.composio (the user's
      * connected apps). Same rule again: a key in the config says the user
      * HAS those connections, not that this driver can reach them. */
@@ -276,6 +319,10 @@ export interface ProviderAdapter {
      * for that new session. The harness then keeps such a session across
      * externally appended messages and sends only those. */
     strictResume?: boolean;
+    /** True when sendTurn can register the harness's hook helper with the
+     * engine (integrations.hooks). Only Claude Code today; other engines
+     * deliver the same information through their protocols. */
+    hooks?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -417,6 +464,36 @@ export interface ModelCatalog {
   }>;
 }
 
+/** The picker label for a model id when the catalog row carries no display
+ * name: split on the word breaks the catalog treats as separators and
+ * capitalize each part ("gpt-5.4-mini" → "Gpt 5.4 Mini"). Each harness
+ * passes its own break class so existing labels stay byte-for-byte. */
+export function titleCaseModelId(id: string, wordBreaks: RegExp): string {
+  return id
+    .split(wordBreaks)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+/** A picker label that carries a second facet — a display name, a provider
+ * host — beside the model id, unless the facet is already what the id says.
+ * `redundantWhen` decides what counts as "already said" and `decorate` how
+ * the facet is appended, so every harness's labels stay exactly what they
+ * were while the shape is written once. */
+export function qualifiedModelLabel(
+  id: string,
+  qualifier: string | null | undefined,
+  options: {
+    redundantWhen?: (id: string, qualifier: string) => boolean;
+    decorate?: (qualifier: string) => string;
+  } = {},
+): string {
+  const { redundantWhen = () => false, decorate = (facet) => ` — ${facet}` } = options;
+  if (!qualifier || redundantWhen(id, qualifier)) return id;
+  return `${id}${decorate(qualifier)}`;
+}
+
 export interface DriverCreateInput<Config> {
   instanceId: InstanceId;
   displayName: string | undefined;
@@ -457,8 +534,9 @@ export interface ProviderInstance {
 
 /** How an engine is presented in the picker rail.
  *  `subscription` — first-party cloud catalog; Custom is extra.
- *  `custom` — no subscription catalog; Custom is the product. */
-export type EngineAccess = "subscription" | "custom";
+ *  `custom` — no subscription catalog; Custom is the product.
+ *  `api` — a cloud model catalog billed through an API key. */
+export type EngineAccess = "subscription" | "custom" | "api";
 
 export interface ProviderDriver<Config = unknown> {
   readonly driverKind: DriverKind;

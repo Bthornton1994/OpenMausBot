@@ -12,7 +12,8 @@
 // every invocation appended to a log the assertions read. The agent is the
 // fake ACP CLI in echo-gated mode (see steer-queue.test.ts), whose echo
 // reply carries the FULL prompt and whose gate file gives a deterministic
-// busy window — no sleeps anywhere.
+// busy window. The slow-preview regression additionally crosses the old
+// five-second lock deadline before releasing its explicit gate.
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +32,7 @@ import {
 } from "./container-computer.ts";
 import { VPS_CONTAINER_LABEL, VPS_IMAGE, VPS_MANAGED_LABEL, VPS_VIEWER_LABEL, vpsContainerName } from "./vps-computer.ts";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import type { RoutineSchedule } from "../shared/routines.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -148,7 +150,7 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
   let acpDump: string;
   let dockerLog: string;
 
-  type ApiBody = Record<string, string | boolean | null | { instanceId: string; model: string } | { sshAlias: string }>;
+  type ApiBody = Record<string, string | boolean | null | RoutineSchedule | { instanceId: string; model: string } | { sshAlias: string }>;
 
   const api = async (method: string, path: string, body?: ApiBody): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${BASE}${path}`, {
@@ -313,6 +315,45 @@ createServer(socket => socket.end()).listen(port, '127.0.0.1');
     }
   }, 30_000);
 
+  it.each(["cloud", null] as const)("starts a %s turn after a slow preview without reporting preparation failure", async computer => {
+    expect((await api("PUT", "/api/config", { vps: { sshAlias: "production-vps" } })).status).toBe(200);
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    await api("PATCH", `/api/bots/${bot.id}`, {
+      computer, cloudBackend: "vps", modelSelection: { instanceId: "vps", model: "fake-model" },
+    });
+    const fixtureDir = dirname(dockerLog);
+    const hold = join(fixtureDir, "hold-capture");
+    const started = join(fixtureDir, "capture-started");
+    writeFileSync(gateFile, "open");
+    rmSync(`${acpDump}.mcp.json`, { force: true });
+    rmSync(started, { force: true });
+    writeFileSync(hold, "hold");
+    const preview = api("POST", `/api/bots/${bot.id}/computer/screenshot`, {});
+    try {
+      await until(async () => existsSync(started), "the slow preview");
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "Check the VPS after its screen refresh" })).status).toBe(202);
+      await until(async () => (await botById(bot.id))?.busy === true, "turn setup waiting on the preview");
+      // Deliberately cross the old 5s acquisition deadline, not an arbitrary
+      // readiness sleep: a normal screen refresh must not terminate the turn.
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      const waiting = await botById(bot.id);
+      expect(waiting.busy, JSON.stringify(waiting.messages)).toBe(true);
+      expect(JSON.stringify(waiting.messages)).not.toContain("the VPS is being prepared");
+      rmSync(hold, { force: true });
+      expect((await preview).status).toBe(200);
+      await until(async () => {
+        const saved = await botById(bot.id);
+        return !saved.busy && saved.messages.some((message: any) => message.text?.startsWith("echo: "));
+      }, "the recovered VPS turn");
+      const mounted = JSON.parse(readFileSync(`${acpDump}.mcp.json`, "utf8"));
+      expect(mounted.find((tool: any) => tool.name === "computer")?.args).toContain(CONTAINER_ID);
+    } finally {
+      rmSync(hold, { force: true });
+      await preview;
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+    }
+  }, 30_000);
+
   it.each(["stopped", "missing", "stopped-during-turn"])(
     "lets Auto discover a %s VPS and start or create it through its chat tool",
     async state => {
@@ -429,6 +470,8 @@ createServer(socket => socket.end()).listen(port, '127.0.0.1');
       const echo = snapshot.messages.find((m: any) => m.kind === "text" && m.text?.startsWith("echo: ")).text;
       // the VPS clause, including the disposable-filesystem warning
       expect(echo).toContain("self-hosted remote Linux computer");
+      expect(echo).toContain("This is a VPS, not Box");
+      expect(echo).toContain("using it does not require a Box API key");
       expect(echo).toContain("wiped whenever its container is recreated");
 
       // the official Cua MCP server was mounted through the VPS bridge
@@ -475,6 +518,27 @@ createServer(socket => socket.end()).listen(port, '127.0.0.1');
       expect(explicitTools.find((tool: { name: string }) => tool.name === "computer")?.args).toContain("production-vps");
       const threadPreview = await api("GET", `/api/bots/${bot.id}/computer?threadId=${explicitThread}`);
       expect(threadPreview.body).toMatchObject({ surface: "cloud", backend: "vps", ready: true });
+
+      // Scheduling on the bot's setup must retain its ACP model + VPS tools,
+      // without requiring credentials for the unrelated Box-hosted runner.
+      const created = await api("POST", "/api/routines", {
+        botId: bot.id, name: "VPS scheduled check", prompt: "Check the existing VPS.", enabled: false,
+        schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 },
+      });
+      expect(created.status, JSON.stringify(created.body)).toBe(201);
+      expect(created.body.routine.runOn).toBe("maus");
+      rmSync(`${acpDump}.mcp.json`, { force: true });
+      const started = await api("POST", `/api/routines/${created.body.routine.id}/run`);
+      expect(started.status, JSON.stringify(started.body)).toBe(201);
+      let completed: any;
+      await until(async () => {
+        completed = (await api("GET", "/api/routines")).body.runs.find((run: any) => run.id === started.body.run.id);
+        return completed?.status === "completed";
+      }, "the routine on the existing VPS");
+      const routineTools = JSON.parse(readFileSync(`${acpDump}.mcp.json`, "utf8"));
+      expect(routineTools.find((tool: { name: string }) => tool.name === "computer")?.args).toContain("production-vps");
+      const routineMessages = (await api("GET", `/api/threads/${completed.threadId}/messages?limit=100`)).body.messages;
+      expect(routineMessages.some((message: any) => message.text?.includes("This is a VPS, not Box"))).toBe(true);
 
       // The turn claim is gone, but its durable container remains on the old
       // host. Keep that resource visible until the user removes it.
@@ -573,12 +637,14 @@ createServer(socket => socket.end()).listen(port, '127.0.0.1');
           "Waiting for its turn on this computer — TCPR operator is running Queue check. Starts automatically when that finishes.",
         ), "the wait chip naming the holder");
 
-        // both turns finish; the wait settles as free-and-continuing or as
-        // stopped, depending on which turn ended first — never as an error
+        // both turns finish; the wait resolves as free-and-continuing or as
+        // stopped (with the duration it waited), depending on which turn
+        // ended first — never as an error, and never by erasing the wait
         writeFileSync(gateFile, "open");
         await until(async () => (await botById(bot.id))?.busy === false, "both turns settling");
         const settled = await activities(refill.threadId);
-        expect(settled.some((name) => name === "Computer free — continuing" || name === "Stopped waiting for the computer")).toBe(true);
+        expect(settled.some((name) =>
+          name.startsWith("Computer free — continuing after ") || name.startsWith("Stopped waiting for the computer after "))).toBe(true);
         expect(settled.join("|")).not.toMatch(/still busy|error/i);
         // the last thread out clears the claim: the alias can move again
         expect((await api("PUT", "/api/config", { vps: { sshAlias: "production-vps" } })).status).toBe(200);
