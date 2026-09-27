@@ -226,3 +226,7 @@ and Undo restored the file.
   health, reply style) and "when in doubt, keep", 4/4 kept every core line and
   moved Asha → asha, food → Dining, the Goa trip → travel, the codename → a
   project topic.
+- **M9 — health and diet never leave the core.** Hand test after M8: one
+  tidy-up moved "The user is vegetarian" into `Dining.md` despite the prompt.
+  Lines about diet, allergies or health are now excluded from the organize
+  call in code (`alwaysCore`), so no answer can move them.

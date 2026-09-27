@@ -107,8 +107,9 @@ off. It keeps the notes in shape without the bot having to decide to:
   or client, a trip, likes in one domain) into that subject's topic file,
   unchanged, creating it with a header and other words for it. Core facts —
   the person's name, where they live, their company, diet, allergies and
-  health needs, how they like replies — always stay; a line judged core is
-  not asked about again. At most 20 lines move in one pass; each file's change
+  health needs, how they like replies — always stay; a line about diet,
+  allergies or health is never even offered for moving (a fixed rule, not the
+  model's choice), and a line judged core is not asked about again. At most 20 lines move in one pass; each file's change
   is a journal row (*filed into topics*) that can be undone.
 - **About me.** A lasting fact about the person, taken from their own words,
   is added to **Settings → General → About me**, which every bot reads, as a

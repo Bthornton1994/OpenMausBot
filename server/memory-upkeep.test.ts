@@ -168,6 +168,8 @@ describe("organizing MEMORY.md", () => {
     expect(candidates.map((e) => e.body)).toEqual(["B"]);
     expect(parseMoves('{"moves":[{"i":0,"topic":"x"},{"i":0,"topic":"y"},{"i":5,"topic":"z"},{"i":0}]}', candidates).map((m) => m.topic)).toEqual(["x.md"]);
     expect(parseMoves("nonsense", candidates)).toEqual([]);
+    // health and diet facts are never offered for moving at all
+    expect(organizeCandidates("- 2026-09-26 · The user is vegetarian.\n- 2026-09-26 · Allergic to peanuts\n- 2026-09-26 · Loves Irani cafes\n", TODAY, new Set()).map((e) => e.body)).toEqual(["Loves Irani cafes"]);
     const { text: left, byTopic } = applyMoves(text, parseMoves('{"moves":[{"i":0,"topic":"x","aliases":["q"]}]}', candidates));
     expect(left).toBe("- 2026-09-26 · A\n- 2026-09-20 · Trip · until 2026-09-21\n");
     expect(byTopic.get("x.md")).toEqual({ lines: ["- 2026-09-26 · B"], aliases: ["q"] });
@@ -347,10 +349,12 @@ describe("the upkeep loop", () => {
       "",
     ].join("\n"));
     writeMemoryTopic(BOT.id, "Dining.md", "# Dining\n\n- Loves pasta\n");
-    organizeAnswer = '{"moves":[{"i":1,"topic":"Asha","aliases":["sister","family"]},{"i":2,"topic":"dining","aliases":["restaurants"]}]}';
+    organizeAnswer = '{"moves":[{"i":0,"topic":"Asha","aliases":["sister","family"]},{"i":1,"topic":"dining","aliases":["restaurants"]}]}';
     const report = await upkeep().tidy(BOT.id);
     expect(report.organized).toBe(2);
-    expect(organizePrompts[0]).toContain("[0] The user is allergic to peanuts.");
+    // the allergy is never even offered for moving
+    expect(organizePrompts[0]).not.toContain("allergic");
+    expect(organizePrompts[0]).toContain("[0] The user's sister Asha is a doctor in Delhi.");
     expect(memory()).toBe("- 2026-09-26 · from chat \"Food\" · The user is allergic to peanuts.\n");
     const asha = readMemoryTopic(BOT.id, "asha.md")!;
     expect(parseTopicHeader(asha)).toEqual({ title: "asha", aliases: ["sister", "family"] });
@@ -358,7 +362,7 @@ describe("the upkeep loop", () => {
     const dining = readMemoryTopic(BOT.id, "Dining.md")!;
     expect(parseTopicHeader(dining).aliases).toEqual(["restaurants"]);
     expect(dining).toContain("The user loves Irani cafes.");
-    // the core line was judged once and is not asked about again
+    // nothing left to judge: no second call
     organizePrompts = [];
     await upkeep().tidy(BOT.id);
     expect(organizePrompts).toEqual([]);

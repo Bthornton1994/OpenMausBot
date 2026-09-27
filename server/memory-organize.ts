@@ -15,6 +15,14 @@ export const ORGANIZE_MARKER = "You are the ORGANIZE step of a memory system";
 /** One pass moves at most this many entries. */
 export const MAX_MOVES = 20;
 const PROMPT_ENTRIES = 60;
+/** Lines the model may not move, whatever it answers: a safety or health
+ * fact must load into every turn. Seen live — a model moved "is vegetarian"
+ * into a food topic despite being told diet is core. */
+const ALWAYS_CORE = /\b(?:allerg\w*|anaphyla\w*|intoleran\w*|vegetarian|vegan|halal|kosher|gluten|lactose|diet\w*|diabet\w*|asthma\w*|epilep\w*|pregnan\w*|medicat\w*|medicine|medical|disabilit\w*|wheelchair|blind|deaf|health)\b/i;
+
+export function alwaysCore(body: string): boolean {
+  return ALWAYS_CORE.test(body);
+}
 
 export interface TopicMove {
   entry: MemoryEntryLine;
@@ -26,7 +34,7 @@ export interface TopicMove {
 /** Live, unexpired entries not already judged core: what the call is asked about. */
 export function organizeCandidates(text: string, today: string, core: ReadonlySet<string>): MemoryEntryLine[] {
   return parseMemoryEntries(text)
-    .filter((e) => !e.struck && !isExpired(e, today) && !core.has(factIdentity(e.body)))
+    .filter((e) => !e.struck && !isExpired(e, today) && !core.has(factIdentity(e.body)) && !alwaysCore(e.body))
     .slice(0, PROMPT_ENTRIES);
 }
 
