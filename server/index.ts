@@ -1274,15 +1274,17 @@ function operatorPrices(): PriceList | null {
  * engine reported tokens but no price, and let the spend cap see it at once.
  * The first booking that takes the month past the warning threshold, or to
  * the cap, notifies admins (once per month each; server/spend.ts). */
-function bookTurnUsage(row: Omit<UsageRow, "at" | "costSource">): void {
-  const booked = { ...row, ...ledgerCost(row, operatorPrices()), at: new Date().toISOString() };
+function bookTurnUsage(row: Omit<UsageRow, "at" | "costSource">, tokensReported = true, notificationThreadId = row.threadId): void {
+  // Missing helper usage is unpriced, not an estimated zero-dollar call.
+  const cost = tokensReported || row.costUsd !== null ? ledgerCost(row, operatorPrices()) : { costUsd: null };
+  const booked = { ...row, ...cost, at: new Date().toISOString() };
   // The append lands asynchronously; the cap counts the row from memory
   // until it does, so the check below (and the next turn start) sees it.
   noteSpend(DATA_DIR, booked, appendUsage(DATA_DIR, booked));
   const state = spendState(cfg, DATA_DIR);
   const alert = takeSpendAlert(DATA_DIR, state);
   if (alert && state) {
-    broadcast({ kind: "notify", notification: buildSpendNotification({ id: row.botId, name: row.botName }, row.threadId, spendAlertText(alert, state)) }, { adminOnly: true });
+    broadcast({ kind: "notify", notification: buildSpendNotification({ id: row.botId, name: row.botName }, notificationThreadId, spendAlertText(alert, state)) }, { adminOnly: true });
   }
 }
 
@@ -5119,8 +5121,29 @@ const memoryUpkeep = createMemoryUpkeep({
     const bot = store.bot(botId);
     const instance = bot ? registry.get(bot.modelSelection.instanceId) : undefined;
     // an engine the organisation disallows never receives memory text
-    if (!instance || policyModelRefusal(instance)) return null;
-    return instance.generateText ? { generateText: instance.generateText.bind(instance) } : {};
+    if (!bot || !instance || policyModelRefusal(instance)) return null;
+    const generate = instance.generateText?.bind(instance);
+    return generate ? {
+      generateText: async (prompt, options) => {
+        // Check every capture, organize and contradiction call, including
+        // consecutive calls within one upkeep pass.
+        assertWithinBudget(cfg, DATA_DIR);
+        const threadId = `memory-${randomUUID()}`;
+        return generate(prompt, { ...options, onUsage: (usage) => bookTurnUsage({
+          botId: bot.id,
+          botName: bot.name,
+          threadId,
+          instanceId: instance.instanceId,
+          driverKind: instance.driverKind,
+          model: usage.model,
+          input: usage.input ?? 0,
+          output: usage.output ?? 0,
+          ...(usage.cachedInput !== undefined ? { cachedInput: usage.cachedInput } : {}),
+          costUsd: usage.costUsd ?? null,
+          trigger: { kind: "bot", botId: bot.id },
+        }, usage.input !== undefined && usage.output !== undefined, bot.threadId) });
+      },
+    } : {};
   },
   busy: (botId) => botHasActiveTurn(botId),
   addToAboutMe: (from, texts) => {

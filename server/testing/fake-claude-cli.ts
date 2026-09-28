@@ -36,6 +36,8 @@
 //   FAKE_CLAUDE_TEXT_HANG when set, the one-shot text mode never replies —
 //                      the caller's abort signal is the only way it ends,
 //                      which is exactly what its tests need to prove.
+//   FAKE_CLAUDE_TEXT_RESULT raw --output-format json one-shot response;
+//                      unset, wraps the text reply with synthetic usage.
 //   FAKE_CLAUDE_REPLIES JSON array of strings (or string arrays for multiple
 //                      assistant items) used in order across turns. This makes
 //                      bounded multi-turn orchestration deterministic.
@@ -226,7 +228,7 @@ if (argv[0] === "auth" && argv[1] === "status") {
 // One-shot helper mode used by generateText/reviewPermission. The prompt is
 // deliberately read from stdin so sensitive review text never appears in
 // argv or process listings.
-if (argAfter("--output-format") === "text") {
+if (["text", "json"].includes(argAfter("--output-format") ?? "")) {
   const prompt = await new Promise<string>((resolve) => {
     let input = "";
     process.stdin.setEncoding("utf8");
@@ -248,6 +250,18 @@ if (argAfter("--output-format") === "text") {
     // top-level await, which Node would otherwise treat as fatal
     await new Promise(() => setInterval(() => {}, 1 << 30));
   }
+  const replyText = (text: string, code = 0) => {
+    const model = argAfter("--model") ?? "claude-haiku-4-5";
+    process.stdout.write(argAfter("--output-format") === "json"
+      ? process.env.FAKE_CLAUDE_TEXT_RESULT ?? JSON.stringify({
+          type: "result", is_error: code !== 0, result: text,
+          usage: { input_tokens: 10, cache_read_input_tokens: 2, cache_creation_input_tokens: 3, output_tokens: 5 },
+          total_cost_usd: 0.01,
+          modelUsage: { [model]: { inputTokens: 10, cacheReadInputTokens: 2, cacheCreationInputTokens: 3, outputTokens: 5, costUSD: 0.01 } },
+        })
+      : code === 0 ? text : "");
+    process.exit(code);
+  };
   // FAKE_CLAUDE_TEXT_ROUTES: a JSON file {"marker": "reply"}, re-read each
   // run; the first marker the prompt contains picks the reply, so one run
   // can answer a capture, a tidy-up and a title differently.
@@ -256,8 +270,7 @@ if (argAfter("--output-format") === "text") {
       const routes = JSON.parse(readFileSync(process.env.FAKE_CLAUDE_TEXT_ROUTES, "utf8")) as Record<string, string>;
       const hit = Object.entries(routes).find(([marker]) => prompt.includes(marker));
       if (hit) {
-        process.stdout.write(hit[1]);
-        process.exit(0);
+        replyText(hit[1]);
       }
     } catch {
       // a malformed routes file falls through to the plain reply below
@@ -268,13 +281,11 @@ if (argAfter("--output-format") === "text") {
     const reply = existsSync(file) ? readFileSync(file, "utf8") : "__FAIL__";
     if (reply.trim() === "__FAIL__") {
       process.stderr.write("fake one-shot text failed\n");
-      process.exit(1);
+      replyText("fake one-shot text failed", 1);
     }
-    process.stdout.write(reply);
-    process.exit(0);
+    replyText(reply);
   }
-  process.stdout.write("fake generated text\n");
-  process.exit(0);
+  replyText("fake generated text\n");
 }
 
 // Line-driven, like the real CLI under --input-format stream-json: each user
