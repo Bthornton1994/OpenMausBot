@@ -112,7 +112,7 @@ import { connectorCallFromFrame, connectorRefusalText, connectorUnrecognizedText
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { buildRecall } from "./recall.ts";
 import { createMemoryUpkeep, upkeepEnabled } from "./memory-upkeep.ts";
-import { appendAboutMe, commitLearned, listLearnedFacts, planLearned, removeLearned } from "./profile-learned.ts";
+import { appendAboutMe, commitLearned, planLearned } from "./profile-learned.ts";
 import { canAccessTeam, canReachPeer, coordinatorSupervises, livePeerRoster, livePeerRosterBlock, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, resolveTeammate, roomPeerRosterSystemPrompt, roomRosterLine, PEER_ACCESS_HELP } from "./peer-roster.ts";
 import { openMausStatusSystemPrompt } from "./openmaus-status-capsule.ts";
 import {
@@ -127,6 +127,7 @@ import {
   localVmRecreatableOnDemand,
   localVmWorkspaceExists,
   perBotLocalVmTarget,
+  poolLocalVmTarget,
   SHARED_LOCAL_VM_TARGET,
   setupCommands,
   VM_WORKSPACE_GUEST,
@@ -148,6 +149,7 @@ import {
   threadEventLogRetentionDays,
   saveConfig,
   showToolCallsEnabled,
+  routinesInConversationEnabled,
   claudeUserMcpEnabled,
   skillAuthoringEnabled,
   autoRecallEnabled,
@@ -319,7 +321,6 @@ import {
   supportsWorkspaceFiles,
   updateMemory,
   appendMemoryLog,
-  isMemoryTopicName,
   memorySystemPrompt,
   memorySourceLabel,
   searchMemoryFiles,
@@ -328,22 +329,10 @@ import {
 } from "./workspace.ts";
 import { listMemoryTopics, memoryDate, readMemoryFile, readMemoryTopic, writeMemoryFile, writeMemoryTopic } from "./workspace.ts";
 import {
-  MEMORY_INDEX,
-  MemoryStoreError,
-  memoryCapacity,
-  memoryOverview,
-  openMemoryLocation,
-  readMemoryDoc,
-} from "./memory-store.ts";
-import {
   beginMemoryTurn,
   endMemoryTurn,
   flushAllMemoryJournals,
-  flushMemoryJournal,
-  journalMemoryDelete,
   journalMemoryWrite,
-  readMemoryJournal,
-  revertMemoryChange,
   type MemoryJournalEntry,
 } from "./memory-journal.ts";
 import {
@@ -400,11 +389,13 @@ import {
 import { readCuaConnection, readCuaUnavailableReason, gatedLocalComputer } from "./local-computer.ts";
 import {
   discoverExistingPerBotLocalVms,
+  discoverExistingPoolLocalVms,
   localVmInventoryEntry,
   shouldArmLocalVmIdle,
 } from "./local-vm-inventory.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
+import { LocalVmSeatPool, type LocalVmSeatHolder } from "./local-vm-seat-pool.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import * as vps from "./vps-computer.ts";
@@ -560,6 +551,7 @@ import { json, onJsonBody, parsedBodyOf, readBody } from "./harness/http.ts";
 import { ROUTES, dispatchRoutes } from "./routes/table.ts";
 import { createHostedSlackRoutes } from "./routes/hosted-slack.ts";
 import { createBotPresetRoutes } from "./routes/bot-presets.ts";
+import { createBotMemoryRoutes } from "./routes/bot-memory.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
@@ -5440,6 +5432,11 @@ let routines: RoutineManager | null = null;
 let calendarCalls: CalendarCallManager | null = null;
 const localVmOwnerBusy = (botId: string) => store.bot(botId)?.busy === true;
 const localVmLeases = new LocalVmLeasePool(30 * 60_000);
+// Pool mode (issue #1654) keeps the lease pool as the ownership fence and
+// uses this table only to decide WHICH seat a conversation addresses: a
+// TTL-bounded affinity returns each thread to the desktop holding its login
+// state, and hands the seat back once the conversation has been idle.
+const localVmSeatPool = new LocalVmSeatPool(() => localVmMaxInstances(cfg));
 const localVmLifecycleBusy = new Set<string>();
 const localVmThreadTargets = new Map<string, LocalVmTarget>();
 const localVmActiveThreads = new Map<string, string>();
@@ -5875,7 +5872,7 @@ async function computerPreviewSurface(bot: BotRecord, threadId?: string) {
     const remote = await vps.vpsComputerStatus(cfg, bot.id);
     if (remote.ready) return "cloud";
   }
-  const target = localVmTargetForBot(bot.id);
+  const target = localVmTargetForStatus(bot.id, threadId);
   if (instance?.adapter.capabilities.computerMcp && localVmSeen.has(target.key)) {
     const vm = await containerComputerStatus(undefined, undefined, target).catch(() => null);
     if (vm && autoLocalVmAttachable(vm)) return "vm";
@@ -5915,7 +5912,7 @@ async function selectableComputers(bot: BotRecord) {
           canCreate = lifecycle === "provision";
         }
       } else if (surface === "vm" && localEngine && caps?.computerMcp) {
-        const target = localVmTargetForBot(bot.id);
+        const target = localVmTargetForStatus(bot.id);
         const status = await containerComputerStatus(undefined, undefined, target);
         ready = status.ready;
         canCreate = !ready && autoLocalVmAttachable(status);
@@ -6044,6 +6041,30 @@ function localVmTargetForBot(botId: string): LocalVmTarget {
   return localVmMode(cfg) === "per-bot" ? perBotLocalVmTarget(botId) : SHARED_LOCAL_VM_TARGET;
 }
 
+function localVmPoolSeatHolder(seat: number): LocalVmSeatHolder | null {
+  return localVmLeases.forTarget(poolLocalVmTarget(seat).key).current(localVmOwnerBusy);
+}
+
+/** The Local VM a conversation's turn addresses. In pool mode each thread
+ * draws a seat with TTL-bounded affinity so it reuses the desktop that
+ * holds its login state; other modes are unchanged. */
+function localVmTargetForThread(botId: string, threadId: string): LocalVmTarget {
+  if (localVmMode(cfg) !== "pool") return localVmTargetForBot(botId);
+  return poolLocalVmTarget(localVmSeatPool.assign(threadId, localVmPoolSeatHolder));
+}
+
+/** Best-effort seat for read-only surfaces (Computer panel previews,
+ * screenshots, status payloads). Records no affinity: a status probe must
+ * not steer a later turn onto a desktop its claim would not choose. */
+function localVmTargetForStatus(botId: string, threadId?: string): LocalVmTarget {
+  if (localVmMode(cfg) !== "pool") return localVmTargetForBot(botId);
+  // An in-flight turn keeps its claimed seat even after its affinity TTL
+  // decays: prefer the live target so a preview cannot land on another seat.
+  const activeTarget = threadId ? localVmThreadTargets.get(threadId) : undefined;
+  if (activeTarget) return activeTarget;
+  return poolLocalVmTarget((threadId ? localVmSeatPool.affinitySeat(threadId) : null) ?? 0);
+}
+
 function localVmLeaseFor(target: LocalVmTarget): LocalVmLease {
   return localVmLeases.forTarget(target.key);
 }
@@ -6080,6 +6101,17 @@ function releaseLocalVmThread(threadId: string): void {
   autoVmClaims.delete(threadId);
   const target = localVmThreadTargets.get(threadId);
   if (!target) return;
+  // Renew affinity at settlement so a turn that consumed part of the TTL
+  // still leaves the full window after it ends; failed claims never reach
+  // here (no target), so only settled turns renew. A turn longer than the
+  // TTL finds its entry expired — touch() alone would drop it — so renew
+  // with the seat the turn actually ran on. A target recorded before a
+  // mid-turn mode change is not a pool seat; touch still covers that.
+  if (localVmMode(cfg) === "pool") {
+    const pooled = /^pool:(\d+)$/.exec(target.key);
+    if (pooled) localVmSeatPool.renew(threadId, Number(pooled[1]));
+    else localVmSeatPool.touch(threadId);
+  }
   localVmLeaseFor(target).release(threadId);
   if (localVmActiveThreads.get(target.key) === threadId) localVmActiveThreads.delete(target.key);
   localVmThreadTargets.delete(threadId);
@@ -6090,6 +6122,26 @@ function releaseLocalVmThread(threadId: string): void {
 // bot's current destination is intentionally ignored: moving a bot to Cloud,
 // Browser, This computer, Auto, or Off does not delete its old Local VM.
 void (async () => {
+  if (localVmMode(cfg) === "pool") {
+    // Same restore rule as per-bot: idle cleanup removes the container, not
+    // its provisioned workspace, so every surviving seat stays Auto-eligible.
+    const seats = localVmMaxInstances(cfg);
+    for (let seat = 0; seat < seats; seat += 1) {
+      const target = poolLocalVmTarget(seat);
+      if (localVmWorkspaceExists(target)) localVmSeen.add(target.key);
+    }
+    const runtime = await containerRuntimeStatus().catch(() => null);
+    if (!runtime?.runtime || !runtime.daemonUp) return;
+    const existing = await discoverExistingPoolLocalVms(seats, runtime.runtime).catch(() => []);
+    const statuses = await Promise.all(existing.map((target) =>
+      containerComputerStatus(undefined, undefined, target).catch(() => null),
+    ));
+    existing.forEach((target, index) => {
+      noteLocalVmSeen(target, statuses[index]);
+      if (shouldArmLocalVmIdle(statuses[index])) localVmIdleFor(target).touch();
+    });
+    return;
+  }
   if (localVmMode(cfg) !== "per-bot") {
     const status = await containerComputerStatus(undefined, undefined, SHARED_LOCAL_VM_TARGET).catch(() => null);
     noteLocalVmSeen(SHARED_LOCAL_VM_TARGET, status);
@@ -8437,7 +8489,7 @@ async function startTurn(
        * desktop, not whatever localVmTargetForBot resolves to by the time
        * the first screen call arrives. */
       const claimAutoLocalVm = async (claimThreadId: string, pinnedTarget?: LocalVmTarget): Promise<{ target: LocalVmTarget; runtime: Runtime }> => {
-        const localVmTarget = pinnedTarget ?? localVmTargetForBot(bot.id);
+        const localVmTarget = pinnedTarget ?? localVmTargetForThread(bot.id, claimThreadId);
         await bindTurnComputer(resourceOwner, `computer:vm:${localVmTarget.key}`, true);
         if (localVmImageBusy || localVmModeChangeBusy || localVmLifecycleBusy.has(localVmTarget.key)) {
           throw new Error("this Local VM is being started, stopped, or replaced — wait for setup to finish");
@@ -8448,6 +8500,9 @@ async function startTurn(
         if (!localVmLeaseFor(localVmTarget).claim(claimThreadId, bot.id, localVmOwnerBusy)) {
           throw new Error("this Local VM is already being used by another turn — wait for that turn to finish");
         }
+        // Only a turn that wins its lease extends pool affinity; a thread
+        // retrying behind a stranger lets the TTL lapse and migrates.
+        if (localVmMode(cfg) === "pool") localVmSeatPool.touch(claimThreadId);
         localVmThreadTargets.set(claimThreadId, localVmTarget);
         localVmActiveThreads.set(localVmTarget.key, claimThreadId);
         localVmIdleFor(localVmTarget).touch();
@@ -8538,7 +8593,15 @@ async function startTurn(
           if (!strict) return false;
           throw new Error("this model engine cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
         }
-        const localVmTarget = localVmTargetForBot(bot.id);
+        if (!strict && localVmMode(cfg) === "pool") {
+          // localVmTargetForThread records pool affinity, so a turn the
+          // fast path is about to skip must not reserve or refresh a seat.
+          // Gate on the side-effect-free candidate assign() would pick —
+          // the automationSource bypass below stays authoritative.
+          const poolCandidate = poolLocalVmTarget(localVmSeatPool.candidate(threadId, localVmPoolSeatHolder));
+          if (!localVmSeen.has(poolCandidate.key) && !opts?.automationSource) return false;
+        }
+        const localVmTarget = localVmTargetForThread(bot.id, threadId);
         let lazyReadyVm: { runtime: Runtime } | null = null;
         if (!strict) {
           // Nothing this process has ever seen for this target, and nobody is
@@ -9431,6 +9494,14 @@ routines = new RoutineManager({
     const bot = store.bot(botId);
     if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
     return task;
+  },
+  joinConversation: (run) => {
+    if (!routinesInConversationEnabled(cfg) || run.target !== "bot") return null;
+    const source = routineSourceOwner(run);
+    // Only this bot's own visible chat. A room, or a teammate's thread, keeps
+    // the detached run so one bot cannot write its work into the wrong place.
+    if (!source || source.group || source.bot.id !== run.botId) return null;
+    return source.threadId;
   },
   createGoalTask: (groupId, title) => store.createGroupTask(groupId, title, false),
   isResultsThread: (botId, threadId) => {
@@ -10851,7 +10922,7 @@ async function runGroupMemberTurn(
       throw new Error("this model engine cannot use the Local VM");
     }
     // A distinct identity fences cleanup even in shared mode on the same room thread.
-    const target = { ...localVmTargetForBot(readyBot.id) };
+    const target = { ...localVmTargetForThread(readyBot.id, threadId) };
     await bindTurnComputer(resourceOwner, `computer:vm:${target.key}`, true);
     if (localVmImageBusy || localVmModeChangeBusy || localVmLifecycleBusy.has(target.key)) {
       throw new Error("this Local VM is being started, stopped, or replaced");
@@ -10859,6 +10930,7 @@ async function runGroupMemberTurn(
     if (!localVmLeaseFor(target).claim(threadId, readyBot.id, localVmOwnerBusy)) {
       throw new Error("this Local VM is already being used by another turn");
     }
+    if (localVmMode(cfg) === "pool") localVmSeatPool.touch(threadId);
     roomVmTarget = target;
     localVmThreadTargets.set(threadId, target);
     localVmActiveThreads.set(target.key, threadId);
@@ -12989,7 +13061,11 @@ async function readyLocalVmForTurn(botId: string, target: LocalVmTarget, isCurre
   // before the first await — the same synchronous-fence-then-count shape
   // the panel route uses — so two concurrent turns cannot both pass the
   // per-bot limit between count and create.
-  const ownsProvision = !localVmProvisionBusy;
+  // Pool capacity is bounded by its seat indices. Each seat already has
+  // its own lease/lifecycle fence, so independent cold seats can start
+  // together without competing for the per-bot inventory's capacity gate.
+  const pooled = target.key.startsWith("pool:");
+  const ownsProvision = !pooled && !localVmProvisionBusy;
   if (ownsProvision) localVmProvisionBusy = true;
   let status: ContainerComputerStatus;
   try {
@@ -13000,9 +13076,9 @@ async function readyLocalVmForTurn(botId: string, target: LocalVmTarget, isCurre
     // Another creation is already mid-flight and its container is not yet
     // visible to a count, so the safe answer is the inspected status —
     // exactly what the over-cap path below returns.
-    if (!ownsProvision) return status;
+    if (!pooled && !ownsProvision) return status;
 
-    if (target.key !== SHARED_LOCAL_VM_TARGET.key) {
+    if (target.key.startsWith("bot:")) {
       const count = await existingPerBotLocalVmCount(status.runtime);
       if (!isCurrent() || count >= localVmMaxInstances(cfg)) return status;
     }
@@ -13125,6 +13201,7 @@ function configStatus() {
     features: {
       skillAuthoring: skillAuthoringEnabled(cfg),
       showToolCalls: showToolCallsEnabled(cfg),
+      routinesInConversation: routinesInConversationEnabled(cfg),
       browser: builtInBrowserEnabled(cfg),
       // Maintainer-only escape hatch, not a Settings toggle: the desktop
       // shell and the Settings UI read it so they offer nothing this server
@@ -13422,27 +13499,6 @@ function serveStatic(res: ServerResponse, path: string): boolean {
   }
 }
 
-/** A store refusal is a client error with a status of its own (400 path,
- * 409 conflict, 413 too large); a 409 also carries what is on disk now so
- * the editor can show the bot's version instead of guessing. Anything else
- * is a real failure and goes to the handler's catch-all. */
-function replyMemoryError(res: ServerResponse, error: unknown) {
-  if (!(error instanceof MemoryStoreError)) throw error;
-  if (error.code === "conflict") {
-    return json(res, error.status, { error: error.message, code: error.code, currentHash: error.currentHash, current: error.current });
-  }
-  return json(res, error.status, { error: error.message, code: error.code });
-}
-
-/** The journal row as the panel shows it: the full prior text stays on
- * the server (a revert needs it there, the list does not), and the thread
- * id becomes the chat title people recognise. */
-function journalEntryForClient(botId: string, entry: MemoryJournalEntry) {
-  const { before: _before, ...visible } = entry;
-  const threadTitle = entry.threadId ? store.taskByThread(botId, entry.threadId)?.title : undefined;
-  return threadTitle ? { ...visible, threadTitle } : visible;
-}
-
 // Loopback-only enforcement: the harness runs on 127.0.0.1 but accepts
 // requests from any loopback connection and any web page that DNS-rebinds
 // onto it. Reject non-loopback Hosts outright (defeats rebinding) and
@@ -13498,6 +13554,19 @@ ROUTES.push(createHostedSlackRoutes({ bot: (id) => store.bot(id), hostedReady: (
 // its file, so New bot cannot disagree with it. No organization: none.
 const orgInstallStatuses = () => orgLibrary?.installStatuses() ?? new Map();
 ROUTES.push(createBotPresetRoutes({ presets: presetStore, orgStatuses: orgInstallStatuses }));
+// The bot-memory panel's routes (MEMORY.md, memory/ topics, journal); the
+// store lookups — the 404 precheck and journal thread titles — stay explicit.
+ROUTES.push(createBotMemoryRoutes({
+  bot: (id) => store.bot(id),
+  taskByThread: (botId, threadId) => store.taskByThread(botId, threadId),
+  upkeep: memoryUpkeep,
+  aboutMe: () => cfg.profile?.aboutMe ?? "",
+  saveAboutMe: (aboutMe) => {
+    saveConfig({ profile: { ...cfg.profile, aboutMe } });
+    Object.assign(cfg, loadConfig());
+    broadcast({ kind: "config", ...configStatus() });
+  },
+}));
 
 const toolResults = new ToolResults();
 const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
@@ -19117,166 +19186,6 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, { bot: visible });
     }
 
-    // ── bot memory: MEMORY.md + memory/ topic and log files ──────────────
-    // The files already belong to the person (plain markdown in the bot's
-    // workspace). server/memory-store.ts decides which paths can be reached
-    // and refuses a save whose expectedHash no longer matches the file;
-    // server/memory-journal.ts records every change made here so it can be
-    // read back and reverted. Reads never create the workspace — a bot that
-    // has not run yet simply has nothing to show. Admin scope by default
-    // (request-auth.ts), like the profile routes above.
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory$/);
-    if (m && method === "GET") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      try {
-        const overview = memoryOverview(m[1]);
-        // `text` and `truncated` ride along one release for clients of the
-        // old whole-file shape; the panel reads the file through /memory/file
-        return json(res, 200, { ...overview, text: readMemoryDoc(m[1], MEMORY_INDEX).text, truncated: overview.index.truncated });
-      } catch (error) {
-        return replyMemoryError(res, error);
-      }
-    }
-    if (m && method === "PUT") {
-      // The pre-panel whole-file write, kept one release: no hash check, so
-      // it can still overwrite a note the bot just wrote — journaled as the
-      // person's so at least the journal can undo it.
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      const parsed = z.object({ text: z.string() }).safeParse(await readBody(req));
-      if (!parsed.success) return json(res, 400, { error: "text must be a string" });
-      try {
-        const { doc } = journalMemoryWrite(m[1], MEMORY_INDEX, parsed.data.text, { actor: "person", via: "api" });
-        return json(res, 200, { ok: true, hash: doc.hash, truncated: memoryCapacity(doc.text).truncated });
-      } catch (error) {
-        // the old route answered 400 for an oversized body; keep that for
-        // its callers while the new route says 413
-        if (error instanceof MemoryStoreError && error.code === "too-large") return json(res, 400, { error: error.message });
-        return replyMemoryError(res, error);
-      }
-    }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/file$/);
-    if (m && method === "GET") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      try {
-        return json(res, 200, readMemoryDoc(m[1], url.searchParams.get("path") ?? MEMORY_INDEX));
-      } catch (error) {
-        return replyMemoryError(res, error);
-      }
-    }
-    if (m && method === "PUT") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      const parsed = z
-        .object({ path: z.string().default(MEMORY_INDEX), text: z.string(), expectedHash: z.string().optional() })
-        .safeParse(await readBody(req));
-      if (!parsed.success) return json(res, 400, { error: "text must be a string; path and expectedHash are optional strings" });
-      try {
-        const { doc, entry } = journalMemoryWrite(m[1], parsed.data.path, parsed.data.text, {
-          actor: "person",
-          via: "ui",
-          expectedHash: parsed.data.expectedHash,
-        });
-        return json(res, 200, { ok: true, ...doc, entry: entry ? journalEntryForClient(m[1], entry) : null, overview: memoryOverview(m[1]) });
-      } catch (error) {
-        return replyMemoryError(res, error);
-      }
-    }
-    if (m && method === "DELETE") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      const file = url.searchParams.get("path") ?? "";
-      try {
-        const entry = journalMemoryDelete(m[1], file, { actor: "person", via: "ui" });
-        return json(res, 200, { ok: true, path: file, entry: entry ? journalEntryForClient(m[1], entry) : null, overview: memoryOverview(m[1]) });
-      } catch (error) {
-        return replyMemoryError(res, error);
-      }
-    }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/journal$/);
-    if (m && method === "GET") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      // the row a save queued a moment ago may not have reached disk yet
-      await flushMemoryJournal(m[1]);
-      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? 50) || 50));
-      const botId = m[1];
-      return json(res, 200, { entries: readMemoryJournal(botId, limit).map((entry) => journalEntryForClient(botId, entry)) });
-    }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/journal\/([\w-]+)\/revert$/);
-    if (m && method === "POST") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      await flushMemoryJournal(m[1]);
-      const result = revertMemoryChange(m[1], m[2]);
-      if (!result.ok) return json(res, result.status, { error: result.error });
-      return json(res, 200, { ok: true, ...result.doc, entry: result.entry ? journalEntryForClient(m[1], result.entry) : null, overview: memoryOverview(m[1]) });
-    }
-    // What bots with Memory upkeep added to About me on their own
-    // (server/profile-learned.ts), and Remove for any of it. Admin scope by
-    // default, like the config.
-    if (method === "GET" && path === "/api/profile/learned") {
-      return json(res, 200, { learned: listLearnedFacts() });
-    }
-    m = path.match(/^\/api\/profile\/learned\/([\w-]+)\/remove$/);
-    if (m && method === "POST") {
-      const removed = removeLearned(m[1], cfg.profile?.aboutMe ?? "");
-      if (!removed) return json(res, 404, { error: "That fact was already removed." });
-      if (removed.aboutMe !== (cfg.profile?.aboutMe ?? "")) {
-        saveConfig({ profile: { ...cfg.profile, aboutMe: removed.aboutMe } });
-        Object.assign(cfg, loadConfig());
-        broadcast({ kind: "config", ...configStatus() });
-      }
-      return json(res, 200, { ok: true, aboutMe: cfg.profile?.aboutMe ?? "", learned: listLearnedFacts() });
-    }
-
-    // Memory upkeep: its status, and a tidy-up now (Bot Settings → Memory).
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/upkeep$/);
-    if (m && method === "GET") {
-      const bot = store.bot(m[1]);
-      if (!bot) return json(res, 404, { error: "no such bot" });
-      return json(res, 200, { enabled: upkeepEnabled(bot), ...memoryUpkeep.status(bot.id) });
-    }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/tidy$/);
-    if (m && method === "POST") {
-      const bot = store.bot(m[1]);
-      if (!bot) return json(res, 404, { error: "no such bot" });
-      if (!upkeepEnabled(bot)) return json(res, 409, { error: "Switch on Memory upkeep for this bot first." });
-      const report = await memoryUpkeep.tidy(bot.id);
-      await flushMemoryJournal(bot.id);
-      return json(res, 200, { report, overview: memoryOverview(bot.id) });
-    }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/open$/);
-    if (m && method === "POST") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      const parsed = z.object({ target: z.enum(["obsidian", "folder"]) }).safeParse(await readBody(req));
-      if (!parsed.success) return json(res, 400, { error: "target must be obsidian or folder" });
-      // The folder is on this machine's disk; opening it only makes sense
-      // from this machine. A paired phone or a remote browser gets the path
-      // to open by hand instead.
-      const workspacePath = memoryOverview(m[1]).workspacePath;
-      if (auth.kind !== "loopback") {
-        return json(res, 403, { error: `This only works on the computer running OpenMausBot. The memory folder there is ${workspacePath}`, workspacePath });
-      }
-      const opened = await openMemoryLocation(m[1], parsed.data.target);
-      if (!opened.ok) return json(res, 500, { error: opened.error, workspacePath: opened.workspacePath });
-      return json(res, 200, opened);
-    }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/topics\/([^/]+)$/);
-    if (m && method === "GET") {
-      if (!store.bot(m[1])) return json(res, 404, { error: "no such bot" });
-      // Decode before validating: a UI-sent name arrives percent-encoded
-      // ("my notes.md" → "my%20notes.md"), and an encoded traversal
-      // ("..%2F..") must be judged by what it decodes TO, not slip through
-      // as an opaque token. The name gate then rejects anything that is not
-      // a single plain-markdown path segment.
-      let name: string;
-      try {
-        name = decodeURIComponent(m[2]);
-      } catch {
-        return json(res, 400, { error: "invalid topic name" });
-      }
-      if (!isMemoryTopicName(name)) return json(res, 400, { error: "invalid topic name" });
-      const text = readMemoryTopic(m[1], name);
-      if (text === null) return json(res, 404, { error: "no such topic file" });
-      return json(res, 200, { name, text });
-    }
-
     // ── workspace checkpoints: per-turn shadow-git snapshots ────────────
     // The list endpoint is the source of truth (turns store nothing), and
     // `enabled` tells the UI whether snapshots can happen here at all —
@@ -20439,6 +20348,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (localVmMode(cfg) === "per-bot" && action === "run") {
         return json(res, 409, { error: "Per-bot mode creates each desktop from that bot's Computer panel" });
       }
+      if (localVmMode(cfg) === "pool" && action === "run") {
+        return json(res, 409, { error: "Pool mode creates its desktops automatically from conversation turns" });
+      }
       const vmOwner = localVmLeaseFor(SHARED_LOCAL_VM_TARGET).current(localVmOwnerBusy);
       if (vmOwner && (action === "stop" || action === "remove" || action === "run")) {
         return json(res, 409, { error: "the Local VM is being used by a bot — stop that turn first" });
@@ -20479,7 +20391,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "GET") {
       const bot = computerPreviewBot(m[1], url);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      return json(res, 200, await localVmPayload(localVmTargetForBot(bot.id)));
+      return json(res, 200, await localVmPayload(localVmTargetForStatus(bot.id, bot.threadId)));
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/local-computer\/(run|stop|remove)$/);
     if (m && method === "POST") {
@@ -20548,7 +20460,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (url.searchParams.has("threadId") && await computerPreviewSurface(bot, bot.threadId) !== "vm") {
         return json(res, 409, { error: "This conversation is not using the Local VM" });
       }
-      const target = localVmTargetForBot(bot.id);
+      const target = localVmTargetForStatus(bot.id, url.searchParams.has("threadId") ? bot.threadId : undefined);
       localVmIdleFor(target).touch();
       res.setHeader("cache-control", "private, no-store");
       return json(res, 200, {
