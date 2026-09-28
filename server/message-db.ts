@@ -616,11 +616,12 @@ const RECALL_FILLER = new Set(
 );
 
 /** The content words of a message, for an any-term recall: lower-cased,
- * de-duplicated, stop words and filler dropped, punctuation trimmed from the
- * ends only (so `-10`, `c++` and `v2.1` survive as they are written). */
+ * de-duplicated, stop words and filler dropped. Ordinary separators between
+ * letters split words; signs, language symbols and versions (`-10`, `c++`,
+ * `v2.1`) survive as written rather than matching a different fact. */
 export function recallTerms(query: string): string[] {
   const out: string[] = [];
-  for (const raw of query.split(/\s+/)) {
+  for (const raw of query.split(/\s+|(?<=\p{L})[/,;:.—–-]+(?=\p{L})/u)) {
     const token = raw.replace(/"/g, "").replace(/^[\s.,;:!?()[\]{}'`“”‘’]+|[\s.,;:!?()[\]{}'`“”‘’]+$/g, "").toLowerCase();
     if (token.length < 2 && !/\d/.test(token)) continue;
     if (!/[\p{L}\p{N}]/u.test(token)) continue;

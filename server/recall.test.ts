@@ -110,6 +110,17 @@ describe("recall from memory files", () => {
     expect(memoryPassages(BOT, "10")).toHaveLength(1);
   });
 
+  it("recalls words separated by ordinary punctuation without splitting semantic symbols", () => {
+    writeMemoryTopic(BOT, "billing.md", "Invoice goes to finance.\n");
+    writeMemoryTopic(BOT, "payment.md", "Send funds on Friday.\n");
+    for (const query of ["invoice/payment", "invoice-payment", "invoice,payment", "invoice:payment", "invoice—payment"]) {
+      expect(recallTerms(query)).toEqual(["invoice", "payment"]);
+      expect(memoryPassages(BOT, query).map((hit) => hit.label)).toContain("memory/billing.md");
+      expect(topicPassages(BOT, query).map((hit) => hit.label)).toContain("memory/payment.md");
+    }
+    expect(recallTerms("-10 C++ v2.1")).toEqual(["-10", "c++", "v2.1"]);
+  });
+
   it("filters historical files before the recall limit without hiding them from explicit search", () => {
     for (let day = 1; day <= 15; day++) appendMemoryLog(BOT, "invoice", { now: new Date(2026, 8, day) });
     writeMemoryTopic(BOT, "archive.md", "invoice");
