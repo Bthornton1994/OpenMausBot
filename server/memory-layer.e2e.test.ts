@@ -52,6 +52,19 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
     expect(await api(`/api/bots/${bot.id}/memory/upkeep`)).toMatchObject({ enabled: true });
     await api(`/api/bots/${bot.id}`, "PATCH", { memoryUpkeep: false });
 
+    // A successful routine is automation, not the owner's personal words.
+    const { bot: scheduled } = await api<{ bot: WireBot }>("/api/bots", "POST", { name: "Scheduled memory" }, 201);
+    const { routine } = await api("/api/routines", "POST", {
+      name: "Automated report", prompt: "Report the work status.", botId: scheduled.id, enabled: false,
+      schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 },
+    }, 201);
+    const { run } = await api(`/api/routines/${routine.id}/run`, "POST", undefined, 201);
+    await expect.poll(async () => (await api("/api/routines")).runs.find((entry: any) => entry.id === run.id)?.status,
+      { timeout: 20_000 }).toBe("completed");
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect((await memoryFile(scheduled.id)).text).not.toContain("The person is vegetarian");
+    expect((await api("/api/profile/learned")).learned).toEqual([]);
+
     // ── read side, on by default ─────────────────────────────────────────
     // single-fact recall by an alias: a topic note found by a word it never says
     await api(`/api/bots/${bot.id}/memory/file`, "PUT", { path: "memory/dining.md", text: "---\ntitle: Dining\naliases: [food, restaurants, lunch]\n---\n- Loves pasta, hates olives\n" });

@@ -425,7 +425,7 @@ describe("workspace", () => {
   });
 
   it("accepts plain single-segment topic names and nothing else", () => {
-    for (const good of ["deploys.md", "a.md", "my notes.md", "v1.2-rc.md", "under_score.md"]) {
+    for (const good of ["deploys.md", "a.md", "my notes.md", "v1.2-rc.md", "under_score.md", "café.md", "旅行.md"]) {
       expect(isMemoryTopicName(good), good).toBe(true);
     }
     for (const bad of [

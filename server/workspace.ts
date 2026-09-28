@@ -171,7 +171,7 @@ function indexWrittenMemoryFile(botId: string, relativePath: string): void {
   try {
     const path = join(workspaceDir(botId), relativePath);
     const stat = statSync(path);
-    indexMemoryFile(botId, relativePath, readFileSync(path, "utf8"), { mtimeMs: stat.mtimeMs, bytes: stat.size });
+    indexMemoryFile(botId, relativePath, searchableMemoryText(relativePath, readFileSync(path, "utf8")), { mtimeMs: stat.mtimeMs, bytes: stat.size });
   } catch {
     // the next search's sync pass picks it up
   }
@@ -196,27 +196,35 @@ function memoryFilesOnDisk(botId: string): Array<{ path: string; mtimeMs: number
   });
 }
 
-/** Bring the search index in step with the disk. Server-side writes index
- * as they happen; this catches what they cannot — the bot's own file tools
- * rewriting a topic file, the person editing one, a file deleted — by
- * comparing size and mtime, not by watching the filesystem. A handful of
- * stats per search, so it runs right before one. */
+const memoryIndexDates = new Map<string, string>();
+
+function searchableMemoryText(path: string, text: string): string {
+  if (path === "MEMORY.md" && text === MEMORY_SEED) return "";
+  // Keep historical records searchable, but do not recall expired current facts.
+  if (path === "memory/archive.md" || path.startsWith(`memory/${MEMORY_LOG_DIR}/`)) return text;
+  return withoutExpired(text, memoryDate()).text;
+}
+
+/** Sync edits and deletions from disk; refresh unchanged files once a day
+ * too, because facts can expire without their files changing. */
 export function syncMemoryIndex(botId: string): void {
+  const today = memoryDate();
+  const dateChanged = memoryIndexDates.get(botId) !== today;
   const onDisk = memoryFilesOnDisk(botId);
   const indexed = new Map(indexedMemoryFiles(botId).map((file) => [file.path, file]));
   for (const file of onDisk) {
     const known = indexed.get(file.path);
     indexed.delete(file.path);
-    if (known && known.bytes === file.bytes && known.mtimeMs === Math.trunc(file.mtimeMs)) continue;
+    if (!dateChanged && known && known.bytes === file.bytes && known.mtimeMs === Math.trunc(file.mtimeMs)) continue;
     try {
       const text = readFileSync(join(workspaceDir(botId), file.path), "utf8");
-      // the seed is instructions about memory, not memory — never a hit
-      indexMemoryFile(botId, file.path, file.path === "MEMORY.md" && text === MEMORY_SEED ? "" : text, file);
+      indexMemoryFile(botId, file.path, searchableMemoryText(file.path, text), file);
     } catch {
       // vanished between the listing and the read: dropped below next time
     }
   }
   for (const gone of indexed.keys()) removeMemoryFile(botId, gone);
+  memoryIndexDates.set(botId, today);
 }
 
 /** Search one bot's memory files, after syncing the index to the disk. */
@@ -514,7 +522,7 @@ export function readMemoryLog(botId: string, name: string): string | null {
 // ends in .md. No slashes or backslashes means no traversal; no leading dot
 // means no dotfiles and no bare "..". This is the single gate every topic
 // name passes — listing and reading agree on it by construction.
-const TOPIC_NAME = /^[\w][\w .-]{0,199}\.md$/;
+const TOPIC_NAME = /^[\p{L}\p{N}_][\p{L}\p{N}_ .-]{0,199}\.md$/u;
 
 export function isMemoryTopicName(name: string): boolean {
   return TOPIC_NAME.test(name);

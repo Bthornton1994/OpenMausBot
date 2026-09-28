@@ -23,7 +23,7 @@ import { DATA_DIR } from "./config.ts";
 import { CaptureBuffer, capturePrompt, newCandidates, parseCandidates, type Candidate, type CaptureBatch, type CaptureTurn } from "./memory-capture.ts";
 import { factIdentity, lineFactIdentity, notebookIdentities } from "./memory-entries.ts";
 import { mergeTopicText } from "./memory-topics.ts";
-import { applyMoves, organizeCandidates, organizePrompt, parseMoves } from "./memory-organize.ts";
+import { applyMoves, MAX_MOVES, organizeCandidates, organizePrompt, parseMoves } from "./memory-organize.ts";
 import { recordMemoryChange } from "./memory-journal.ts";
 import { applyTidy, contradictionCandidates, contradictionPrompt, parseContradictions, planChanges, planTidy, type Contradiction } from "./memory-tidy.ts";
 import { ensureWorkspace, listMemoryTopics, memoryDate, memoryEntry, memoryTopicIndex, updateMemory, workspaceDir, writeMemoryFile, writeMemoryTopic } from "./workspace.ts";
@@ -313,8 +313,11 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     // the line numbers are the file's as read; a write since means ask again later
     const before = readRaw(botId, "MEMORY.md") ?? "";
     if (before !== first) return 0;
-    const moves = parseMoves(answer, candidates);
-    const moved = new Set(moves.map((move) => move.entry.line));
+    const proposed = parseMoves(answer, candidates);
+    if (proposed === null) return 0;
+    // Deferred moves are not core: let the next pass reconsider them.
+    const moved = new Set(proposed.map((move) => move.entry.line));
+    const moves = proposed.slice(0, MAX_MOVES);
     const judgedCore = candidates.filter((entry) => !moved.has(entry.line)).map((entry) => factIdentity(entry.body));
     const saved = loadState();
     saved.bots[botId] = { ...saved.bots[botId], core: [...new Set([...(saved.bots[botId]?.core ?? []), ...judgedCore])].slice(-MAX_CORE) };
@@ -353,8 +356,11 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     const bot = deps.bot(botId);
     const at = now().getTime();
     const today = memoryDate(now());
+    const stopped: TidyReport = { at, expired: 0, duplicates: 0, superseded: 0, deferred: 0, contradictionsChecked: false, note: "Memory upkeep is off or paused; no further changes were made." };
+    if (paused || !upkeepEnabled(bot)) return stopped;
     ensureWorkspace(botId);
     const organized = await organize(botId);
+    if (paused || !upkeepEnabled(deps.bot(botId))) return stopped;
     const first = readRaw(botId, "MEMORY.md") ?? "";
     const engine = deps.engine(botId);
     const candidates = contradictionCandidates(first, today);
@@ -371,7 +377,7 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
         contradictionsChecked = true;
       }
     }
-    if (paused) return { at, expired: 0, duplicates: 0, superseded: 0, deferred: 0, contradictionsChecked: false, note: "A backup was running; the tidy-up waits for the next check." };
+    if (paused || !upkeepEnabled(deps.bot(botId))) return stopped;
     // Re-read after the await. If the notes changed meanwhile, the model's
     // line numbers no longer point at the same facts: keep only the
     // deterministic steps this time.

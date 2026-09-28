@@ -5157,7 +5157,8 @@ bus.subscribe((event: RuntimeEvent) => {
   if (event.type !== "turn.completed" || !event.turnId || !event.ok) return;
   try {
     const bot = store.botByThread(event.threadId);
-    if (!bot || !upkeepEnabled(bot) || store.groupByThread(event.threadId) || isInternalTurn(event.threadId)) return;
+    if (!bot || !upkeepEnabled(bot) || store.groupByThread(event.threadId) || isInternalTurn(event.threadId)
+      || isUnattended(bot.id, event.threadId) || routines?.runForThread(event.threadId)) return;
     const path = store.activePath(event.threadId);
     const replyAt = path.findLastIndex((message) => message.role === "bot" && message.kind === "text" && message.turnId === event.turnId);
     if (replyAt < 0) return;
@@ -8959,7 +8960,7 @@ async function startTurn(
       const recalled = autoRecallPrompt(bot, threadId, resolvedImages.text, {
         // a routine run starts fresh by design, and a webhook is untrusted:
         // neither pulls earlier conversations in
-        conversations: commsDepth === 0 && !coordinationNode && !opts?.automationSource,
+        conversations: commsDepth === 0 && !coordinationNode && !opts?.automationSource && !opts?.unattended,
         userName: cfg.profile?.name?.trim() || "User",
       });
       runningTurnEngines.set(threadId, instance);

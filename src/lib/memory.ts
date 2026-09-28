@@ -112,6 +112,7 @@ export interface TidyReport {
   duplicates: number;
   superseded: number;
   deferred: number;
+  organized?: number;
   contradictionsChecked: boolean;
   note?: string;
 }
@@ -154,6 +155,7 @@ export function tidySummary(report: TidyReport): string {
   if (report.expired) parts.push(`archived ${report.expired} expired note${report.expired === 1 ? "" : "s"}`);
   if (report.duplicates) parts.push(`merged ${report.duplicates} duplicate${report.duplicates === 1 ? "" : "s"}`);
   if (report.superseded) parts.push(`crossed out ${report.superseded} contradicted note${report.superseded === 1 ? "" : "s"}`);
+  if (report.organized) parts.push(`filed ${report.organized} note${report.organized === 1 ? "" : "s"} into topics`);
   const head = parts.length ? parts.join(", ") : "nothing to tidy";
   return head.charAt(0).toUpperCase() + head.slice(1);
 }

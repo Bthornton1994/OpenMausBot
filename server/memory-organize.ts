@@ -57,28 +57,29 @@ export function organizePrompt(candidates: readonly MemoryEntryLine[], topics: s
   ].join("\n");
 }
 
-export function parseMoves(text: string, candidates: readonly MemoryEntryLine[]): TopicMove[] {
+export function parseMoves(text: string, candidates: readonly MemoryEntryLine[]): TopicMove[] | null {
   const trimmed = text.trim();
   const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(trimmed);
   const body = (fenced ? fenced[1] : trimmed).trim();
   const start = body.indexOf("{");
   const end = body.lastIndexOf("}");
-  if (start < 0 || end <= start) return [];
+  if (start < 0 || end <= start) return null;
   let parsed: { moves?: unknown };
   try {
     parsed = JSON.parse(body.slice(start, end + 1)) as { moves?: unknown };
   } catch {
-    return [];
+    return null;
   }
-  if (!Array.isArray(parsed.moves)) return [];
+  if (!parsed || !Array.isArray(parsed.moves)) return null;
   const out: TopicMove[] = [];
   const seen = new Set<number>();
   for (const move of parsed.moves) {
-    if (!move || typeof move !== "object") continue;
+    if (!move || typeof move !== "object") return null;
     const { i, topic, aliases } = move as Record<string, unknown>;
-    if (!Number.isInteger(i) || (i as number) < 0 || (i as number) >= candidates.length || seen.has(i as number)) continue;
+    if (!Number.isInteger(i) || (i as number) < 0 || (i as number) >= candidates.length) return null;
+    if (seen.has(i as number)) continue;
     const name = topicFileName(topic);
-    if (!name) continue;
+    if (!name) return null;
     seen.add(i as number);
     out.push({
       entry: candidates[i as number]!,
@@ -87,7 +88,6 @@ export function parseMoves(text: string, candidates: readonly MemoryEntryLine[])
         ? aliases.filter((a): a is string => typeof a === "string").map((a) => a.replace(/[\r\n,[\]]+/g, " ").trim().slice(0, 40)).filter(Boolean).slice(0, 8)
         : [],
     });
-    if (out.length >= MAX_MOVES) break;
   }
   return out;
 }

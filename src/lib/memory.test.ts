@@ -8,9 +8,17 @@ import {
   journalSummary,
   relativeTime,
   topicFileName,
+  tidySummary,
   type MemoryCapacity,
   type MemoryJournalRow,
 } from "./memory";
+
+it("reports organized notes rather than saying nothing was tidied", () => {
+  const report = { at: 0, expired: 0, duplicates: 0, superseded: 0, deferred: 0, contradictionsChecked: false };
+  expect(tidySummary(report)).toBe("Nothing to tidy");
+  expect(tidySummary({ ...report, organized: 1 })).toBe("Filed 1 note into topics");
+  expect(tidySummary({ ...report, organized: 2 })).toBe("Filed 2 notes into topics");
+});
 
 const index = (overrides: Partial<MemoryCapacity> = {}): MemoryCapacity => ({
   lines: 40,

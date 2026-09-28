@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { DATA_DIR } from "./config.ts";
 import { CaptureBuffer, capturePrompt, newCandidates, parseCandidates, topicFileName } from "./memory-capture.ts";
 import { mergeTopicText, parseTopicHeader } from "./memory-topics.ts";
-import { applyMoves, organizeCandidates, ORGANIZE_MARKER, parseMoves } from "./memory-organize.ts";
+import { applyMoves, MAX_MOVES, organizeCandidates, ORGANIZE_MARKER, parseMoves } from "./memory-organize.ts";
 import { flushMemoryJournal, readMemoryJournal } from "./memory-journal.ts";
 import { applyTidy, contradictionBudget, contradictionCandidates, parseContradictions, planTidy } from "./memory-tidy.ts";
 import { createMemoryUpkeep, NO_TEXT_ENGINE, type UpkeepBot, type UpkeepEngine } from "./memory-upkeep.ts";
@@ -166,11 +166,14 @@ describe("organizing MEMORY.md", () => {
     const text = "- 2026-09-26 · A\n- 2026-09-26 · B\n- 2026-09-20 · Trip · until 2026-09-21\n";
     const candidates = organizeCandidates(text, TODAY, new Set(["A"]));
     expect(candidates.map((e) => e.body)).toEqual(["B"]);
-    expect(parseMoves('{"moves":[{"i":0,"topic":"x"},{"i":0,"topic":"y"},{"i":5,"topic":"z"},{"i":0}]}', candidates).map((m) => m.topic)).toEqual(["x.md"]);
-    expect(parseMoves("nonsense", candidates)).toEqual([]);
+    expect(parseMoves('{"moves":[{"i":0,"topic":"x"},{"i":0,"topic":"y"}]}', candidates)?.map((m) => m.topic)).toEqual(["x.md"]);
+    expect(parseMoves('{"moves":[{"i":5,"topic":"z"}]}', candidates)).toBeNull();
+    expect(parseMoves('{"moves":[{"i":0}]}', candidates)).toBeNull();
+    expect(parseMoves("nonsense", candidates)).toBeNull();
+    expect(parseMoves('{"moves":[]}', candidates)).toEqual([]);
     // health and diet facts are never offered for moving at all
     expect(organizeCandidates("- 2026-09-26 · The user is vegetarian.\n- 2026-09-26 · Allergic to peanuts\n- 2026-09-26 · Loves Irani cafes\n", TODAY, new Set()).map((e) => e.body)).toEqual(["Loves Irani cafes"]);
-    const { text: left, byTopic } = applyMoves(text, parseMoves('{"moves":[{"i":0,"topic":"x","aliases":["q"]}]}', candidates));
+    const { text: left, byTopic } = applyMoves(text, parseMoves('{"moves":[{"i":0,"topic":"x","aliases":["q"]}]}', candidates)!);
     expect(left).toBe("- 2026-09-26 · A\n- 2026-09-20 · Trip · until 2026-09-21\n");
     expect(byTopic.get("x.md")).toEqual({ lines: ["- 2026-09-26 · B"], aliases: ["q"] });
   });
@@ -379,6 +382,44 @@ describe("the upkeep loop", () => {
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "hi", bot: "hello" }] });
     expect(report.organized).toBe(1);
     expect(readMemoryTopic(BOT.id, "acme.md")).toContain("The client Acme wants logo revisions.");
+  });
+
+  it("retries organization after malformed output instead of remembering every entry as core", async () => {
+    writeMemoryFile(BOT.id, "- 2026-09-25 · Acme needs a logo revision.\n");
+    organizeAnswer = "temporary provider error";
+    const service = upkeep();
+    await service.tidy(BOT.id);
+    organizeAnswer = '{"moves":[{"i":0,"topic":"acme"}]}';
+    expect((await service.tidy(BOT.id)).organized).toBe(1);
+    expect(readMemoryTopic(BOT.id, "acme.md")).toContain("Acme needs a logo revision.");
+  });
+
+  it("organizes Unicode topic names through the same read/write gate", async () => {
+    writeMemoryFile(BOT.id, "- 2026-09-25 · Enjoys quiet cafés.\n");
+    organizeAnswer = '{"moves":[{"i":0,"topic":"café"}]}';
+    expect((await upkeep().tidy(BOT.id)).organized).toBe(1);
+    expect(readMemoryTopic(BOT.id, "café.md")).toContain("Enjoys quiet cafés.");
+  });
+
+  it("does not tidy after upkeep is disabled during a model call", async () => {
+    const original = "- 2026-09-25 · Likes tea\n- 2026-09-25 · Likes tea\n";
+    writeMemoryFile(BOT.id, original);
+    engine = { generateText: async () => {
+      BOT.memoryUpkeep = false;
+      return '{"moves":[]}';
+    } };
+    await upkeep().tidy(BOT.id);
+    expect(memory()).toBe(original);
+  });
+
+  it("reconsiders moves beyond the per-pass limit instead of marking them core", async () => {
+    writeMemoryFile(BOT.id, Array.from({ length: MAX_MOVES + 1 }, (_, i) => `- 2026-09-25 · Project detail ${i}`).join("\n"));
+    organizeAnswer = JSON.stringify({ moves: Array.from({ length: MAX_MOVES + 1 }, (_, i) => ({ i, topic: "project" })) });
+    const service = upkeep();
+    expect((await service.tidy(BOT.id)).organized).toBe(MAX_MOVES);
+    organizeAnswer = '{"moves":[{"i":0,"topic":"project"}]}';
+    expect((await service.tidy(BOT.id)).organized).toBe(1);
+    expect(readMemoryTopic(BOT.id, "project.md")).toContain(`Project detail ${MAX_MOVES}`);
   });
 
   it("tidies topic files too: expired lines to the archive, duplicates merged", async () => {

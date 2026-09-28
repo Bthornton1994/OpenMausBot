@@ -11,7 +11,8 @@
 // are neutralised so a note cannot close the block; the block is capped.
 import { recallMessages, recallTerms, type MemoryHit, type RecallHit } from "./message-db.ts";
 import { parseTopicHeader, readTopicHead, topicBody, topicWords } from "./memory-topics.ts";
-import { listMemoryTopics, readMemoryTopic, searchMemoryFiles, workspaceDir } from "./workspace.ts";
+import { listMemoryTopics, memoryDate, readMemoryTopic, searchMemoryFiles, workspaceDir } from "./workspace.ts";
+import { withoutExpired } from "./memory-entries.ts";
 import { join } from "node:path";
 
 /** Below this many characters a message is a nod, not a question. */
@@ -139,7 +140,7 @@ export function topicPassages(botId: string, query: string): RecallPassage[] {
       if (topic.name === "archive.md") continue;
       const words = topicWords(topic.name, parseTopicHeader(readTopicHead(join(dir, topic.name))));
       if (!terms.some((term) => words.some((word) => sameWord(term, word)))) continue;
-      const body = topicBody(readMemoryTopic(botId, topic.name) ?? "");
+      const body = topicBody(withoutExpired(readMemoryTopic(botId, topic.name) ?? "", memoryDate()).text);
       if (!body) continue;
       out.push({ source: "memory", label: `memory/${topic.name}`, snippet: body.length > TOPIC_PASSAGE_CHARS ? `${body.slice(0, TOPIC_PASSAGE_CHARS)}…` : body });
       if (out.length >= MEMORY_HITS) break;

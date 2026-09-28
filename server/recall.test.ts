@@ -1,7 +1,7 @@
 // Automatic recall: the query, the two-term rule, which files are never
 // recalled, and the block's shape (rule first, numbered, fenced, capped).
 import { rmSync } from "node:fs";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import { closeMessageDb, recallMatchTerm, recallTerms } from "./message-db.ts";
@@ -101,6 +101,22 @@ describe("recall from memory files", () => {
   it("never recalls a daily log, which repeats what was just said", () => {
     appendMemoryLog(BOT, "shipped the quarterly invoice report");
     expect(memoryPassages(BOT, "the quarterly invoice report")).toEqual([]);
+  });
+
+  it("excludes expired topic facts from aliases and search even when the file has not changed", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(2026, 8, 25, 12));
+      writeMemoryTopic(BOT, "trip.md", "---\naliases: [holiday]\n---\n- 2026-09-25 · Staying in Goa · until 2026-09-25\n- 2026-09-25 · Prefers window seats\n");
+      expect(memoryPassages(BOT, "staying Goa")[0]?.snippet).toContain("Goa");
+      vi.setSystemTime(new Date(2026, 8, 26, 12));
+      expect(topicPassages(BOT, "holiday")[0]?.snippet).not.toContain("Goa");
+      expect(topicPassages(BOT, "holiday")[0]?.snippet).toContain("window seats");
+      expect(memoryPassages(BOT, "staying Goa")).toEqual([]);
+      expect(memoryPassages(BOT, "window seats")[0]?.snippet).toContain("window");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("is null for a short message or nothing matching", () => {

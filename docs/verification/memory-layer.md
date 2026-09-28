@@ -29,11 +29,15 @@ Evidence covers:
 - `Balance is -10` captured twice is kept once; `Balance is 10` is a different fact.
 - A fact about the person reaches About me on its own as a dated, attributed line in the prompt; Remove takes it out and a second Remove is refused.
 - The tidy-up archives the expired entry and strikes the contradicted one, reports it, and Undo restores the file.
+- A routine run is not captured as a person's conversation and never adds owner facts to About me.
 
 Unit tests add the share limit on small notebooks (no contradiction change below
 five entries), the nightly schedule (once a day after the hour, never while the
 bot is busy, catching up after sleep), backup pauses, and engines without a
-one-shot text call.
+one-shot text call. They also cover expired topic facts disappearing from both
+alias recall and the search index after midnight without a file edit, retrying
+malformed organization output and deferred moves, Unicode topic names, and
+stopping upkeep writes when its switch changes during a model call.
 
 ## Not proven here
 
