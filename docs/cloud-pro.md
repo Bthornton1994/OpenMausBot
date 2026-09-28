@@ -223,3 +223,12 @@ malformed session summary or grant is treated as none.
   engine. Every model call uses the person's own sign-in or key.
 - A volume binds to one machine and is never adopted by another.
 - Each customer's app lives in its own Fly private network.
+
+## Published image
+
+Every push to `main` and every release tag publishes the home machine image as
+`ghcr.io/milind-soni/openmausbot-cloud-home`, tagged `latest` (main only), `sha-<commit>` and the release tag.
+It is built from `deploy/fly/Dockerfile` on top of the server image for the same commit, with Claude Code and
+Codex installed. The Docker workflow's summary prints the digest. Set it in the Admin as
+`OMB_CLOUD_HOME_IMAGE=ghcr.io/milind-soni/openmausbot-cloud-home@sha256:…`; changing it rolls the new image
+out to existing machines one at a time, reverting automatically on a failed health check.
