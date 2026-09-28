@@ -26,6 +26,7 @@ Evidence covers:
 - A fact said in one chat is recalled in a new chat, named by its source.
 - An entry past its until date leaves the prompt; one without a date stays.
 - A new bot has upkeep on; switched off, nothing is captured and **Tidy up now** is refused.
+- A rejected settings update does not discard a queued capture or change the upkeep switch.
 - Upkeep on: core facts are appended as dated, `(noticed)` entries with their until date; detail is filed into a topic file created with a title and aliases; all journaled as upkeep.
 - `Balance is -10` captured twice is kept once; `Balance is 10` is a different fact.
 - A fact about the person reaches About me on its own as a dated, attributed line in the prompt; Remove takes it out and a second Remove is refused.

@@ -38,11 +38,15 @@ async function serve(deps: Partial<BotMemoryRouteDeps> = {}, beforeDispatch?: (r
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     beforeDispatch?.(res);
-    const handled = await dispatchRoutes(routes, {
-      req, res, url, path: url.pathname, method: req.method ?? "GET",
-      auth: { kind: "loopback", scopes: ["admin"] }, json, readBody,
-    });
-    if (!handled) json(res, 404, { from: "inline routes" });
+    try {
+      const handled = await dispatchRoutes(routes, {
+        req, res, url, path: url.pathname, method: req.method ?? "GET",
+        auth: { kind: "loopback", scopes: ["admin"] }, json, readBody,
+      });
+      if (!handled) json(res, 404, { from: "inline routes" });
+    } catch (error) {
+      json(res, 500, { error: String(error) });
+    }
   });
   servers.push(server);
   await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
@@ -134,6 +138,34 @@ describe("the bot-memory module through the route table", () => {
     expect(await removed.json()).toEqual({ ok: true, aboutMe: "Handwritten note", learned: [] });
     expect((await remove()).status).toBe(404);
     expect(saved).toEqual(["Handwritten note"]);
+  });
+
+  it("keeps a learned fact retryable when saving About me fails", async () => {
+    const from = { botId: "bot-123", botName: "Memo" };
+    const facts = planLearned(from, ["Prefers quiet cafes"], "", "2026-09-28");
+    commitLearned(facts);
+    const original = `Handwritten note\n${facts[0]!.line}`;
+    let aboutMe = original;
+    let failSave = true;
+    const base = await serve({
+      aboutMe: () => aboutMe,
+      saveAboutMe: (text) => {
+        if (failSave) throw new Error("synthetic profile write failure");
+        aboutMe = text;
+      },
+    });
+    const remove = () => fetch(`${base}/api/profile/learned/${facts[0]!.id}/remove`, { method: "POST" });
+    expect((await remove()).status).toBe(500);
+    expect(aboutMe).toBe(original);
+    expect(await (await fetch(`${base}/api/profile/learned`)).json()).toEqual({ learned: facts });
+    expect(planLearned(from, [facts[0]!.text], "", "2026-09-28")).toHaveLength(1);
+
+    failSave = false;
+    const retried = await remove();
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ ok: true, aboutMe: "Handwritten note", learned: [] });
+    expect(planLearned(from, [facts[0]!.text], aboutMe, "2026-09-28")).toEqual([]);
+    expect((await remove()).status).toBe(404);
   });
 
   it("passes wrong methods and near-miss paths to the next handler", async () => {

@@ -18588,7 +18588,6 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.memoryUpkeep !== undefined) {
         if (typeof body.memoryUpkeep !== "boolean") return json(res, 400, { error: "memoryUpkeep must be true or false" });
         patch.memoryUpkeep = body.memoryUpkeep;
-        if (!body.memoryUpkeep && existingBot) memoryUpkeep.dropBot(existingBot.id);
       }
       // per-bot gate on the app's built-in browser
       if (body.browser !== undefined) {
@@ -18910,6 +18909,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         bot = store.patchBot(m[1], patch);
       }
       if (!bot) return json(res, 404, { error: "no such bot" });
+      if (body.memoryUpkeep === false) memoryUpkeep.dropBot(bot.id);
       // A defined Works on is the newest explicit choice: this bot's
       // auto-recorded pins that now point elsewhere give way immediately, so
       // the next turn on each thread follows the new setting. Person-set pins

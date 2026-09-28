@@ -101,16 +101,19 @@ export function appendAboutMe(aboutMe: string, lines: readonly string[], maxChar
 }
 
 /** Forget one learned fact: its line leaves About me (when it is still
- * there, unedited) and it is never added again. Returns the new About me. */
-export function removeLearned(id: string, aboutMe: string): { fact: LearnedFact; aboutMe: string } | null {
+ * there, unedited) and it is never added again. Save About me before
+ * committing removal so a failed profile save leaves the fact retryable. */
+export function removeLearned(id: string, aboutMe: string, saveAboutMe?: (text: string) => void): { fact: LearnedFact; aboutMe: string } | null {
   const file = load();
   const fact = file.learned.find((f) => f.id === id);
   if (!fact) return null;
-  file.learned = file.learned.filter((f) => f.id !== id);
-  file.removed = [...file.removed, factIdentity(fact.text)].slice(-MAX_REMOVED);
-  save(file);
   const lines = aboutMe.split("\n");
   const at = lines.indexOf(fact.line);
   if (at !== -1) lines.splice(at, 1);
-  return { fact, aboutMe: lines.join("\n") };
+  const next = lines.join("\n");
+  if (next !== aboutMe) saveAboutMe?.(next);
+  file.learned = file.learned.filter((f) => f.id !== id);
+  file.removed = [...file.removed, factIdentity(fact.text)].slice(-MAX_REMOVED);
+  save(file);
+  return { fact, aboutMe: next };
 }

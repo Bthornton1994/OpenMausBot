@@ -157,10 +157,8 @@ export function createBotMemoryRoutes(deps: BotMemoryRouteDeps): RouteHandler {
     }
     m = path.match(/^\/api\/profile\/learned\/([\w-]+)\/remove$/);
     if (m && method === "POST") {
-      const current = deps.aboutMe();
-      const removed = removeLearned(m[1], current);
+      const removed = removeLearned(m[1], deps.aboutMe(), deps.saveAboutMe);
       if (!removed) return json(res, 404, { error: "That fact was already removed." });
-      if (removed.aboutMe !== current) deps.saveAboutMe(removed.aboutMe);
       return json(res, 200, { ok: true, aboutMe: deps.aboutMe(), learned: listLearnedFacts() });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/upkeep$/);
