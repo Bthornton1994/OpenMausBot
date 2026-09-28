@@ -100,6 +100,7 @@ import { useShowThreads } from "@/lib/thread-preferences";
 import { attentionJumpAction, AttentionThreadRows, crossBotAttentionThreads, SidebarBotActivity, sidebarBotActivityTasks } from "./SidebarBotActivity";
 import { SidebarAttentionPanel } from "./SidebarAttentionPanel";
 import { ShortcutHint } from "./ShortcutHint";
+import { usePopoverDismiss } from "@/hooks/use-popover-dismiss";
 
 const SECTION_LABEL_KEYS: Record<string, LocaleKey> = {
   [PINNED_SECTION_ID]: "sidebar.section.pinned",
@@ -1647,14 +1648,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     return () => document.removeEventListener("keydown", closeOnEscape);
   }, [open, onClose, confirm]);
 
-  useEffect(() => {
-    if (!densityOpen) return;
-    const closeDensityMenu = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setDensityOpen(false);
-    };
-    window.addEventListener("keydown", closeDensityMenu);
-    return () => window.removeEventListener("keydown", closeDensityMenu);
-  }, [densityOpen]);
+  // Each header menu's root wraps its trigger and its popover, so a press on
+  // the trigger is left to the trigger's own toggle.
+  const densityMenuRef = useRef<HTMLDivElement>(null);
+  const attentionMenuRef = useRef<HTMLDivElement>(null);
+  const plusMenuRef = useRef<HTMLDivElement>(null);
+  usePopoverDismiss(densityOpen, densityMenuRef, () => setDensityOpen(false));
+  usePopoverDismiss(attentionOpen, attentionMenuRef, () => setAttentionOpen(false));
+  usePopoverDismiss(plusOpen, plusMenuRef, () => setPlusOpen(false));
 
   useEffect(() => {
     if (remoteClient) return;
@@ -1909,7 +1910,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           >
             {density === "icons" ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}
           </button>
-          <div className="relative">
+          <div ref={densityMenuRef} className="relative">
             <button
               type="button"
               onClick={() => setDensityOpen((value) => !value)}
@@ -1926,7 +1927,6 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
             </button>
             {densityOpen && (
               <>
-                <div className="fixed inset-0 z-30" onMouseDown={() => setDensityOpen(false)} />
                 <div className={cn(
                   "absolute top-full z-40 mt-1 w-40 overflow-hidden rounded-xl border border-hairline/50 bg-menu py-1.5 shadow-2xl shadow-black/60",
                   density === "icons" ? "left-0" : "right-0",
@@ -1953,7 +1953,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               </>
             )}
           </div>
-          <div className={density === "icons" ? "relative" : "contents"}>
+          <div ref={attentionMenuRef} className={density === "icons" ? "relative" : "contents"}>
             <button
               type="button"
               onClick={() => setAttentionOpen((o) => !o)}
@@ -1968,7 +1968,6 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
             </button>
             {attentionOpen && (
               <>
-                <div className="fixed inset-0 z-30" onMouseDown={() => setAttentionOpen(false)} />
                 <div className={cn(
                   "absolute top-full z-40 mt-1 overflow-hidden rounded-xl border border-hairline/50 bg-menu py-1.5 shadow-2xl shadow-black/60",
                   density === "icons" ? "left-0" : "right-0",
@@ -1995,6 +1994,8 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               </>
             )}
           </div>
+          {/* `contents` keeps the popover anchored to the header row */}
+          <div ref={plusMenuRef} className="contents">
           <button
             ref={importReturnRef}
             onClick={() => setPlusOpen((o) => !o)}
@@ -2006,7 +2007,6 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           </button>
           {plusOpen && (
             <>
-              <div className="fixed inset-0 z-30" onMouseDown={() => setPlusOpen(false)} />
               <div className={cn(
                 "absolute top-full z-40 mt-1 w-52 overflow-hidden rounded-xl border border-hairline/50 bg-menu py-1.5 shadow-2xl shadow-black/60",
                 density === "icons" ? "left-0" : "right-0",
@@ -2066,6 +2066,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
               </div>
             </>
           )}
+          </div>
         </div>
       </div>
 
