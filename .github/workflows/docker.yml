@@ -167,7 +167,7 @@ jobs:
             -e 'OMB_HOSTED_MODELS={"anthropic":["claude-sonnet-5"],"openai":[],"openrouter":["openai/gpt-fixture"]}')
           # An incomplete contract exits instead of serving.
           if timeout 60 docker run --name home-bad -e OMB_CLOUD_ROLE=home omb-cloud-home:ci; then echo "an incomplete contract served"; exit 1; fi
-          docker logs home-bad 2>&1 | grep -q "Cloud home configuration is invalid"
+          grep -q "Cloud home configuration is invalid" <<<"$(docker logs home-bad 2>&1)"
           docker rm -f home-bad >/dev/null
           docker run -d --name home -p 127.0.0.1:18080:8080 -v omb-home-ci:/data "${contract[@]}" omb-cloud-home:ci
           E=http://127.0.0.1:18080
@@ -179,8 +179,9 @@ jobs:
             docker logs home; echo "the cloud home never became healthy"; return 1
           }
           healthy
-          docker logs home 2>&1 | grep -q "ignoring 1 included anthropic model(s): Claude Code never runs on included AI"
-          if docker logs home 2>&1 | grep -qF "$secret"; then echo "the bootstrap secret reached the log"; exit 1; fi
+          logs=$(docker logs home 2>&1)
+          grep -qF "ignoring 1 included anthropic model(s): Claude Code never runs on included AI" <<<"$logs"
+          if grep -qF "$secret" <<<"$logs"; then echo "the bootstrap secret reached the log"; exit 1; fi
           # The launcher, the server and the edge all run as maus.
           owners=$(docker exec home sh -c 'for p in /proc/[0-9]*; do case "$(readlink "$p/exe" 2>/dev/null)" in */node|*/caddy) stat -c %U "$p";; esac; done' | sort -u)
           echo "process owners: $owners"; test "$owners" = maus
