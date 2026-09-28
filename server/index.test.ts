@@ -1117,12 +1117,12 @@ describe("harness HTTP API", () => {
     // busy guard instead of its expected response. Drain the holds between
     // tests so a leak fails inside its own test rather than cascading through
     // the rest of the block.
-    managedBoxListGate?.release();
-    managedBoxListGate = null;
-    managedBoxCreateGate?.release();
-    managedBoxCreateGate = null;
-    managedBoxDeleteGate?.release();
-    managedBoxDeleteGate = null;
+    managedBoatListGate?.release();
+    managedBoatListGate = null;
+    managedBoatCreateGate?.release();
+    managedBoatCreateGate = null;
+    managedBoatDeleteGate?.release();
+    managedBoatDeleteGate = null;
     const deadline = Date.now() + 15_000;
     let stuck = { bots: [] as string[], groups: [] as string[], computers: [] as string[] };
     while (Date.now() < deadline) {
