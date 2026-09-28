@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import type { Bot } from "@/state/store";
 import { browserAvailable, type FeatureFlagConfig } from "@/lib/feature-flags";
+import { t } from "@/lib/i18n";
 
 const fixture = vi.hoisted(() => {
   vi.stubGlobal("window", {});
@@ -56,5 +57,11 @@ describe("Browser panel installation access", () => {
     expect(installing).toContain("Installing…");
     expect(installing).toContain('disabled=""');
     expect(installing).not.toContain("has its own browser");
+  });
+});
+
+describe("Computer panel header", () => {
+  it("names its icon-only close button", () => {
+    expect(render({})).toContain(`aria-label="${t("computer.close")}"`);
   });
 });
