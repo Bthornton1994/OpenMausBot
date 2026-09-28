@@ -1,9 +1,8 @@
-export type CloudMachineStatus = "provisioning" | "ready" | "stopped" | "payment-problem" | "failed" | "allowance-used";
+export type CloudMachineStatus = "provisioning" | "ready" | "stopped" | "payment-problem" | "failed";
 /** What the renderer may know about the person's Cloud machine: never a code. */
 export interface CloudMachine {
   status: CloudMachineStatus;
   origin?: string;
-  allowanceResetsAt?: number;
 }
 export interface CloudHomeGrant { origin: string; code: string; expiresAt: number }
 export interface CloudHomeTarget { origin: string; grant: CloudHomeGrant | null }

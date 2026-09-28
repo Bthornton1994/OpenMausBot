@@ -18,17 +18,18 @@ test("the Admin's cloud summary becomes one plain machine state", () => {
   assert.deepEqual(parseCloudSummary({ state: "payment_problem", origin, pairingAvailable: false }), { status: "payment-problem", origin });
   assert.deepEqual(parseCloudSummary({ state: "stopped", origin: null, pairingAvailable: false }), { status: "stopped" });
   assert.deepEqual(parseCloudSummary({ state: "failed", origin, pairingAvailable: false }), { status: "failed", origin });
-  // A spent allowance on a running machine is its own state, with its reset date.
+  // Cloud Pro includes no AI: an allowance an older Admin still sends changes nothing.
   assert.deepEqual(parseCloudSummary({ state: "ready", origin, pairingAvailable: true, allowance: { includedUsd: 25, usedUsd: 25.4, resetsAt: NOW + 86_400_000 } }),
-    { status: "allowance-used", origin, allowanceResetsAt: NOW + 86_400_000 });
-  assert.deepEqual(parseCloudSummary({ state: "ready", origin, pairingAvailable: true, allowance: { includedUsd: 25, usedUsd: 3, resetsAt: NOW } }), { status: "ready", origin });
+    { status: "ready", origin });
 });
 
 test("a malformed summary is no machine at all", () => {
   for (const input of [null, undefined, "ready", [], { state: "running", origin }, { state: "ready" }, { state: "ready", origin: null },
     { state: "ready", origin: "http://omb-u-1a2b3c4d5e6f.fly.dev" }, { state: "ready", origin: `${origin}/pair` },
     { state: "ready", origin: "https://user:pw@omb-u-1a2b3c4d5e6f.fly.dev" }, { state: "ready", origin: "https://localhost" },
-    { state: "stopped", origin: "javascript:alert(1)" }, { state: "toString", origin }, { state: "__proto__", origin }]) {
+    { state: "stopped", origin: "javascript:alert(1)" }, { state: "toString", origin }, { state: "__proto__", origin },
+    // an included-AI state from before Cloud Pro dropped included AI
+    { state: "allowance_used", origin }]) {
     assert.equal(parseCloudSummary(input), null, JSON.stringify(input));
   }
 });
@@ -49,7 +50,7 @@ test("the machine is listed under Servers once, never renamed and never made act
   const listed = withCloudHome(local, { status: "ready", origin }, () => "cloud-1");
   assert.deepEqual(listed, { environments: [{ id: "cloud-1", name: CLOUD_HOME_NAME, origin }], activeId: environments.LOCAL_ID });
   const renamed = { ...listed, environments: [{ ...listed.environments[0], name: "Work cloud" }] };
-  assert.equal(withCloudHome(renamed, { status: "allowance-used", origin }, () => "cloud-2"), renamed);
+  assert.equal(withCloudHome(renamed, { status: "stopped", origin }, () => "cloud-2"), renamed);
 });
 
 test("connecting uses the pairing page with the code in the hash, or the machine itself", () => {
@@ -129,7 +130,7 @@ test("a grant for another machine or an Admin refusal never connects", async t =
   await assert.rejects(f.client.pairHome(), error => error.status === 409);
 });
 
-test("stopped, unpaid, failed and allowance-used machines show plainly; only allowance-used can still be joined", async t => {
+test("stopped, unpaid and failed machines show plainly and cannot be joined", async t => {
   const f = await admin(t);
   f.cloud = { state: "payment_problem", origin, pairingAvailable: false };
   f.entitlement = { plan: "free", status: "inactive", expiresAt: null, version: 4 };
@@ -142,8 +143,8 @@ test("stopped, unpaid, failed and allowance-used machines show plainly; only all
     assert.equal(f.client.homeTarget(), null);
   }
   f.entitlement = { plan: "pro", status: "active", expiresAt: NOW + 30 * 86_400_000, version: 5 };
-  f.cloud = { state: "ready", origin, pairingAvailable: true, allowance: { includedUsd: 25, usedUsd: 25, resetsAt: NOW + 86_400_000 } };
-  assert.deepEqual((await f.client.refresh()).machine, { status: "allowance-used", origin, allowanceResetsAt: NOW + 86_400_000 });
+  f.cloud = { state: "ready", origin, pairingAvailable: true };
+  assert.deepEqual((await f.client.refresh()).machine, { status: "ready", origin });
   assert.deepEqual(f.client.homeTarget(), { origin });
 });
 

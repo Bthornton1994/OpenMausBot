@@ -4,8 +4,8 @@ import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
 import { afterEach, expect, it } from "vitest";
 import {
-  CLOUD_HOME_MARKER, CLOUD_PAIRING_MAX_TTL_S, CLOUD_PAIRING_NONCE_MS, CLOUD_PAIRING_SKEW_S, cloudHomeConfiguration, cloudHomeConfigured,
-  cloudHomeHost, cloudPairingSignature, createCloudPairing, prepareCloudHomeVolume,
+  CLOUD_HOME_MARKER, CLOUD_IGNORED_KEYS, CLOUD_PAIRING_MAX_TTL_S, CLOUD_PAIRING_NONCE_MS, CLOUD_PAIRING_SKEW_S, cloudHomeConfiguration, cloudHomeConfigured,
+  cloudHomeHost, cloudPairingSignature, createCloudPairing, prepareCloudHomeVolume, withoutIgnoredCloudKeys,
 } from "./cloud-home.ts";
 import { cloudHomeChildEnvironments, passwdIds } from "./cloud-home-start.ts";
 import { hostedModelPolicy } from "./hosted-models.ts";
@@ -19,15 +19,17 @@ const directory = () => { const value = mkdtempSync(join(tmpdir(), "omb-cloud-ho
 
 // Shapes exactly as openmaus-cloud's provisioner writes them (cloud-machines.ts).
 const secret = "S".repeat(43);
-const token = `omb_cloudai_${"t".repeat(43)}`;
 const machineId = "3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93";
-const gatewayUrl = "https://cloud.example.test/api/cloud/gateway/g0123456789abcdef0123456789abcd";
 const contract = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
   OMB_CLOUD_ROLE: "home", OMB_CLOUD_MACHINE_ID: machineId, OMB_CLOUD_ADMIN_URL: "https://cloud.example.test",
   OMB_PUBLIC_URL: "https://omb-u-1a2b3c4d5e6f.fly.dev", OMB_CLOUD_BOOTSTRAP_SECRET: secret, ...extra,
 });
-const withModels = (catalog: object = { anthropic: [], openai: ["gpt-5.6-sol"], openrouter: ["anthropic/claude-sonnet-5"] }) =>
-  contract({ OMB_HOSTED_MODEL_URL: gatewayUrl, OMB_HOSTED_MODEL_TOKEN: token, OMB_HOSTED_MODELS: JSON.stringify(catalog) });
+// A platform gateway's settings, as an Admin from before Cloud Pro dropped
+// included AI wrote them. A Cloud home ignores them.
+const token = `omb_cloudai_${"t".repeat(43)}`;
+const gatewayUrl = "https://cloud.example.test/api/cloud/gateway/g0123456789abcdef0123456789abcd";
+const withGateway = (extra: NodeJS.ProcessEnv = {}) => contract({ OMB_HOSTED_MODEL_URL: gatewayUrl, OMB_HOSTED_MODEL_TOKEN: token,
+  OMB_HOSTED_MODELS: JSON.stringify({ anthropic: ["claude-sonnet-5"], openai: ["gpt-5.6-sol"], openrouter: ["anthropic/claude-sonnet-5"] }), ...extra });
 
 // ── boot contract ──────────────────────────────────────────────────────────
 
@@ -37,15 +39,32 @@ it("is off on every ordinary server and desktop", () => {
   expect(cloudHomeConfiguration({ OMB_PUBLIC_URL: "https://selfhosted.example.test", OMB_HOSTED_MODELS: "{}" })).toBeNull();
 });
 
-it("reads the Admin's contract, with and without included models", () => {
+it("reads the Admin's contract", () => {
   expect(cloudHomeConfiguration(contract())).toEqual({
     machineId, adminOrigin: "https://cloud.example.test", publicOrigin: "https://omb-u-1a2b3c4d5e6f.fly.dev", bootstrapSecret: secret, warnings: [],
   });
-  const config = cloudHomeConfiguration(withModels())!;
-  expect(config.gateway).toEqual({ base: gatewayUrl, token, openai: ["gpt-5.6-sol"], openrouter: ["anthropic/claude-sonnet-5"] });
-  expect(config.warnings).toEqual([]);
   expect(cloudHomeConfiguration(contract({ OMB_CLOUD_ADMIN_URL: "https://cloud.example.test/" }))!.adminOrigin).toBe("https://cloud.example.test");
-  expect(cloudHomeConfiguration({ ...withModels(), OMB_HOSTED_MODEL_URL: `${gatewayUrl}/` })!.gateway!.base).toBe(gatewayUrl);
+});
+
+it("ignores a platform gateway's settings with one warning, whatever they hold, and never serves them", () => {
+  // Cloud Pro includes no AI: the person signs in with their own account or key.
+  const all = cloudHomeConfiguration(withGateway())!;
+  expect(Object.keys(all).sort()).toEqual(["adminOrigin", "bootstrapSecret", "machineId", "publicOrigin", "warnings"]);
+  expect(all.warnings).toEqual(["ignoring OMB_HOSTED_MODEL_URL, OMB_HOSTED_MODEL_TOKEN, OMB_HOSTED_MODELS: Cloud Pro includes no AI; people sign in with their own Claude or ChatGPT account, or an API key"]);
+  // Any one of them, valid or not, is ignored the same way instead of failing the machine.
+  for (const stray of [{ OMB_HOSTED_MODEL_TOKEN: token }, { OMB_HOSTED_MODEL_TOKEN: "sk-ant-api03-platform-key" }, { OMB_HOSTED_MODELS: "{not json" },
+    { OMB_HOSTED_MODEL_URL: "https://gateway.attacker.test/v1" }, { OMB_HOSTED_MODELS: "" }]) {
+    const config = cloudHomeConfiguration(contract(stray))!;
+    expect(config.warnings).toEqual([expect.stringMatching(new RegExp(`^ignoring ${Object.keys(stray)[0]}: Cloud Pro includes no AI`))]);
+    const value = Object.values(stray)[0];
+    if (value) expect(JSON.stringify(config)).not.toContain(value);
+  }
+  // The exclusive workspace model policy stays off, so nothing routes to a gateway.
+  expect(hostedModelPolicy(directory(), withGateway())).toBeNull();
+  expect(hostedModelPolicy(directory(), contract({ OMB_HOSTED_MODEL_TOKEN: `omb_workspace_${"t".repeat(43)}`, OMB_HOSTED_MODELS: "{}" }))).toBeNull();
+  // Nothing the machine starts inherits them.
+  expect(Object.keys(withoutIgnoredCloudKeys(withGateway())).filter((key) => (CLOUD_IGNORED_KEYS as readonly string[]).includes(key))).toEqual([]);
+  expect(withoutIgnoredCloudKeys(withGateway())).toEqual(contract());
 });
 
 it.each<[string, NodeJS.ProcessEnv]>([
@@ -62,40 +81,16 @@ it.each<[string, NodeJS.ProcessEnv]>([
   ["a secret with padding", contract({ OMB_CLOUD_BOOTSTRAP_SECRET: `${"S".repeat(42)}=` })],
   ["the desktop app", contract({ OMB_DESKTOP_PARENT: "1" })],
   ["a hosted team workspace too", contract({ OMB_ADMIN_URL: "https://cloud.example.test" })],
-  ["a token without the rest", contract({ OMB_HOSTED_MODEL_TOKEN: token })],
-  ["no gateway URL", { ...withModels(), OMB_HOSTED_MODEL_URL: undefined }],
-  ["a workspace token", { ...withModels(), OMB_HOSTED_MODEL_TOKEN: `omb_workspace_${"t".repeat(43)}` }],
-  ["a raw platform key", { ...withModels(), OMB_HOSTED_MODEL_TOKEN: "sk-ant-api03-platform-key" }],
-  ["a gateway on another origin", { ...withModels(), OMB_HOSTED_MODEL_URL: "https://gateway.attacker.test/api/cloud/gateway/g1" }],
-  ["an http gateway", { ...withModels(), OMB_HOSTED_MODEL_URL: gatewayUrl.replace("https:", "http:") }],
-  ["a gateway with a query", { ...withModels(), OMB_HOSTED_MODEL_URL: `${gatewayUrl}?key=x` }],
-  ["a gateway at the origin root", { ...withModels(), OMB_HOSTED_MODEL_URL: "https://cloud.example.test/" }],
-  ["a malformed catalog", { ...withModels(), OMB_HOSTED_MODELS: "{not json" }],
-  ["an unknown provider", withModels({ anthropic: [], openai: [], openrouter: ["a/b"], google: ["x"] })],
+  ["a hosted team workspace with a gateway", withGateway({ OMB_ADMIN_URL: "https://cloud.example.test", OMB_ADMIN_WORKSPACE: "acme", OMB_ADMIN_MEMBERSHIP: "portal" })],
 ])("refuses to start with %s", (_why, env) => {
   expect(() => cloudHomeConfiguration(env)).toThrow(/Cloud home configuration is invalid/);
 });
 
-it("never runs Claude Code on included AI, and says so instead of failing the machine", () => {
-  // openmaus-cloud's default catalog lists Claude under anthropic.
-  const config = cloudHomeConfiguration(withModels({ anthropic: ["claude-sonnet-5", "claude-haiku-4-5"], openai: ["gpt-5.6-sol"], openrouter: [] }))!;
-  expect(config.gateway).toEqual({ base: gatewayUrl, token, openai: ["gpt-5.6-sol"], openrouter: [] });
-  expect(config.warnings).toEqual([expect.stringMatching(/ignoring 2 included anthropic model\(s\): Claude Code never runs on included AI/)]);
-  const claudeOnly = cloudHomeConfiguration(withModels({ anthropic: ["claude-sonnet-5"], openai: [], openrouter: [] }))!;
-  expect(claudeOnly.gateway).toBeUndefined();
-  expect(claudeOnly.warnings).toHaveLength(2);
-  expect(cloudHomeConfiguration(withModels({ anthropic: [], openai: [], openrouter: [] }))!.gateway).toBeUndefined();
-});
-
 it("never echoes a secret or token in its refusal", () => {
-  for (const env of [contract({ OMB_CLOUD_BOOTSTRAP_SECRET: `${secret}!` }), { ...withModels(), OMB_HOSTED_MODEL_TOKEN: `${token}x` }]) {
+  for (const env of [contract({ OMB_CLOUD_BOOTSTRAP_SECRET: `${secret}!` }), withGateway({ OMB_CLOUD_BOOTSTRAP_SECRET: `${secret}!` })]) {
     try { cloudHomeConfiguration(env); expect.unreachable(); }
     catch (error) { expect(String(error)).not.toContain(secret); expect(String(error)).not.toContain(token); }
   }
-});
-
-it("keeps the exclusive workspace model policy off, so personal engines stay", () => {
-  expect(hostedModelPolicy(directory(), withModels())).toBeNull();
 });
 
 // ── the Admin's signed pairing request ───────────────────────────────────────
@@ -237,11 +232,13 @@ it("binds a fresh volume to its machine and refuses anyone else's data", () => {
   expect(readFileSync(join(unmarked, "notes.txt"), "utf8")).toBe("someone's data");
 });
 
-it("gives the edge only its routing name and the server the contract", () => {
-  const config = cloudHomeConfiguration(withModels())!;
-  const { server, edge } = cloudHomeChildEnvironments(config, { ...withModels(), PATH: "/usr/bin" }, "/data");
+it("gives the edge only its routing name and the server the contract, never a gateway's settings", () => {
+  const config = cloudHomeConfiguration(withGateway())!;
+  const { server, edge } = cloudHomeChildEnvironments(config, { ...withGateway(), PATH: "/usr/bin" }, "/data");
   expect(server).toMatchObject({ HOME: "/data", OMB_DATA_DIR: "/data/.openmausbot", OMB_PORT: "8799", OMB_WEBHOOK_PORT: "8800",
-    OMB_PUBLIC_URL: "https://omb-u-1a2b3c4d5e6f.fly.dev", OMB_WEBHOOK_PUBLIC_URL: "https://omb-u-1a2b3c4d5e6f.fly.dev", OMB_HOSTED_MODEL_TOKEN: token });
+    OMB_PUBLIC_URL: "https://omb-u-1a2b3c4d5e6f.fly.dev", OMB_WEBHOOK_PUBLIC_URL: "https://omb-u-1a2b3c4d5e6f.fly.dev", OMB_CLOUD_BOOTSTRAP_SECRET: secret });
+  for (const key of CLOUD_IGNORED_KEYS) expect(server).not.toHaveProperty(key);
+  expect(JSON.stringify(server)).not.toContain(token);
   expect(edge.OMB_CLOUD_PUBLIC_HOST).toBe(cloudHomeHost(config));
   expect(JSON.stringify(edge)).not.toContain(token);
   expect(JSON.stringify(edge)).not.toContain(secret);
@@ -261,5 +258,7 @@ it("ships an edge and a Fly template that keep the server private", () => {
   expect(fly).toMatch(/destination = "\/data"/);
   expect(fly).toMatch(/path = "\/api\/health"/);
   const env = /\[env\]([\s\S]*?)\n\[/.exec(fly)![1];
-  for (const secretKey of ["OMB_CLOUD_BOOTSTRAP_SECRET", "OMB_HOSTED_MODEL_TOKEN", "OMB_CLOUD_ADMIN_URL"]) expect(env).not.toMatch(new RegExp(`^\\s*${secretKey}\\s*=`, "m"));
+  for (const secretKey of ["OMB_CLOUD_BOOTSTRAP_SECRET", "OMB_CLOUD_ADMIN_URL"]) expect(env).not.toMatch(new RegExp(`^\\s*${secretKey}\\s*=`, "m"));
+  // Cloud Pro includes no AI: the template sets no gateway.
+  expect(fly).not.toContain("OMB_HOSTED_");
 });

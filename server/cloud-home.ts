@@ -13,22 +13,26 @@
 // timestamp, a nonce and the body's hash); each valid request opens one
 // ordinary pairing window (sessions.ts: single use, at most ten minutes),
 // which the Admin hands to the person's signed-in desktop app.
+//
+// Cloud Pro includes no AI. The person signs in on the machine with their own
+// Claude or ChatGPT account, or an API key, exactly as on any server; nothing
+// on a Cloud home is ever routed to a platform model gateway.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import { join } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import { hostedWorkspaceConfigured } from "./enterprise.ts";
-import { parseHostedCatalog } from "./hosted-catalog.ts";
 import { formatPairingCode, type SessionRegistry } from "./sessions.ts";
 
 export const CLOUD_HOME_CONTRACT_VERSION = 1;
 /** Any of these switches the server into Cloud home mode; then all are required. */
 export const CLOUD_HOME_KEYS = ["OMB_CLOUD_ROLE", "OMB_CLOUD_MACHINE_ID", "OMB_CLOUD_ADMIN_URL", "OMB_CLOUD_BOOTSTRAP_SECRET"] as const;
-/** Present together or not at all: a machine without included models is valid. */
-export const CLOUD_MODEL_KEYS = ["OMB_HOSTED_MODEL_URL", "OMB_HOSTED_MODEL_TOKEN", "OMB_HOSTED_MODELS"] as const;
+/** A platform model gateway's settings. A Cloud home never uses them: given
+ * any, it logs one warning, and neither the server nor anything it starts
+ * ever sees them. */
+export const CLOUD_IGNORED_KEYS = ["OMB_HOSTED_MODEL_URL", "OMB_HOSTED_MODEL_TOKEN", "OMB_HOSTED_MODELS"] as const;
 export const CLOUD_PAIRING_PATH = "/api/cloud/pairing";
-export const CLOUD_GATEWAY_TOKEN = /^omb_cloudai_[A-Za-z0-9_-]{43}$/;
 export const CLOUD_PAIRING_DEFAULT_TTL_S = 300;
 export const CLOUD_PAIRING_MAX_TTL_S = 600;
 /** How far a signed request's timestamp may be from this machine's clock. */
@@ -38,21 +42,11 @@ export const CLOUD_PAIRING_NONCE_MS = 10 * 60_000;
 const MAX_NONCES = 10_000;
 export const CLOUD_HOME_MARKER = ".omb-cloud-home.json";
 
-export interface CloudHomeGateway {
-  /** OMB_HOSTED_MODEL_URL; routes append /openai/v1 and /openrouter/v1. */
-  base: string;
-  token: string;
-  openai: string[];
-  openrouter: string[];
-}
-
 export interface CloudHomeConfig {
   machineId: string;
   adminOrigin: string;
   publicOrigin: string;
   bootstrapSecret: string;
-  /** Absent when this machine has no included models (the person brings their own). */
-  gateway?: CloudHomeGateway;
   /** Safe degradations worth an operator's attention, for the startup log. */
   warnings: string[];
 }
@@ -91,34 +85,16 @@ export function cloudHomeConfiguration(env: NodeJS.ProcessEnv = process.env): Cl
   const bootstrapSecret = env.OMB_CLOUD_BOOTSTRAP_SECRET ?? "";
   if (!/^[A-Za-z0-9_-]{43,128}$/.test(bootstrapSecret)) invalid("OMB_CLOUD_BOOTSTRAP_SECRET must be at least 256 bits of base64url");
   const warnings: string[] = [];
-  const config: CloudHomeConfig = { machineId, adminOrigin, publicOrigin, bootstrapSecret, warnings };
-  const present = CLOUD_MODEL_KEYS.filter((key) => env[key] !== undefined);
-  if (!present.length) return config;
-  if (present.length !== CLOUD_MODEL_KEYS.length) invalid(`set ${CLOUD_MODEL_KEYS.join(", ")} together, or none of them`);
-  if (!CLOUD_GATEWAY_TOKEN.test(env.OMB_HOSTED_MODEL_TOKEN ?? "")) invalid("OMB_HOSTED_MODEL_TOKEN must be the omb_cloudai_ gateway token the Admin minted for this machine");
-  let base: URL;
-  try { base = new URL(env.OMB_HOSTED_MODEL_URL ?? ""); } catch { return invalid("OMB_HOSTED_MODEL_URL must be an https URL"); }
-  // The gateway key only ever goes to the Admin that minted it.
-  if (base.protocol !== "https:" || base.origin !== adminOrigin || base.username || base.password || base.search || base.hash || base.pathname === "/") {
-    invalid("OMB_HOSTED_MODEL_URL must be a gateway path on OMB_CLOUD_ADMIN_URL");
-  }
-  let catalog;
-  try { catalog = parseHostedCatalog(env.OMB_HOSTED_MODELS); } catch { return invalid("OMB_HOSTED_MODELS is not a valid model catalog"); }
-  // Anthropic's Claude Code terms: a platform may not pay for or intermediate
-  // Claude usage in Claude Code; each person signs in with their own account.
-  // Claude Code therefore never runs on included AI. Claude models can be
-  // included through openrouter, where OpenMausBot's own agent runs them.
-  if (catalog.anthropic.length) {
-    warnings.push(`ignoring ${catalog.anthropic.length} included anthropic model(s): Claude Code never runs on included AI; offer Claude under openrouter`);
-  }
-  if (!catalog.openai.length && !catalog.openrouter.length) {
-    warnings.push("no included models this machine can run; people use their own engines");
-    return config;
-  }
-  return {
-    ...config,
-    gateway: { base: base.href.replace(/\/+$/, ""), token: env.OMB_HOSTED_MODEL_TOKEN!, openai: catalog.openai, openrouter: catalog.openrouter },
-  };
+  const ignored = CLOUD_IGNORED_KEYS.filter((key) => env[key] !== undefined);
+  if (ignored.length) warnings.push(`ignoring ${ignored.join(", ")}: Cloud Pro includes no AI; people sign in with their own Claude or ChatGPT account, or an API key`);
+  return { machineId, adminOrigin, publicOrigin, bootstrapSecret, warnings };
+}
+
+/** The environment without a platform gateway's settings (CLOUD_IGNORED_KEYS). */
+export function withoutIgnoredCloudKeys(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const kept = { ...env };
+  for (const key of CLOUD_IGNORED_KEYS) delete kept[key];
+  return kept;
 }
 
 /** The Admin's side of the signature (openmaus-cloud cloudPairingSignature). */

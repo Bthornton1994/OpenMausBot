@@ -10,17 +10,16 @@
 import environments from "./environments.cjs";
 
 export const CLOUD_HOME_NAME = "My Cloud";
-export const CLOUD_MACHINE_STATUSES = Object.freeze(["provisioning", "ready", "stopped", "payment-problem", "failed", "allowance-used"]);
+export const CLOUD_MACHINE_STATUSES = Object.freeze(["provisioning", "ready", "stopped", "payment-problem", "failed"]);
 /** Statuses in which the machine answers and may be connected to. */
-export const CLOUD_MACHINE_CONNECTABLE = Object.freeze(["ready", "allowance-used"]);
+export const CLOUD_MACHINE_CONNECTABLE = Object.freeze(["ready"]);
 // The Admin's `cloud.state` words, contract version 1.
 const ADMIN_STATES = Object.freeze({
-  setting_up: "provisioning", ready: "ready", stopped: "stopped", payment_problem: "payment-problem", failed: "failed", allowance_used: "allowance-used",
+  setting_up: "provisioning", ready: "ready", stopped: "stopped", payment_problem: "payment-problem", failed: "failed",
 });
 // formatPairingCode: three groups of four from the server's pairing alphabet.
 const CODE = /^[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/;
 const MAX_GRANT_MS = 10 * 60_000;
-const finite = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
 
 function homeOrigin(value) {
   if (typeof value !== "string" || value.length > 300) return null;
@@ -34,19 +33,15 @@ function homeOrigin(value) {
 }
 
 /** Validate the session's `cloud` summary. A malformed one means no machine,
- * never a partly trusted one. A spent allowance on a running machine shows as
- * its own state when the Admin reports `allowance: {includedUsd, usedUsd, resetsAt}`. */
+ * never a partly trusted one. Only the state and the address are read: Cloud
+ * Pro includes no AI, so there is no allowance to show. */
 export function parseCloudSummary(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  let status = Object.hasOwn(ADMIN_STATES, input.state) ? ADMIN_STATES[input.state] : null;
+  const status = Object.hasOwn(ADMIN_STATES, input.state) ? ADMIN_STATES[input.state] : null;
   if (!status) return null;
   const origin = input.origin === undefined || input.origin === null ? null : homeOrigin(input.origin);
   if ((input.origin !== undefined && input.origin !== null && !origin) || (CLOUD_MACHINE_CONNECTABLE.includes(status) && !origin)) return null;
-  const allowance = input.allowance && typeof input.allowance === "object" ? input.allowance : null;
-  const spent = allowance && finite(allowance.includedUsd) && finite(allowance.usedUsd) && allowance.usedUsd >= allowance.includedUsd;
-  if (status === "ready" && spent) status = "allowance-used";
-  const resetsAt = status === "allowance-used" && allowance && Number.isSafeInteger(allowance.resetsAt) && allowance.resetsAt > 0 ? allowance.resetsAt : null;
-  return { status, ...(origin ? { origin } : {}), ...(resetsAt ? { allowanceResetsAt: resetsAt } : {}) };
+  return { status, ...(origin ? { origin } : {}) };
 }
 
 /** Validate `POST /api/cloud/desktop/pairing` for the machine it was asked for. */

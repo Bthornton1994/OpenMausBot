@@ -747,9 +747,6 @@ export interface InstanceInfo {
   /** Company instances are owned by the desktop parent, never editable here. */
   readOnly?: boolean;
   managed?: { organizationId: string; organizationName: string };
-  /** Included with OMB Cloud Pro: metered through the Cloud, nothing to set
-   * up. `used` once this month's allowance is spent, until a turn succeeds. */
-  included?: { state: "ready" | "used" };
   /** The enrolled organisation's desktop policy does not allow bots to run on
    * this instance: shown, but disabled, with the server's reason. */
   policy?: { organizationName: string; reason: string };

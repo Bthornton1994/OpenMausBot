@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CloudAccountState } from "../../electron/cloud-account.mjs";
 import type { CloudMachine } from "../../electron/cloud-home.mjs";
-import { activeLocale, t } from "@/lib/i18n";
+import { t } from "@/lib/i18n";
 import { Card } from "./SettingsPrimitives";
 
 const MACHINE_TEXT = {
@@ -10,20 +10,16 @@ const MACHINE_TEXT = {
   stopped: "cloudHome.stopped",
   "payment-problem": "cloudHome.paymentProblem",
   failed: "cloudHome.failed",
-  "allowance-used": "cloudHome.allowanceUsed",
 } as const;
 
 /** The person's Cloud machine: where it stands, and one way in. Status and
  * address come only from the verified native snapshot; the pairing code
  * never reaches this page. A render helper (no hooks), part of the card. */
 function cloudHomeCard({ machine, busy, failed, onConnect }: { machine: CloudMachine; busy: boolean; failed: boolean; onConnect: () => void }) {
-  const connectable = machine.status === "ready" || machine.status === "allowance-used";
-  const resets = machine.status === "allowance-used" && machine.allowanceResetsAt
-    ? new Intl.DateTimeFormat(activeLocale(), { month: "long", day: "numeric" }).format(machine.allowanceResetsAt) : null;
+  const connectable = machine.status === "ready";
   return <Card title={t("cloudHome.title")}>
     <div data-cloud-home={machine.status} className="flex flex-col items-start gap-3">
       <p role="status" className={machine.status === "ready" ? "text-[14px] text-ink" : "text-[13px] text-ink-secondary"}>{t(MACHINE_TEXT[machine.status])}</p>
-      {resets && <p className="text-[13px] text-ink-secondary">{t("cloudHome.allowanceResets", { date: resets })}</p>}
       {connectable && <>
         <button type="button" disabled={busy} className="ui-button" onClick={onConnect}>{t("cloudHome.connect")}</button>
         <p className="text-[12px] text-ink-secondary">{t("cloudHome.connectHelp")}</p>

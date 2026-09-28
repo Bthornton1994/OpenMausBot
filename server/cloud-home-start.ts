@@ -11,7 +11,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { chownSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { cloudHomeConfiguration, cloudHomeHost, prepareCloudHomeVolume, type CloudHomeConfig } from "./cloud-home.ts";
+import { cloudHomeConfiguration, cloudHomeHost, prepareCloudHomeVolume, withoutIgnoredCloudKeys, type CloudHomeConfig } from "./cloud-home.ts";
 
 const SERVICE_USER = "maus";
 
@@ -25,10 +25,11 @@ export function passwdIds(passwd: string, name: string): { uid: number; gid: num
 }
 
 /** The server child's environment: the operator's contract plus fixed
- * ports and paths. The edge child gets only what it needs to route. */
+ * ports and paths, never a platform gateway's settings. The edge child gets
+ * only what it needs to route. */
 export function cloudHomeChildEnvironments(config: CloudHomeConfig, env: NodeJS.ProcessEnv, home: string) {
   const server: NodeJS.ProcessEnv = {
-    ...env, HOME: home, OMB_DATA_DIR: env.OMB_DATA_DIR || join(home, ".openmausbot"),
+    ...withoutIgnoredCloudKeys(env), HOME: home, OMB_DATA_DIR: env.OMB_DATA_DIR || join(home, ".openmausbot"),
     OMB_PORT: "8799", OMB_WEBHOOK_PORT: "8800", OMB_PUBLIC_URL: config.publicOrigin,
     OMB_WEBHOOK_PUBLIC_URL: env.OMB_WEBHOOK_PUBLIC_URL || config.publicOrigin,
   };
@@ -44,6 +45,8 @@ export function startCloudHome(env: NodeJS.ProcessEnv = process.env) {
   process.umask(0o077);
   const config = cloudHomeConfiguration(env);
   if (!config) throw new Error("This image runs an OMB Cloud home machine; set its boot contract (docs/cloud-pro.md).");
+  // Logged here once: the server child never sees what they are about.
+  for (const warning of config.warnings) console.warn(`cloud home: ${warning}`);
   const home = env.HOME || "/data";
   if (process.getuid?.() === 0) {
     const ids = passwdIds(readFileSync("/etc/passwd", "utf8"), SERVICE_USER);

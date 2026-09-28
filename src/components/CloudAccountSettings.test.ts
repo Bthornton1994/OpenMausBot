@@ -69,7 +69,6 @@ it.each([
   ["stopped", "Your Cloud is stopped", false],
   ["payment-problem", "problem with your payment", false],
   ["failed", "could not be set up yet", false],
-  ["allowance-used", "Included AI used up this month", true],
 ] as const)("shows the %s machine state plainly", async (status, text, connectable) => {
   await ready({ ...pro, machine: { status, ...(status === "provisioning" ? {} : { origin }) } });
   const html = render().html;
@@ -78,9 +77,11 @@ it.each([
   expect(html.includes("Connect to my Cloud")).toBe(connectable);
   expect(html).not.toContain("Could not complete this Cloud action");
 });
-it("says when included AI comes back", async () => {
-  await ready({ ...pro, machine: { status: "allowance-used", origin, allowanceResetsAt: Date.UTC(2026, 9, 1, 12) } });
-  expect(render().html).toContain("Included AI comes back on October 1");
+it("promises no included AI: the person signs in with their own account there", async () => {
+  await ready({ ...pro, machine: { status: "ready", origin } });
+  const html = render().html;
+  expect(html).toContain("sign in there with your own Claude or ChatGPT account, or an API key");
+  expect(html).not.toMatch(/included/i);
 });
 it("connects with one click, sending nothing from the page", async () => {
   await ready({ ...pro, machine: { status: "ready", origin } });

@@ -152,19 +152,19 @@ jobs:
         # :8080 is the only listener, a forwarded request is never the
         # loopback owner, a bad boot contract never serves, everything runs as
         # maus, and only an HMAC-signed, fresh, unreplayed request opens a
-        # single-use pairing window, also after a restart.
+        # single-use pairing window, also after a restart. Cloud Pro includes
+        # no AI: the machine boots without any model gateway, serves no
+        # included models, and tells the paired app to open its engine sign-in.
         run: |
           set -euo pipefail
           docker build -f deploy/fly/Dockerfile --build-arg BASE_IMAGE=openmausbot:ci --build-arg ENGINES= -t omb-cloud-home:ci .
           rand43() { openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'; }
           b64url() { base64 | tr '+/' '-_' | tr -d '=\n'; }
-          secret=$(rand43); token="omb_cloudai_$(rand43)"
+          secret=$(rand43)
           test "${#secret}" = 43
           host=omb-t-0123456789ab.fly.dev
           contract=(-e OMB_CLOUD_ROLE=home -e OMB_CLOUD_MACHINE_ID=3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93 -e OMB_CLOUD_ADMIN_URL=https://cloud.example.test
-            -e "OMB_PUBLIC_URL=https://$host" -e "OMB_CLOUD_BOOTSTRAP_SECRET=$secret" -e "OMB_HOSTED_MODEL_TOKEN=$token"
-            -e OMB_HOSTED_MODEL_URL=https://cloud.example.test/api/cloud/gateway/g0123456789abcdef0123456789abcd
-            -e 'OMB_HOSTED_MODELS={"anthropic":["claude-sonnet-5"],"openai":[],"openrouter":["openai/gpt-fixture"]}')
+            -e "OMB_PUBLIC_URL=https://$host" -e "OMB_CLOUD_BOOTSTRAP_SECRET=$secret")
           # An incomplete contract exits instead of serving.
           if timeout 60 docker run --name home-bad -e OMB_CLOUD_ROLE=home omb-cloud-home:ci; then echo "an incomplete contract served"; exit 1; fi
           grep -q "Cloud home configuration is invalid" <<<"$(docker logs home-bad 2>&1)"
@@ -180,7 +180,8 @@ jobs:
           }
           healthy
           logs=$(docker logs home 2>&1)
-          grep -qF "ignoring 1 included anthropic model(s): Claude Code never runs on included AI" <<<"$logs"
+          grep -qF "bots run on the engines the person signs in to here" <<<"$logs"
+          if grep -qF "ignoring OMB_HOSTED" <<<"$logs"; then echo "a model gateway reached the boot contract"; exit 1; fi
           if grep -qF "$secret" <<<"$logs"; then echo "the bootstrap secret reached the log"; exit 1; fi
           # The launcher, the server and the edge all run as maus.
           # comm and the /proc/<pid> owner are readable without CAP_SYS_PTRACE; readlink of another user's exe is not.
@@ -209,8 +210,10 @@ jobs:
           session=$(curl -sf "${H[@]}" -X POST -H 'content-type: application/json' -d "{\"code\":\"$pcode\"}" $E/api/auth/pair | jq -r .token)
           test "$(code "${H[@]}" -H "Authorization: Bearer $session" $E/api/bots)" = 200
           test "$(code "${H[@]}" -X POST -H 'content-type: application/json' -d "{\"code\":\"$pcode\"}" $E/api/auth/pair)" = 401   # single use
+          # No included models: only the person's own engines, and the app opens its engine sign-in.
           curl -sf "${H[@]}" -H "Authorization: Bearer $session" $E/api/instances \
-            | jq -e '[.instances[] | select(.instanceId == "included.agent" and .included.state == "ready" and .access == "api")] | length == 1'
+            | jq -e '(.instances | length) > 0 and ([.instances[] | select((.instanceId | startswith("included.")) or has("included") or .readOnly == true)] | length == 0)'
+          curl -sf "${H[@]}" -H "Authorization: Bearer $session" $E/api/auth/session | jq -e '.cloudHome == true and (has("hosted") | not)'
           # Only the edge is reachable from the network, never the server itself.
           ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' home)
           probe() { docker run --rm --network bridge curlimages/curl:8.14.1 -s -o /dev/null --max-time 3 "http://$1:$2/api/health"; }

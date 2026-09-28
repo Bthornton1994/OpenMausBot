@@ -5,12 +5,17 @@ customer gets one Fly app with one `home` machine that is always on, a volume
 at `/data`, and TLS at `https://<app>.fly.dev`. The desktop app, the phone and
 the web are windows onto it. Local use of the app is unchanged and free.
 
+Cloud Pro includes no AI usage. The person signs in on their machine with their
+own Claude or ChatGPT subscription, or an API key, through the same sign-in
+flows as any OpenMausBot server. Nothing on a Cloud home is routed to a
+platform model gateway.
+
 This page is the OpenMausBot half of a contract with three parties:
 
 - **the home machine**: this repository's `deploy/fly/` image;
 - **the Admin** (openmaus-cloud, `docs/consumer-cloud.md` there): provisions
-  the app, holds the machine's signing secret, runs the metered model gateway,
-  and answers the desktop's Cloud session;
+  the app, holds the machine's signing secret, and answers the desktop's Cloud
+  session;
 - **the desktop app**: signs in to Cloud, lists the machine under Servers,
   and offers **Connect to my Cloud**.
 
@@ -25,20 +30,31 @@ Contract version: `1` (`cloudContractVersion` on the wire).
 3. When it is ready, the machine appears under **Servers** as **My Cloud**, and
    the card offers **Connect to my Cloud**. One click opens the machine in the
    app window, signed in. There is no second confirmation.
-4. Their first bot runs immediately on the models **Included with Pro**. The
-   model picker lists them as ready under the **OMB Cloud** engine, with no
-   sign-in or setup.
-5. They can still sign in to their own Claude Code (paste-code) or Codex
-   (device code) under **Settings → Engines** on the Cloud. Those logins stay
-   on the machine's volume, beside the included models.
-6. When the month's included allowance is spent, the chat says **Included AI
-   used up this month**, the picker marks the included engine, and the Cloud
-   card says so too. Their own engines keep working.
+4. The first thing the Cloud shows is its engine sign-in
+   (`src/components/CloudEngineSignIn.tsx`), with three choices:
+   - **Sign in to Claude**: the existing paste-code flow (open Anthropic's
+     page, paste the code back);
+   - **Sign in to ChatGPT (Codex)**: the existing device-code flow;
+   - **Use an API key**: the existing model-provider keys in **Settings →
+     Connections** (Anthropic, or an OpenAI-compatible key such as OpenRouter).
+
+   It says plainly that the account's plan limits apply to bots running 24/7,
+   and that a Claude Max plan or an API key is recommended for heavy use.
+5. Until one of those engines can run, every bot on the Cloud, including the
+   default one, shows this sign-in rather than a chat that fails its first
+   turn. Once one can run, the chat takes its place. Sign-ins stay on the
+   machine's volume (`~/.claude`, `~/.codex`, the server's own config).
+
+The Cloud's `GET /api/auth/session` answers `"cloudHome": true` for a paired
+session; that is how the web UI knows to open the engine sign-in instead of
+the welcome flow, which describes the person's own computer (it can still be
+replayed from Settings). A paired session without admin scope (a phone paired
+as a client) is not shown the sign-in, since it cannot sign engines in.
 
 The card shows one of: **Setting up**, **Ready**, **Stopped**, **Payment
-problem**, **Could not be set up yet**, **Included AI used up**. Only Ready
-and Included AI used up can be connected to. Signed out of Cloud, the app
-makes no Cloud request and nothing on this page runs.
+problem**, **Could not be set up yet**. Only Ready can be connected to.
+Signed out of Cloud, the app makes no Cloud request and nothing on this page
+runs.
 
 ## The image
 
@@ -101,46 +117,28 @@ never echoes a secret.
 | `OMB_CLOUD_ADMIN_URL` | secret | The Cloud origin, exact `https://`, e.g. `https://cloud.openmausbot.com`. |
 | `OMB_CLOUD_BOOTSTRAP_SECRET` | secret | 43 base64url characters (256 bits): the key the Admin signs pairing requests with. |
 | `OMB_PUBLIC_URL` | env | The machine's exact `https://` origin, `https://<app>.fly.dev`. |
-| `OMB_HOSTED_MODEL_URL` | env | The gateway base, `${OMB_CLOUD_ADMIN_URL}/api/cloud/gateway/<gatewayId>`. Must be on the Admin's origin. |
-| `OMB_HOSTED_MODEL_TOKEN` | secret | This machine's gateway token, `omb_cloudai_` + 43 base64url characters. |
-| `OMB_HOSTED_MODELS` | env | The included catalog, JSON: `{"anthropic":[…],"openai":[…],"openrouter":[…]}`. |
 
-- The last three go together, or none of them (a machine without included models).
 - The machine must not also carry `OMB_ADMIN_URL`, `OMB_ADMIN_WORKSPACE` or
   `OMB_ADMIN_MEMBERSHIP`: a Cloud home is a personal server with pairing codes
   on, not a hosted team workspace with portal membership.
 - `HOME=/data` and `OMB_DATA_DIR=/data/.openmausbot` are set by the image.
-- The server keeps the secret and the token in memory and removes them from
-  its environment at startup; no engine or tool it starts ever inherits them.
+- The server keeps the secret in memory and removes it from its environment at
+  startup; no engine or tool it starts ever inherits it.
 
-### Which included models run, and where
+### No model gateway
 
-| Catalog key | Runs as | Route |
-| --- | --- | --- |
-| `openrouter` | `included.agent` ("OMB Cloud"): OpenMausBot's own agent (`openai-compat`) | `${OMB_HOSTED_MODEL_URL}/openrouter/v1` |
-| `openai` | `included.codex` ("OMB Cloud · Codex"): Codex, gateway as its custom provider | `${OMB_HOSTED_MODEL_URL}/openai/v1` |
-| `anthropic` | **nothing**: ignored, with a startup warning | never `/anthropic` |
+Cloud Pro includes no AI, so the contract has no model gateway. If a Cloud
+home is ever given `OMB_HOSTED_MODEL_URL`, `OMB_HOSTED_MODEL_TOKEN` or
+`OMB_HOSTED_MODELS` (an Admin from before this decision set all three), it
+still boots, logs one warning naming the variables (never their values), and
+ignores them:
 
-Claude Code never runs on included AI. Anthropic's Claude Code terms say a
-platform may not pay for, resell or intermediate Claude usage on its users'
-behalf; each person signs in with their own Anthropic account or key
-(https://code.claude.com/docs/en/legal-and-compliance). A gateway token the
-platform pays for is exactly that, whichever key sits behind the gateway. To
-include Claude models, list them under `openrouter`
-(e.g. `anthropic/claude-sonnet-5`); OpenMausBot's own agent runs them. A
-catalog whose only entries are `anthropic` boots with no included models
-rather than failing the machine.
-
-Included instances sit beside the person's own engines, never in place of
-them, and cannot be edited (`/api/instances/included.*` refuses changes).
-Until the person saves another default, new bots (including the first one)
-start on the included models, unless this month's allowance is used up.
-
-**Allowance used up**: the gateway answers `402` in the provider's own error
-shape (`budget_exceeded` for OpenAI, `{"error":{"code":402,…}}` for
-OpenRouter). The machine turns that into "Included AI used up this month…" in
-the chat, marks the engine in the picker, and clears the mark after the next
-successful turn.
+- the launcher drops them from the server's environment, and the server drops
+  them from its own at startup, so no engine or tool ever sees them;
+- the portal workspace model policy (`server/hosted-models.ts`) stays off on a
+  Cloud home whatever they hold, so no instance is routed to a gateway;
+- no `included.*` or other read-only instance is served; the person's own
+  engines are the only way to a model.
 
 ## Pairing: the Admin's signed request
 
@@ -197,11 +195,10 @@ token (`Authorization: Bearer omc_…`). Contract version 1 adds:
 ```
 
 - `null` or absent when the account has no machine; the app then shows nothing new.
-- `state` is `setting_up`, `ready`, `stopped`, `payment_problem` or `failed`
-  (the app also accepts `allowance_used`). `origin` is required for `ready`.
-- Optional `allowance: {"includedUsd": 25, "usedUsd": 25.4, "resetsAt": <ms>}`
-  (the Admin's `cloudAllowance` shape): a running machine whose allowance is
-  spent shows **Included AI used up** with the reset date.
+- `state` is `setting_up`, `ready`, `stopped`, `payment_problem` or `failed`.
+  `origin` is required for `ready`. Any other state (including the retired
+  `allowance_used`) is treated as no machine. Other fields, such as a retired
+  `allowance`, are ignored.
 
 **Connect to my Cloud** first asks the machine whether this app is already
 signed in there (`GET <origin>/api/auth/session` with its cookie). If not, it
@@ -219,8 +216,10 @@ malformed session summary or grant is treated as none.
   forwards is the loopback owner.
 - Pairing windows are opened only for a request signed with the machine's
   secret, fresh and never replayed; each window is single use and short lived.
-- The signing secret and gateway token are removed from the server's
-  environment at startup and are never passed to engines or to Caddy.
-- Claude Code never receives included AI.
+- The signing secret is removed from the server's environment at startup and
+  is never passed to engines or to Caddy.
+- There is no platform model gateway: stray `OMB_HOSTED_*` settings are
+  ignored with one warning and never reach the server's environment or an
+  engine. Every model call uses the person's own sign-in or key.
 - A volume binds to one machine and is never adopted by another.
 - Each customer's app lives in its own Fly private network.
