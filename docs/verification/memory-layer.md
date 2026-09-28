@@ -37,7 +37,10 @@ bot is busy, catching up after sleep), backup pauses, and engines without a
 one-shot text call. They also cover expired topic facts disappearing from both
 alias recall and the search index after midnight without a file edit, retrying
 malformed organization output and deferred moves, Unicode topic names, and
-stopping upkeep writes when its switch changes during a model call.
+stopping upkeep writes when its switch changes during a model call. Search
+checks use actual index results for signed-number/symbol false matches and
+historical files crowding out current topics. A failed topic write leaves its
+notes in the notebook; retrying completes only the remaining moves.
 
 ## Not proven here
 

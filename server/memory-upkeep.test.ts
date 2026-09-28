@@ -1,7 +1,7 @@
 // Memory upkeep: capture parsing and dedupe, the tidy plan (the share limit
 // on small notebooks and the identity regressions from #1363's review),
 // About me suggestions, and the upkeep loop against a scripted engine.
-import { readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -399,6 +399,22 @@ describe("the upkeep loop", () => {
     organizeAnswer = '{"moves":[{"i":0,"topic":"café"}]}';
     expect((await upkeep().tidy(BOT.id)).organized).toBe(1);
     expect(readMemoryTopic(BOT.id, "café.md")).toContain("Enjoys quiet cafés.");
+  });
+
+  it("keeps failed topic moves in the notebook and retries them without duplicating successful moves", async () => {
+    writeMemoryFile(BOT.id, "- 2026-09-25 · Acme needs a logo.\n- 2026-09-25 · Beta needs a website.\n");
+    const blocked = join(workspaceDir(BOT.id), "memory", "beta.md");
+    mkdirSync(blocked);
+    organizeAnswer = '{"moves":[{"i":0,"topic":"acme"},{"i":1,"topic":"beta"}]}';
+    const service = upkeep();
+    expect((await service.tidy(BOT.id)).organized).toBe(1);
+    expect(memory()).toContain("Beta needs a website");
+    expect(memory()).not.toContain("Acme needs a logo");
+    rmSync(blocked, { recursive: true });
+    organizeAnswer = '{"moves":[{"i":0,"topic":"beta"}]}';
+    expect((await service.tidy(BOT.id)).organized).toBe(1);
+    expect(readMemoryTopic(BOT.id, "acme.md")?.match(/Acme needs a logo/g)).toHaveLength(1);
+    expect(readMemoryTopic(BOT.id, "beta.md")).toContain("Beta needs a website");
   });
 
   it("does not tidy after upkeep is disabled during a model call", async () => {

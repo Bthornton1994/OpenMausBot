@@ -589,18 +589,19 @@ function ftsQuery(query: string, mode: SearchMode = "all"): string | null {
     // Automatic recall searches with a whole message: any content word may
     // match, ranked by bm25. Punctuation-only tokens are dropped, since a
     // lone "?" or "—" would match nothing useful. No content word, no query.
-    const terms = recallTerms(query);
-    return terms.length ? terms.map(recallMatchTerm).join(" OR ") : null;
+    const terms = recallTerms(query).map(recallMatchTerm).filter(Boolean);
+    return terms.length ? terms.join(" OR ") : null;
   }
   return (content.length ? content : tokens).map((token) => `"${token}"`).join(" ");
 }
 
 /** One recall term as FTS5 syntax. The index does no stemming, so a word
  * of four or more letters matches as a prefix, with a plural -s taken off
- * first: "restaurant" and "restaurants" find each other. Anything with a
- * digit or symbol ("-10", "c++", "v2.1") stays an exact token — as a prefix,
- * "c" would match every word starting with c. */
-export function recallMatchTerm(term: string): string {
+ * first: "restaurant" and "restaurants" find each other. Skip punctuation
+ * terms: unicode61 cannot distinguish "-10" from "10" or "c++" from "c",
+ * even in a quoted FTS phrase. Explicit all-term search stays unchanged. */
+export function recallMatchTerm(term: string): string | null {
+  if (!/^[\p{L}\p{N}]+$/u.test(term)) return null;
   if (!/^\p{L}{4,}$/u.test(term)) return `"${term}"`;
   const stem = term.length > 4 && term.endsWith("s") && !term.endsWith("ss") ? term.slice(0, -1) : term;
   return `"${stem}"*`;
@@ -859,6 +860,9 @@ export function recallMemory(query: string, botId: string, limit = 12, mode: Sea
         `snippet(memory_fts, 0, '[', ']', '…', ${SNIPPET_TOKENS}) AS snippet ` +
         "FROM memory_fts JOIN memory_files f ON f.rowid = memory_fts.rowid " +
         "WHERE memory_fts MATCH ? AND f.bot_id = ? " +
+        // Automatic recall must filter before LIMIT; historical logs can
+        // otherwise crowd all current topic files out of the result set.
+        (mode === "any" ? "AND f.path NOT IN ('MEMORY.md', 'memory/archive.md') AND f.path NOT LIKE 'memory/log/%' " : "") +
         "ORDER BY bm25(memory_fts), f.mtime_ms DESC LIMIT ?",
     )
     // SAFETY: the SELECT names exactly these three columns; snippet() is never null

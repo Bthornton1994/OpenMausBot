@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DATA_DIR } from "./config.ts";
 import { closeMessageDb, recallMatchTerm, recallTerms } from "./message-db.ts";
 import { buildRecall, enoughMatches, memoryPassages, RECALL_CLOSE, RECALL_OPEN, recallQuery, renderRecall, topicPassages } from "./recall.ts";
-import { appendMemoryLog, writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
+import { appendMemoryLog, searchMemoryFiles, writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
 
 const BOT = "bot-recall-test";
 
@@ -80,8 +80,8 @@ describe("recall from memory files", () => {
     expect(recallMatchTerm("restaurants")).toBe('"restaurant"*');
     expect(recallMatchTerm("restaurant")).toBe('"restaurant"*');
     expect(recallMatchTerm("class")).toBe('"class"*');
-    expect(recallMatchTerm("c++")).toBe('"c++"');
-    expect(recallMatchTerm("-10")).toBe('"-10"');
+    expect(recallMatchTerm("c++")).toBeNull();
+    expect(recallMatchTerm("-10")).toBeNull();
     expect(recallMatchTerm("tea")).toBe('"tea"');
     writeMemoryTopic(BOT, "dining.md", "---\naliases: [food, restaurants]\n---\n- Loves pasta\n");
     expect(memoryPassages(BOT, "suggest a restaurant for tonight").map((p) => p.label)).toEqual(["memory/dining.md"]);
@@ -101,6 +101,22 @@ describe("recall from memory files", () => {
   it("never recalls a daily log, which repeats what was just said", () => {
     appendMemoryLog(BOT, "shipped the quarterly invoice report");
     expect(memoryPassages(BOT, "the quarterly invoice report")).toEqual([]);
+  });
+
+  it("does not confuse signed numbers or language symbols with punctuation-free FTS tokens", () => {
+    writeMemoryTopic(BOT, "numbers.md", "The balance is 10. The language is C.\n");
+    expect(memoryPassages(BOT, "-10")).toEqual([]);
+    expect(memoryPassages(BOT, "C++")).toEqual([]);
+    expect(memoryPassages(BOT, "10")).toHaveLength(1);
+  });
+
+  it("filters historical files before the recall limit without hiding them from explicit search", () => {
+    for (let day = 1; day <= 15; day++) appendMemoryLog(BOT, "invoice", { now: new Date(2026, 8, day) });
+    writeMemoryTopic(BOT, "archive.md", "invoice");
+    writeMemoryFile(BOT, "invoice");
+    writeMemoryTopic(BOT, "billing.md", "Invoice goes to the finance team. " + "Other details. ".repeat(100));
+    expect(memoryPassages(BOT, "invoice").map((hit) => hit.label)).toEqual(["memory/billing.md"]);
+    expect(searchMemoryFiles(BOT, "invoice", 30).some((hit) => hit.file.startsWith("memory/log/"))).toBe(true);
   });
 
   it("excludes expired topic facts from aliases and search even when the file has not changed", () => {

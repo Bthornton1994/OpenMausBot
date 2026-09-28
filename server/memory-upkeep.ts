@@ -323,7 +323,8 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     saved.bots[botId] = { ...saved.bots[botId], core: [...new Set([...(saved.bots[botId]?.core ?? []), ...judgedCore])].slice(-MAX_CORE) };
     saveState(saved);
     if (!moves.length) return 0;
-    const { text, byTopic } = applyMoves(before, moves);
+    const { byTopic } = applyMoves(before, moves);
+    const written = new Set<string>();
     const existing = new Map(listMemoryTopics(botId).map((topic) => [topic.name.toLowerCase(), topic.name]));
     let count = 0;
     for (const [wanted, group] of byTopic) {
@@ -332,12 +333,21 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
       const current = readRaw(botId, path);
       const seen = notebookIdentities(current ?? "");
       const lines = group.lines.filter((line) => !seen.has(lineFactIdentity(line)));
-      count += group.lines.length;
-      if (!lines.length) continue;
-      writeMemoryTopic(botId, name, mergeTopicText(current, { title: name.replace(/\.md$/, "").replace(/-/g, " "), aliases: group.aliases, lines }));
-      recordMemoryChange(botId, { path, actor: "upkeep", via: "organize", before: current, after: readRaw(botId, path) });
+      if (lines.length) {
+        try {
+          writeMemoryTopic(botId, name, mergeTopicText(current, { title: name.replace(/\.md$/, "").replace(/-/g, " "), aliases: group.aliases, lines }));
+        } catch (error) {
+          log(`memory upkeep: could not write ${path}; kept its entries in MEMORY.md: ${(error as Error).message}`);
+          continue;
+        }
+        recordMemoryChange(botId, { path, actor: "upkeep", via: "organize", before: current, after: readRaw(botId, path) });
+      }
       existing.set(name.toLowerCase(), name);
+      written.add(wanted);
+      count += group.lines.length;
     }
+    if (!written.size) return 0;
+    const { text } = applyMoves(before, moves.filter((move) => written.has(move.topic)));
     writeMemoryFile(botId, text);
     recordMemoryChange(botId, { path: "MEMORY.md", actor: "upkeep", via: "organize", before, after: readRaw(botId, "MEMORY.md") });
     log(`memory upkeep: moved ${count} entr${count === 1 ? "y" : "ies"} from MEMORY.md into topic files for ${deps.bot(botId)?.name ?? botId}`);
