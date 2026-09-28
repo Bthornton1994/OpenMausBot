@@ -161,14 +161,16 @@ describe("new bot default model selection wiring in index.ts", () => {
   };
   const companyClaude = { ...claude, instanceId: "company.fixture.anthropic", models: { default: "company-claude", options: [{ id: "company-claude", label: "Company" }] } };
   const signedOut = { ...claude, snapshot: { state: "available", authenticated: false } satisfies ProviderSnapshot };
-  function server(instances: unknown[], { enrolled = false, companyModelsOnly = false, saved }: { enrolled?: boolean; companyModelsOnly?: boolean; saved?: ModelSelection } = {}) {
+  function server(instances: unknown[], { enrolled = false, companyModelsOnly = false, saved, included, usedUp = false }: { enrolled?: boolean; companyModelsOnly?: boolean; saved?: ModelSelection; included?: string[]; usedUp?: boolean } = {}) {
     const managedPolicy = new ManagedDesktopPolicy();
     if (companyModelsOnly) managedPolicy.apply({ organizationId: "11111111-1111-4111-8111-111111111111", organizationName: "Fixture Company", expiresAt: Date.now() + 60_000,
       version: 1, companyModelsOnly: true, allowedEngines: "all", mcp: { allowCustom: true, allowlist: [] },
       computers: { thisComputer: true, localVm: true, box: true, vps: true }, remoteAccess: true });
     const managedDesktop = { owns: (instanceId: string) => enrolled && instanceId.startsWith("company.") };
-    const defaultSelection = new Function("hostedModels", "cfg", "registry", "managedDesktop", "managedPolicy", "BUILT_IN_DRIVERS", "selectDefaultModelSelection",
-      `${code}; return defaultSelection;`)(undefined, { defaultModelSelection: saved }, { describe: async () => instances }, managedDesktop, managedPolicy,
+    const includedModels = included ? { owns: (instanceId: string) => included.includes(instanceId),
+      info: (instanceId: string) => included.includes(instanceId) ? { state: usedUp ? "used" : "ready" } : undefined } : null;
+    const defaultSelection = new Function("hostedModels", "includedModels", "cfg", "registry", "managedDesktop", "managedPolicy", "BUILT_IN_DRIVERS", "selectDefaultModelSelection",
+      `${code}; return defaultSelection;`)(undefined, includedModels, { defaultModelSelection: saved }, { describe: async () => instances }, managedDesktop, managedPolicy,
       [{ driverKind: "claudeAgent", metadata: { displayName: "Claude" } }], selectDefaultModelSelection) as () => Promise<ModelSelection>;
     return { defaultSelection, close: () => managedPolicy.close() };
   }
@@ -178,6 +180,21 @@ describe("new bot default model selection wiring in index.ts", () => {
     await expect(notEnrolled.defaultSelection()).resolves.toEqual({ instanceId: "claude", model: "claude-default" });
     const enrolled = server([signedOut, companyClaude], { enrolled: true });
     await expect(enrolled.defaultSelection()).resolves.toEqual({ instanceId: "company.fixture.anthropic", model: "company-claude" });
+  });
+
+  it("starts a Cloud machine's bots on its included models until the person saves another default", async () => {
+    const includedAgent = { ...companyRouter, instanceId: "included.agent" };
+    const freeEngine = { ...companyRouter, instanceId: "opencodeGo", models: { default: "opencode/free", options: [{ id: "opencode/free", label: "Free" }] } };
+    for (const instances of [[signedOut, includedAgent], [claude, freeEngine, includedAgent]]) {
+      await expect(server(instances, { included: ["included.agent"] }).defaultSelection()).resolves.toEqual({ instanceId: "included.agent", model: "company/router" });
+    }
+    // Their saved choice wins, and a used-up allowance falls back to a working engine.
+    await expect(server([claude, includedAgent], { included: ["included.agent"], saved: { instanceId: "claude", model: "claude-default" } }).defaultSelection())
+      .resolves.toEqual({ instanceId: "claude", model: "claude-default" });
+    await expect(server([claude, includedAgent], { included: ["included.agent"], usedUp: true }).defaultSelection())
+      .resolves.toEqual({ instanceId: "claude", model: "claude-default" });
+    // Not a Cloud machine: today's choice.
+    await expect(server([signedOut, freeEngine]).defaultSelection()).resolves.toEqual({ instanceId: "claude", model: "claude-default" });
   });
 
   it("passes the organisation's policy into the choice", async () => {

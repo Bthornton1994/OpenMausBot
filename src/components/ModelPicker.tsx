@@ -34,6 +34,7 @@ function modelProvider(instance: InstanceInfo | undefined, model: string): strin
 }
 
 export function engineStatus(instance: InstanceInfo): string {
+  if (instance.included) return t(instance.included.state === "used" ? "model.includedUsed" : "model.included");
   if (needsCli(instance)) return t("model.setupRequired");
   if (needsSignIn(instance)) return t("model.signInRequired");
   return instance.snapshot.version ?? t("model.ready");
@@ -311,7 +312,7 @@ export function ModelEngineRail({ instances, selectedInstance, claudeInstance, o
     const target = claude ? claudeInstance ?? instance : instance;
     const selected = claude ? selectedInstance?.driverKind === "claudeAgent" : instance.instanceId === selectedInstance?.instanceId;
     const label = claude ? "Claude" : instance.displayName;
-    const attention = needsCli(target) || needsSignIn(target) || Boolean(target.snapshot.update);
+    const attention = needsCli(target) || needsSignIn(target) || Boolean(target.snapshot.update) || target.included?.state === "used";
     const managedBy = target.policy ? t("policy.managedBy", { organization: target.policy.organizationName }) : undefined;
     return (
       <button
@@ -707,7 +708,7 @@ export function ModelPicker({
                       <span
                         className={cn(
                           "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
-                          blocked ? "bg-warning/10 text-warning" : "bg-success/10 text-success",
+                          blocked || railInstance.included?.state === "used" ? "bg-warning/10 text-warning" : "bg-success/10 text-success",
                         )}
                       >
                         {pane === "custom" && !blocked ? t("model.localModels") : engineStatus(railInstance)}
@@ -786,6 +787,12 @@ export function ModelPicker({
                         <>
                           {railInstance.snapshot.update && (
                             <EngineUpdateNotice update={railInstance.snapshot.update} instance={railInstance} className="mx-1 mb-2" />
+                          )}
+                          {railInstance.included?.state === "used" && (
+                            <div data-included-used role="status" className="mx-1 mb-2 rounded-lg bg-warning/10 px-3 py-2 text-[12px] leading-relaxed text-ink-secondary">
+                              <p className="font-medium text-warning">{t("model.includedUsed")}</p>
+                              <p className="mt-0.5">{t("model.includedUsedHelp")}</p>
+                            </div>
                           )}
                           <EngineGroupLabel className="px-2 pb-1 pt-0.5">
                             {query

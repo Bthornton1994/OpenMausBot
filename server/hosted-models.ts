@@ -1,8 +1,9 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
+import { cloudHomeConfigured } from "./cloud-home.ts";
 import { hostedWorkspaceConfiguration } from "./enterprise.ts";
+import { HOSTED_MODEL_TOKEN, parseHostedCatalog } from "./hosted-catalog.ts";
 import type { InstanceConfigMap, ModelSelection, ProviderInstance } from "./contracts.ts";
 import type { Store } from "./store.ts";
 
@@ -10,29 +11,21 @@ export const HOSTED_MODEL_POLICY_HEADER = "X-Omb-Hosted-Model-Policy";
 export const HOSTED_MODEL_SETUP_ERROR = "No company models are assigned to this workspace. Ask your administrator to enable model access in Admin.";
 export const HOSTED_MODEL_SELECTION_ERROR = "This model is not assigned to this workspace. Choose one of its company models.";
 export const HOSTED_PROVIDER_SETTINGS_ERROR = "Company models and provider accounts are managed in Admin.";
-const nativeModels = z.array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/)).max(100);
-const catalogSchema = z.object({
-  anthropic: nativeModels,
-  openai: nativeModels,
-  openrouter: z.array(z.string().max(160).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/+-]*$/)).max(100),
-}).strict();
-type HostedCatalog = z.infer<typeof catalogSchema>;
 const providerFor = { claude: "anthropic", codex: "openai", opencode: "openrouter" } as const;
 
 /** Operator-only policy. An ordinary desktop has neither input and keeps its
- * personal providers. Partial policy configuration must never enable them. */
+ * personal providers. Partial policy configuration must never enable them.
+ * A Cloud home machine reads the same two variables, but its models are
+ * added beside the person's own engines (included-models.ts), not in place
+ * of them, so this exclusive workspace policy stays off there. */
 export function hostedModelPolicy(dataDirectory: string, env: NodeJS.ProcessEnv = process.env) {
   if (env.OMB_HOSTED_MODELS === undefined && env.OMB_HOSTED_MODEL_TOKEN === undefined) return null;
+  if (cloudHomeConfigured(env)) return null;
   const hosted = hostedWorkspaceConfiguration(env);
-  if (!hosted?.portalMembership || env.OMB_DESKTOP_PARENT === "1" || !/^omb_workspace_[A-Za-z0-9_-]{43}$/.test(env.OMB_HOSTED_MODEL_TOKEN ?? "")) {
+  if (!hosted?.portalMembership || env.OMB_DESKTOP_PARENT === "1" || !HOSTED_MODEL_TOKEN.test(env.OMB_HOSTED_MODEL_TOKEN ?? "")) {
     throw new Error("Hosted model access requires complete portal-managed configuration.");
   }
-  let catalog: HostedCatalog;
-  try {
-    if (!env.OMB_HOSTED_MODELS || env.OMB_HOSTED_MODELS.length > 65536) throw new Error();
-    catalog = catalogSchema.parse(JSON.parse(env.OMB_HOSTED_MODELS));
-  } catch { throw new Error("Invalid hosted model catalog."); }
-  for (const key of ["anthropic", "openai", "openrouter"] as const) catalog[key] = [...new Set(catalog[key])];
+  const catalog = parseHostedCatalog(env.OMB_HOSTED_MODELS);
   const token = env.OMB_HOSTED_MODEL_TOKEN!;
   const base = `${hosted.admin.origin}/api/gateway/${hosted.workspace}`;
   const assigned = (id: string): string[] => Object.hasOwn(providerFor, id) ? catalog[providerFor[id as keyof typeof providerFor]] : [];

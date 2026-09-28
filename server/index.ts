@@ -277,6 +277,8 @@ import { ProviderRegistry } from "./harness/registry.ts";
 import { ManagedDesktopProviders } from "./managed-desktop.ts";
 import { computerKindForResource, ManagedDesktopPolicy } from "./managed-policy.ts";
 import { hostedModelPolicy, HOSTED_MODEL_POLICY_HEADER, HOSTED_PROVIDER_SETTINGS_ERROR } from "./hosted-models.ts";
+import { CLOUD_PAIRING_PATH, cloudHomeConfiguration, createCloudPairing, readSignedBody } from "./cloud-home.ts";
+import { includedModelPolicy, INCLUDED_READ_ONLY_ERROR, isIncludedInstanceId } from "./included-models.ts";
 import type { ProviderInstance } from "./contracts.ts";
 import { selectDefaultModelSelection, withNewBotEffort } from "./default-model-selection.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, peerApprovalFailure, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
@@ -617,6 +619,16 @@ const sessions = new SessionRegistry({
   portalMembership: hostedWorkspaceConfiguration()?.portalMembership === true,
 });
 const sharedComputers = new SharedComputers(id => sessions.isLive(id));
+// OMB Cloud Pro home machine (server/cloud-home.ts, docs/cloud-pro.md). A
+// partial or invalid boot contract stops the server here, before it serves.
+const CLOUD_HOME = cloudHomeConfiguration();
+const cloudPairing = CLOUD_HOME ? createCloudPairing({ secret: CLOUD_HOME.bootstrapSecret, sessions }) : null;
+if (CLOUD_HOME) {
+  // Held in memory from here on: no engine or tool this server starts
+  // inherits the Admin's signing secret or the gateway key.
+  delete process.env.OMB_CLOUD_BOOTSTRAP_SECRET;
+  delete process.env.OMB_HOSTED_MODEL_TOKEN;
+}
 // Who each thread is for, when a signed-in person can be named (server-private).
 const threadStarters = new ThreadStarters(join(DATA_DIR, "thread-starters.json"));
 const commandAllowlist = new CommandAllowlistStore(join(DATA_DIR, "command-allowlist.json"));
@@ -655,8 +667,20 @@ let companionMutationToken: string | undefined = DESKTOP_MANAGED ? "" : undefine
 const FALLBACK_PUBLIC_URL = process.env.OMB_PUBLIC_URL?.trim().replace(/\/+$/, "") || null;
 const cfg = loadConfig();
 const hostedModels = hostedModelPolicy(DATA_DIR);
-const providerConfigs = () => hostedModels ? hostedModels.configs() : instanceConfigs(cfg);
-const decorateHostedProvider = hostedModels ? (instance: ProviderInstance) => hostedModels.decorate(instance) : undefined;
+// Cloud Pro's included models ride beside the person's own engines; a saved
+// personal instance can never take an included id.
+const includedModels = CLOUD_HOME?.gateway ? includedModelPolicy(CLOUD_HOME.gateway, DATA_DIR) : null;
+const personalInstanceConfigs = () => includedModels
+  ? Object.fromEntries(Object.entries(instanceConfigs(cfg)).filter(([id]) => !isIncludedInstanceId(id)))
+  : instanceConfigs(cfg);
+const providerConfigs = () => hostedModels ? hostedModels.configs()
+  : includedModels ? { ...personalInstanceConfigs(), ...includedModels.configs() } : instanceConfigs(cfg);
+const decorateHostedProvider = hostedModels ? (instance: ProviderInstance) => hostedModels.decorate(instance)
+  : includedModels ? (instance: ProviderInstance) => includedModels.decorate(instance) : undefined;
+if (CLOUD_HOME) {
+  console.log(`cloud home ${CLOUD_HOME.machineId}: included models ${includedModels?.ids().join(", ") || "none"}`);
+  for (const warning of CLOUD_HOME.warnings) console.warn(`cloud home: ${warning}`);
+}
 if (hostedModels) {
   const selection = hostedModels.select(cfg.defaultModelSelection);
   if (selection.instanceId && JSON.stringify(selection) !== JSON.stringify(cfg.defaultModelSelection)) saveConfig({ defaultModelSelection: selection });
@@ -2555,8 +2579,17 @@ function askBotAndWait(targetBotId: string, message: string, depth: number, from
 // engine, and the organisation's policy is respected; otherwise inert.
 async function defaultSelection() {
   if (hostedModels) return hostedModels.select(cfg.defaultModelSelection);
-  return selectDefaultModelSelection(await registry.describe(), cfg.defaultModelSelection, {
-    company: (instanceId) => managedDesktop.owns(instanceId),
+  const instances = await registry.describe();
+  // Cloud Pro works out of the box: until the person saves another default,
+  // new bots run on the included models, unless this month's are used up.
+  if (includedModels && !cfg.defaultModelSelection) {
+    const included = instances.find((instance) => includedModels.info(instance.instanceId)?.state === "ready" && instance.snapshot.state === "available");
+    if (included) return { instanceId: included.instanceId, model: included.models.default };
+  }
+  return selectDefaultModelSelection(instances, cfg.defaultModelSelection, {
+    // Included Cloud models count like Company ones: a signed-out personal
+    // engine never beats a model that can run now; a working one still does.
+    company: (instanceId) => managedDesktop.owns(instanceId) || Boolean(includedModels?.owns(instanceId)),
     refusal: (instance) => policyModelRefusal(instance),
   });
 }
@@ -2581,6 +2614,9 @@ function checkedModelSelection(
     model: value.model.trim(),
   };
   if (hostedModels && !hostedModels.allows(selection)) return { ok: false, status: 400, error: hostedModels.error() };
+  if (includedModels && isIncludedInstanceId(selection.instanceId) && !includedModels.allows(selection)) {
+    return { ok: false, status: 400, error: "This model is not included with your plan. Choose one of the included models." };
+  }
   if (value.effort !== undefined) {
     if (!isEffortLevel(value.effort)) {
       return { ok: false, status: 400, error: `effort "${String(value.effort)}" is not recognized` };
@@ -13101,6 +13137,12 @@ async function describeInstances() {
     if (hostedModels) return { ...described, readOnly: true,
       install: undefined, authentication: undefined, cli: undefined, cliCandidates: [],
     };
+    // Included with Cloud Pro: a ready cloud engine at the top of the rail,
+    // never a sign-in, install or CLI setting.
+    const included = includedModels?.info(instance.instanceId);
+    if (included) return { ...described, readOnly: true, access: "api", included,
+      install: undefined, authentication: undefined, cli: undefined, cliCandidates: [],
+    };
     const policyReason = policyModelRefusal(instance);
     const policy = policyReason ? { policy: { organizationName: managedPolicy.current()!.organizationName, reason: policyReason } } : {};
     if (managedDesktop.owns(instance.instanceId)) return {
@@ -13472,6 +13514,24 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const secure = requestOrigin(req)?.startsWith("https://") === true;
       res.setHeader("set-cookie", serializeSessionCookie(SESSION_COOKIE, issued.token, { secure, maxAgeSeconds: cookieMaxAgeSeconds(issued.session) }));
       return json(res, 200, { session: issued.session, environment });
+    }
+    // The Admin's signed request for one pairing window on a Cloud home
+    // machine. Public like /api/auth/pair, JSON only, and bad signatures
+    // count against the same lockout. Never log its headers, body or code.
+    if (cloudPairing && path === CLOUD_PAIRING_PATH) {
+      res.setHeader("cache-control", "no-store");
+      if (method !== "POST") return json(res, 405, { error: "method_not_allowed" });
+      if (!/^application\/json\b/i.test(String(req.headers["content-type"] ?? ""))) {
+        return json(res, 415, { error: "send the pairing request as JSON (content-type: application/json)" });
+      }
+      const source = requestSource(req);
+      const header = (name: string) => { const value = req.headers[name]; return typeof value === "string" ? value : undefined; };
+      const result = cloudPairing.handle({
+        timestamp: header("x-omb-cloud-timestamp"), nonce: header("x-omb-cloud-nonce"), signature: header("x-omb-cloud-signature"),
+        body: await readSignedBody(req), source,
+      });
+      if (result.status !== 200) console.warn(`cloud pairing refused from ${source}: ${String(result.body.error)}`);
+      return json(res, result.status, result.body);
     }
     if (method === "POST" && path === "/api/auth/pair") {
       // JSON only: a cross-site HTML form cannot send this content type
@@ -20613,6 +20673,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const companyMutation = /^\/api\/instances\/(company\.[\w.-]+)(?:\/|$)/.exec(path);
     if (hostedModels && path.startsWith("/api/instances/") && method !== "GET") return json(res, 403, { error: HOSTED_PROVIDER_SETTINGS_ERROR });
     if (companyMutation && method !== "GET") return json(res, 403, { error: "Company accounts are read-only here. Manage this connection in desktop Settings." });
+    if (includedModels && method !== "GET" && /^\/api\/instances\/included\.[\w.-]+(?:\/|$)/.test(path)) return json(res, 403, { error: INCLUDED_READ_ONLY_ERROR });
 
     const instanceIconPatch = /^\/api\/instances\/([\w.-]+)\/icon$/.exec(path);
     if (method === "PATCH" && instanceIconPatch) {
