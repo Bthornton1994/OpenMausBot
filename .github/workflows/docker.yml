@@ -183,7 +183,8 @@ jobs:
           grep -qF "ignoring 1 included anthropic model(s): Claude Code never runs on included AI" <<<"$logs"
           if grep -qF "$secret" <<<"$logs"; then echo "the bootstrap secret reached the log"; exit 1; fi
           # The launcher, the server and the edge all run as maus.
-          owners=$(docker exec home sh -c 'for p in /proc/[0-9]*; do case "$(readlink "$p/exe" 2>/dev/null)" in */node|*/caddy) stat -c %U "$p";; esac; done' | sort -u)
+          # comm and the /proc/<pid> owner are readable without CAP_SYS_PTRACE; readlink of another user's exe is not.
+          owners=$(docker exec home sh -c 'for p in /proc/[0-9]*; do case "$(cat "$p/comm" 2>/dev/null)" in node|caddy) stat -c %U "$p";; esac; done' | sort -u)
           echo "process owners: $owners"; test "$owners" = maus
           code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@"; }
           H=(-H "Host: $host")
