@@ -48,6 +48,15 @@ describe("who may use a Mac lent to a Cloud home (review: guests, webhooks)", ()
     // A card a guest answered earlier in the conversation is still in the resumed session.
     expect(cloudHomeTurnMayLend(turn({ thread: [card({ kind: "session", name: "Guest", person: GUEST }), said("m1", OWNER)] }))).toBe(false);
   });
+  it("a conversation someone else opened, or one that holds a report of someone else's routine, is not the owner's (review: titles, reports)", () => {
+    // Whoever opened a conversation named it: the owner writing alone in a guest's conversation does not make it theirs.
+    expect(cloudHomeLendingRefusal(turn({ starters: [GUEST] }))).toBe("someone-else");
+    expect(cloudHomeLendingRefusal(turn({ starters: [OWNER, GUEST] }))).toBe("someone-else");
+    expect(cloudHomeLendingRefusal(turn({ starters: [OWNER, undefined] }))).toBeNull();
+    expect(cloudHomeLendingRefusal(turn({ starters: [undefined] }))).toBeNull();
+    expect(cloudHomeLendingRefusal(turn({ reportsFromOthers: true }))).toBe("someone-else");
+    expect(cloudHomeLendingRefusal(turn({ reportsFromOthers: false }))).toBeNull();
+  });
   it("anyone else's words anywhere in the conversation, before the request too, take it out of lending (review: earlier lines)", () => {
     // The reviewer's direct case: [guest line, owner line].
     const poisoned = turn({ thread: [said("g1", GUEST), reply("r0"), said("m1", OWNER)] });

@@ -26,7 +26,7 @@ import { mergeTopicText } from "./memory-topics.ts";
 import { applyMoves, MAX_MOVES, organizeCandidates, organizePrompt, parseMoves } from "./memory-organize.ts";
 import { recordMemoryChange } from "./memory-journal.ts";
 import { applyTidy, contradictionCandidates, contradictionPrompt, parseContradictions, planChanges, planTidy, type Contradiction } from "./memory-tidy.ts";
-import { ensureWorkspace, listMemoryTopics, memoryDate, memoryEntry, memoryTopicIndex, updateMemory, workspaceDir, writeMemoryFile, writeMemoryTopic } from "./workspace.ts";
+import { ensureWorkspace, listMemoryTopics, memoryDate, memoryEntry, memoryTopicIndex, readMemoryText, updateMemory, workspaceDir, writeMemoryFile, writeMemoryTopic } from "./workspace.ts";
 
 export const CAPTURE_MAX_TURNS = 6;
 export const MODEL_TIMEOUT_MS = 60_000;
@@ -66,7 +66,7 @@ export interface UpkeepDeps {
   quietMs: () => number;
   tidyHour: () => number;
   /** Wraps each synchronous burst of writes this makes to one bot's memory
-   * (capture, organize), so the host can tell them from writes made
+   * (capture, organize, tidy), so the host can tell them from writes made
    * elsewhere (an OMB Cloud home: server/lending-memory.ts). */
   writing?: <T>(botId: string, write: () => T) => T;
   now?: () => Date;
@@ -131,7 +131,7 @@ function saveState(state: UpkeepState): void {
 
 function readRaw(botId: string, relative: string): string | null {
   try {
-    return readFileSync(join(workspaceDir(botId), relative), "utf8");
+    return readMemoryText(join(workspaceDir(botId), relative));
   } catch {
     return null;
   }
@@ -413,8 +413,10 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
       // The archive is written first: a line is never out of MEMORY.md
       // before it is in the archive, and the newest journal row — the one a
       // person undoes — is MEMORY.md, whose undo brings the line back.
-      if (archived.length) appendArchive(botId, archived);
-      writeMemoryFile(botId, text);
+      writing(botId, () => {
+        if (archived.length) appendArchive(botId, archived);
+        writeMemoryFile(botId, text);
+      });
       recordMemoryChange(botId, { path: "MEMORY.md", actor: "upkeep", via: "tidy", before, after: readRaw(botId, "MEMORY.md") });
     }
     // Topic files get the two steps that need no model: expired lines to the
@@ -429,8 +431,10 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
       const topicPlan = planTidy(topicBefore, today);
       if (!planChanges(topicPlan)) continue;
       const tidied = applyTidy(topicBefore, topicPlan, today);
-      if (tidied.archived.length) appendArchive(botId, tidied.archived);
-      writeMemoryTopic(botId, topic.name, tidied.text);
+      writing(botId, () => {
+        if (tidied.archived.length) appendArchive(botId, tidied.archived);
+        writeMemoryTopic(botId, topic.name, tidied.text);
+      });
       recordMemoryChange(botId, { path, actor: "upkeep", via: "tidy", before: topicBefore, after: readRaw(botId, path) });
       topicExpired += topicPlan.expired.length;
       topicDuplicates += topicPlan.duplicates.length;

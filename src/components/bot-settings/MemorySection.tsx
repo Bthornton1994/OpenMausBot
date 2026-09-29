@@ -39,11 +39,12 @@ import {
   type MemoryFileInfo,
   type MemoryJournalRow,
   type MemoryOverview,
+  type LendingReview,
   markMemoryReviewed,
 } from "@/lib/memory";
 import { shortPath } from "@/lib/short-path";
 import { t } from "@/lib/i18n";
-import { useStore, type Bot } from "@/state/store";
+import { ApiError, useStore, type Bot } from "@/state/store";
 import { Switch } from "../SettingsPrimitives";
 import { useDesktopCapabilities } from "../DesktopCapabilities";
 import { inputCls } from "./field";
@@ -71,11 +72,23 @@ const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** On an OMB Cloud home: this bot's memory changed in a conversation the
  * owner did not write, so its turns cannot use the owner's lent Mac until
- * the owner has looked. One click accepts it as it is; no confirmation. */
-export function LendingReviewNotice({ busy, onReviewed }: { busy: boolean; onReviewed: () => void }) {
+ * the owner has looked. It names the files that changed; one click accepts
+ * them as shown (no confirmation), and the server refuses it if anything
+ * changed since. */
+export function LendingReviewNotice({ changed, stale, busy, onReviewed }: { changed: readonly string[]; stale: boolean; busy: boolean; onReviewed: () => void }) {
   return (
     <div role="status" className="rounded-xl border border-danger/40 bg-card p-4">
-      <p className="text-[13px] leading-relaxed text-ink">{t("memory.lendingReview")}</p>
+      <p className="text-[13px] leading-relaxed text-ink">{t(stale ? "memory.lendingReviewStale" : "memory.lendingReview")}</p>
+      {changed.length > 0 && (
+        <>
+          <p className="mt-2 text-[12px] text-ink-muted">{t("memory.lendingReviewChanged")}</p>
+          <ul className="mt-1 space-y-0.5">
+            {changed.map((file) => (
+              <li key={file} className="break-all font-mono text-[12px] text-ink">{file}</li>
+            ))}
+          </ul>
+        </>
+      )}
       <button type="button" className={cn(buttonCls, "mt-3")} disabled={busy} onClick={onReviewed}>
         {t("memory.lendingReviewed")}
       </button>
@@ -98,7 +111,8 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
   const [upkeep, setUpkeep] = useState<UpkeepStatus | null>(null);
   const [tidying, setTidying] = useState(false);
   // OMB Cloud home: memory changed where the owner did not write.
-  const [lendingReview, setLendingReview] = useState(false);
+  const [lendingReview, setLendingReview] = useState<LendingReview | null>(null);
+  const [lendingReviewStale, setLendingReviewStale] = useState(false);
   const [reviewing, setReviewing] = useState(false);
   const { dispatch } = useStore();
 
@@ -109,7 +123,7 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
       fetchUpkeepStatus(bot.id).catch(() => null),
     ]);
     setOverview(nextOverview);
-    setLendingReview(nextOverview.lendingReview === true);
+    setLendingReview(nextOverview.lendingReview ?? null);
     setJournal(nextJournal);
     setUpkeep(nextUpkeep);
     if (openPath) {
@@ -279,12 +293,21 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
 
       {lendingReview && (
         <LendingReviewNotice
+          changed={lendingReview.changed}
+          stale={lendingReviewStale}
           busy={reviewing}
           onReviewed={() => {
             setReviewing(true);
-            markMemoryReviewed(bot.id)
-              .then(() => setLendingReview(false))
-              .catch((e: unknown) => setError(errorText(e)))
+            markMemoryReviewed(bot.id, lendingReview.token)
+              .then(() => { setLendingReview(null); setLendingReviewStale(false); })
+              // Changed again since it was shown: show what is there now.
+              .catch((e: unknown) => {
+                if (e instanceof ApiError && e.status === 409) {
+                  setLendingReviewStale(true);
+                  return refresh();
+                }
+                setError(errorText(e));
+              })
               .finally(() => setReviewing(false));
           }}
         />

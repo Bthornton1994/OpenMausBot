@@ -25,8 +25,11 @@ export interface MemoryFileInfo {
 
 export interface MemoryOverview {
   /** On an OMB Cloud home: this bot's memory changed in a conversation the
-   * owner did not write; its turns cannot use a lent Mac until reviewed. */
-  lendingReview?: boolean;
+   * owner did not write; its turns cannot use a lent Mac until reviewed.
+   * `changed` names the files (memory, or instruction files in its working
+   * folders); `token` is exactly what was shown, and a review is refused
+   * once anything changes again. */
+  lendingReview?: LendingReview;
   botId: string;
   workspacePath: string;
   index: MemoryCapacity;
@@ -149,8 +152,13 @@ export function fetchUpkeepStatus(botId: string): Promise<UpkeepStatus> {
 }
 
 /** The owner accepts this bot's memory as it is now (OMB Cloud home only). */
-export function markMemoryReviewed(botId: string): Promise<{ ok: true; lendingReview: false }> {
-  return api(`/api/bots/${botId}/memory/reviewed`, { method: "POST" });
+export interface LendingReview {
+  token: string;
+  changed: string[];
+}
+
+export function markMemoryReviewed(botId: string, token: string): Promise<{ ok: true; lendingReview: false }> {
+  return api(`/api/bots/${botId}/memory/reviewed`, { method: "POST", body: JSON.stringify({ token }) });
 }
 
 export function tidyMemoryNow(botId: string): Promise<{ report: TidyReport; overview: MemoryOverview }> {
