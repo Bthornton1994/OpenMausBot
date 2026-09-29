@@ -328,6 +328,10 @@ const onboardingConfigSchema = z.object({
   version: z.number().int().min(0).max(1000).optional(),
   reelSeen: z.boolean().optional(),
   hintsSeen: z.array(z.string().trim().min(1).max(60)).max(100).optional(),
+  /** OMB Cloud home only: when a bot's turn first finished on this machine
+   * (cloud-home.ts firstCloudTurnPatch). Written by the server, read by the
+   * Cloud's setup checklist. */
+  firstTurnAt: z.string().trim().max(40).optional(),
 }).strict();
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
@@ -597,7 +601,7 @@ export interface AppConfig {
    * the operator's own per-second rate; unset keeps the feature inert. */
   cloudOverflow?: { perSecondCostUsd?: number; idleStopMs?: number; allowlistedThreads?: string[] };
   /** First-run progress; see onboardingConfigSchema. */
-  onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
+  onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[]; firstTurnAt?: string };
   /** Named browser sessions any bot can be pointed at. */
   browserProfiles?: BrowserProfile[];
   /** CDP target of a Chrome the operator already has running (a bare port,
@@ -1443,6 +1447,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     cursor: { driver: "cursorAgent" },
     claude: { driver: "claudeAgent" },
     codex: { driver: "codex" },
+    chatgpt: { driver: "codex", displayName: "ChatGPT plan", config: { authMode: "chatgpt-plan" } },
     antigravity: { driver: "antigravityAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
@@ -1461,6 +1466,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
   // never see. Custom-only engines stay in CUSTOM_ONLY so a one-off test map
   // is not expanded, matching the claude/grok/codex product-fleet probe.
   const PRODUCT_FLEET_ADDITIONS = {
+    chatgpt: { driver: "codex", displayName: "ChatGPT plan", config: { authMode: "chatgpt-plan" } },
     cursor: { driver: "cursorAgent" },
     openaiCompat: { driver: "openai-compat" },
     mistral: { driver: "mistral" },
@@ -1477,6 +1483,10 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     for (const [id, entry] of Object.entries(PRODUCT_FLEET_ADDITIONS)) {
       if (!Object.hasOwn(map, id)) map[id] = { ...entry };
     }
+  }
+  if (map.chatgpt?.driver === "codex" && !(map.chatgpt.config as { cli?: unknown } | undefined)?.cli) {
+    const cli = (map.codex?.config as { cli?: unknown } | undefined)?.cli;
+    if (typeof cli === "string" && cli) map.chatgpt = { ...map.chatgpt, config: { ...map.chatgpt.config as object, cli } };
   }
   for (const [id, sourceEntry] of Object.entries(map)) {
     // instanceConfigs() builds a transient runtime map. Never mutate the
