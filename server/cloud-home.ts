@@ -13,8 +13,9 @@
 // timestamp, a nonce and the body's hash); each valid request opens one
 // ordinary pairing window (sessions.ts: single use, at most ten minutes),
 // which the Admin hands to the person's signed-in desktop app. A request for
-// a browser sign-in (the Cloud page's "Use in your browser") opens a window
-// only this machine's web page redeems, for at most two minutes.
+// a browser sign-in (the Cloud page's "Use in your browser") names the
+// account that owns this Cloud and opens a window only this machine's web
+// page redeems, for at most two minutes, after showing whose Cloud it is.
 //
 // Cloud Pro includes no AI. The person signs in on the machine with their own
 // Claude or ChatGPT account, or an API key, exactly as on any server; nothing
@@ -175,18 +176,24 @@ export function createCloudPairing(options: {
       let parsed: unknown;
       try { parsed = input.body.length ? JSON.parse(input.body.toString("utf8")) : {}; } catch { return { status: 400, body: { error: "invalid_body" } }; }
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { status: 400, body: { error: "invalid_body" } };
-      const { label, ttlSeconds, purpose } = parsed as { label?: unknown; ttlSeconds?: unknown; purpose?: unknown };
+      const { label, ttlSeconds, purpose, owner } = parsed as { label?: unknown; ttlSeconds?: unknown; purpose?: unknown; owner?: unknown };
       // oxlint-disable-next-line no-control-regex
       if (label !== undefined && (typeof label !== "string" || label.length > 80 || /[\x00-\x1f\x7f]/.test(label))) return { status: 400, body: { error: "invalid_label" } };
       if (ttlSeconds !== undefined && (!Number.isSafeInteger(ttlSeconds) || (ttlSeconds as number) < 1)) return { status: 400, body: { error: "invalid_ttl" } };
       if (purpose !== undefined && purpose !== "browser") return { status: 400, body: { error: "invalid_purpose" } };
       const browser = purpose === "browser";
+      // A browser sign-in names its Cloud's owner (the account's email), which the sign-in page shows before the
+      // person continues: plain text, one address, no control or formatting characters.
+      if ((browser || owner !== undefined) && (typeof owner !== "string" || owner.length > 254 || !/^[^\s@\p{C}]{1,64}@[^\s@\p{C}]{1,189}$/u.test(owner))) {
+        return { status: 400, body: { error: "invalid_owner" } };
+      }
       const ttl = Math.min((ttlSeconds as number | undefined) ?? CLOUD_PAIRING_DEFAULT_TTL_S, browser ? CLOUD_BROWSER_SIGN_IN_MAX_TTL_S : CLOUD_PAIRING_MAX_TTL_S);
       const opened = sessions.openPairing({
         scopes: ["admin", "client"],
         label: typeof label === "string" && label.trim() ? label.trim() : "OMB Cloud",
         ttlMs: ttl * 1000,
         browser,
+        ...(browser ? { owner: owner as string } : {}),
       });
       // A browser sign-in has no code to type: only its credential redeems it, and saying `purpose` back tells the
       // Admin this machine made one (a machine from before this ignores `purpose` and opens an ordinary window).

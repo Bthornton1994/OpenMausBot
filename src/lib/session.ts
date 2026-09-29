@@ -70,7 +70,8 @@ export function takePairingCodeFromLocation(): string | null {
 
 /** The OMB Cloud page's "Use in your browser" link, `/pair#signin=omb_pair_…`:
  * a single-use browser sign-in the Cloud's Admin opened on this machine. Taken
- * off the URL and out of history before anything renders, and never shown. */
+ * off the address bar and out of this tab's history entry before anything
+ * renders, and never shown. */
 export function takeBrowserSignInFromLocation(): string | null {
   if (!/[#&]signin=/.test(location.hash)) return null;
   const m = /[#&]signin=(omb_pair_[A-Za-z0-9_-]{43})(?:&|$)/.exec(location.hash);
@@ -129,12 +130,37 @@ export async function pairWithCode(
   return { ok: false, error: typeof error === "string" ? error : `${res.status} ${res.statusText}` };
 }
 
-/** Redeem a browser sign-in (takeBrowserSignInFromLocation) for this
- * browser's session cookie. A browser already connected here redeems nothing:
- * the unused sign-in expires within two minutes. */
-export async function signInWithBrowserGrant(credential: string, fetchImpl: typeof fetch = fetch): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (isConnected(await readSessionState(fetchImpl))) return { ok: true };
-  return pairWithCode({ code: credential, label: defaultDeviceLabel(), browser: true }, fetchImpl);
+/** Whose Cloud a browser sign-in (takeBrowserSignInFromLocation) signs in
+ * to, as the machine recorded it; the page shows this before the person
+ * continues. Asking redeems nothing. Null when it is spent, expired or not
+ * one at all. */
+export async function previewBrowserSignIn(credential: string, fetchImpl: typeof fetch = fetch): Promise<{ owner: string } | null> {
+  try {
+    const res = await fetchImpl("/api/auth/pair", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: credential, browser: true, preview: true }),
+    });
+    const owner: unknown = Reflect.get(Object(await res.json().catch(() => ({}))), "owner");
+    return res.ok && typeof owner === "string" && owner ? { owner } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Continue on that page: redeem it for this browser's session cookie,
+ * replacing any session this browser already had here. The same attempt id
+ * on a retry after a lost answer returns the same session. */
+export function signInWithBrowserGrant(credential: string, attemptId: string, fetchImpl: typeof fetch = fetch): Promise<{ ok: true } | { ok: false; error: string }> {
+  return pairWithCode({ code: credential, label: defaultDeviceLabel(), attemptId, browser: true }, fetchImpl);
+}
+
+/** Whose OMB Cloud this browser signed in to, from `GET /api/auth/session`:
+ * only a browser sign-in's session on a Cloud home says. */
+export function cloudOwnerOf(session: unknown): string | null {
+  const record = Object(session) as { cloudHome?: unknown; owner?: unknown }; // SAFETY: read with typeof checks below
+  return record.cloudHome === true && typeof record.owner === "string" && record.owner ? record.owner : null;
 }
 
 /** Server-side JSON exchanges that end in a session cookie. */

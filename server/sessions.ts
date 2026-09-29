@@ -78,6 +78,10 @@ const sessionSchema = z.object({
   email: z.string().max(320).optional(),
   /** Set only by the internal verified-portal issuance path, never by email or pairing input. */
   membershipAuthority: z.literal("portal").optional(),
+  /** A browser sign-in (PairingCode `browser`): accepted only as its browser's cookie, never as a bearer token. */
+  cookieOnly: z.literal(true).optional(),
+  /** Whose OMB Cloud a browser sign-in signed in to (its PairingCode `owner`). */
+  owner: z.string().max(254).optional(),
 });
 
 const fileSchema = z.object({ version: z.literal(1), sessions: z.array(sessionSchema) });
@@ -94,6 +98,8 @@ export interface PublicSession {
   expiresAt: number;
   /** The account that signed in, when it was an account and not a code. */
   email?: string;
+  /** Whose OMB Cloud a browser sign-in signed in to. */
+  owner?: string;
 }
 
 export interface PairingCode {
@@ -110,6 +116,9 @@ export interface PairingCode {
    * browser sign-in redeems it, only by its credential, and a browser sign-in
    * redeems no other window. */
   browser?: true;
+  /** A browser sign-in's owner, the OMB Cloud account's email, which the
+   * sign-in page shows before anything is redeemed. */
+  owner?: string;
 }
 
 export interface PublicPairing {
@@ -125,6 +134,12 @@ export type ExchangeResult =
   | { ok: false; status: 401 | 429; error: string };
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+
+/** A device's name as the sessions list shows it: what a client sent, less
+ * control and bidirectional-formatting characters. */
+function deviceLabel(value: string | undefined): string {
+  return (value ?? "").replace(/[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "").trim();
+}
 
 function sameDigest(a: string, b: string): boolean {
   const left = Buffer.from(a, "hex");
@@ -185,6 +200,7 @@ function publicSession(record: SessionRecord): PublicSession {
     expiresAt: record.expiresAt,
   };
   if (record.email) view.email = record.email;
+  if (record.owner) view.owner = record.owner;
   return view;
 }
 
@@ -309,7 +325,7 @@ export class SessionRegistry {
 
   // ── pairing ────────────────────────────────────────────────────────────
 
-  openPairing(input: { scopes?: Scope[]; label?: string; ttlMs?: number; browser?: boolean } = {}): { id: string; code: string; credential: string; expiresAt: number } {
+  openPairing(input: { scopes?: Scope[]; label?: string; ttlMs?: number; browser?: boolean; owner?: string } = {}): { id: string; code: string; credential: string; expiresAt: number } {
     this.prune();
     const now = this.now();
     const code = generatePairingCode();
@@ -323,7 +339,7 @@ export class SessionRegistry {
       label: (input.label ?? "").trim().slice(0, 80),
       createdAt: now,
       expiresAt: now + (input.ttlMs ?? PAIRING_CODE_TTL_MS),
-      ...(input.browser ? { browser: true as const } : {}),
+      ...(input.browser ? { browser: true as const, ...(input.owner ? { owner: input.owner } : {}) } : {}),
     };
     this.pairings.push(pairing);
     return { id: pairing.id, code, credential, expiresAt: pairing.expiresAt };
@@ -332,6 +348,17 @@ export class SessionRegistry {
   openPairings(): PublicPairing[] {
     this.prune();
     return this.pairings.map((p) => ({ id: p.id, label: p.label, scopes: [...p.scopes], createdAt: p.createdAt, expiresAt: p.expiresAt }));
+  }
+
+  /** What a browser sign-in's page shows before anything is redeemed: whose
+   * Cloud it signs in to. Only a browser sign-in's 256-bit credential can
+   * match, so this consumes nothing and counts toward no lockout. */
+  previewBrowserSignIn(credential: string): { owner: string | null; expiresAt: number } | null {
+    this.prune();
+    if (!isPairingCredential(credential)) return null;
+    const presented = sha256(credential);
+    const pairing = this.pairings.find((p) => p.browser === true && sameDigest(p.credentialHash, presented));
+    return pairing ? { owner: pairing.owner ?? null, expiresAt: pairing.expiresAt } : null;
   }
 
   cancelPairing(id: string): boolean {
@@ -406,13 +433,14 @@ export class SessionRegistry {
     const record: SessionRecord = {
       id: randomUUID(),
       tokenHash: sha256(token),
-      label: (input.label.trim() || pairing.label || input.fallbackLabel?.trim() || "Unnamed device").slice(0, 80),
+      label: (deviceLabel(input.label) || deviceLabel(pairing.label) || deviceLabel(input.fallbackLabel) || "Unnamed device").slice(0, 80),
       scopes: [...pairing.scopes],
       createdAt: now,
       lastSeenAt: now,
       // The absolute cap applies from the first term, so a TTL configured
       // longer than the cap does not hand out a session the cap forbids.
       expiresAt: now + Math.min(SESSION_TTL_MS, SESSION_MAX_AGE_MS),
+      ...(pairing.browser ? { cookieOnly: true as const, ...(pairing.owner ? { owner: pairing.owner } : {}) } : {}),
     };
     this.sessions.push(record);
     this.lastSeenWrites.set(record.id, now); // the exchange itself was the first sighting
@@ -442,7 +470,7 @@ export class SessionRegistry {
     const record: SessionRecord = {
       id: randomUUID(),
       tokenHash: sha256(token),
-      label: (input.label.trim() || "Unnamed device").slice(0, 80),
+      label: (deviceLabel(input.label) || "Unnamed device").slice(0, 80),
       scopes: [...new Set(input.scopes)],
       createdAt: now,
       lastSeenAt: now,

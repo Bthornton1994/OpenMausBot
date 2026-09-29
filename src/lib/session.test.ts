@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  BROWSER_SIGN_IN_FAILED, isConnected, isOwnerOrAdmin, readSessionState, reasonWorthShowing, SERVICE_TRUST_REASON, signInWithBrowserGrant, takeBrowserSignInFromLocation,
-  takeInvitedEmailFromLocation, takePairingCodeFromLocation,
+  BROWSER_SIGN_IN_FAILED, cloudOwnerOf, isConnected, isOwnerOrAdmin, previewBrowserSignIn, readSessionState, reasonWorthShowing, SERVICE_TRUST_REASON, signInWithBrowserGrant,
+  takeBrowserSignInFromLocation, takeInvitedEmailFromLocation, takePairingCodeFromLocation,
 } from "./session";
 
 describe("what the pair page says about why it was shown", () => {
@@ -52,27 +52,42 @@ describe("the OMB Cloud page's \"Use in your browser\" link", () => {
     vi.unstubAllGlobals();
   });
 
-  it("is redeemed as a browser sign-in into this browser's cookie, and not at all when this browser is already connected", async () => {
+  it("shows whose Cloud it is first, asking only to look, and treats anything else as spent", async () => {
     const requests: Array<{ path: string; body: unknown }> = [];
-    const server = (session: number) => (async (path: string, init?: RequestInit) => {
+    const server = (status: number, body: unknown) => (async (path: string, init?: RequestInit) => {
       requests.push({ path, body: init?.body ? JSON.parse(String(init.body)) : undefined });
-      if (path === "/api/auth/session") return new Response(JSON.stringify({ error: "pair" }), { status: session });
+      return new Response(JSON.stringify(body), { status });
+    }) as unknown as typeof fetch;
+    expect(await previewBrowserSignIn(credential, server(200, { owner: "ada@example.test", expiresAt: 1 }))).toEqual({ owner: "ada@example.test" });
+    expect(requests).toEqual([{ path: "/api/auth/pair", body: { code: credential, browser: true, preview: true } }]);
+    expect(await previewBrowserSignIn(credential, server(401, { error: "expired" }))).toBeNull();
+    expect(await previewBrowserSignIn(credential, server(200, { owner: "" }))).toBeNull();
+    expect(await previewBrowserSignIn(credential, server(200, { owner: 7 }))).toBeNull();
+    expect(await previewBrowserSignIn(credential, (async () => { throw new Error("offline"); }) as unknown as typeof fetch)).toBeNull();
+  });
+
+  it("on Continue is always redeemed into this browser's cookie, connected or not, with the page's one attempt id", async () => {
+    const requests: Array<{ path: string; body: unknown }> = [];
+    const server = (async (path: string, init?: RequestInit) => {
+      requests.push({ path, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      // Whatever this browser already has here, the grant is redeemed (and its old session replaced).
+      if (path === "/api/auth/session") return new Response(JSON.stringify({ kind: "session", id: "s", label: "Chrome on Mac", scopes: ["client"], expiresAt: 1 }), { status: 200 });
       return new Response(JSON.stringify({ session: {} }), { status: 200 });
     }) as unknown as typeof fetch;
-    expect(await signInWithBrowserGrant(credential, server(401))).toEqual({ ok: true });
-    expect(requests.map((r) => r.path)).toEqual(["/api/auth/session", "/api/auth/pair"]);
-    expect(requests[1]?.body).toMatchObject({ code: credential, cookie: true, browser: true, attemptId: expect.any(String) });
-    requests.length = 0;
-    const connected = (async (path: string) => {
-      requests.push({ path, body: undefined });
-      return new Response(JSON.stringify({ kind: "session", id: "s", label: "Chrome on Mac", scopes: ["admin", "client"], expiresAt: 1 }), { status: 200 });
-    }) as unknown as typeof fetch;
-    expect(await signInWithBrowserGrant(credential, connected)).toEqual({ ok: true });
-    expect(requests.map((r) => r.path)).toEqual(["/api/auth/session"]);
-    // A spent or expired one says so on the pair page.
+    expect(await signInWithBrowserGrant(credential, "attempt-page-0001", server)).toEqual({ ok: true });
+    expect(await signInWithBrowserGrant(credential, "attempt-page-0001", server)).toEqual({ ok: true });
+    expect(requests.map((r) => r.path)).toEqual(["/api/auth/pair", "/api/auth/pair"]);
+    for (const request of requests) expect(request.body).toMatchObject({ code: credential, cookie: true, browser: true, attemptId: "attempt-page-0001" });
+    // A spent or expired one says so.
     const spent = (async () => new Response(JSON.stringify({ error: "pairing code is wrong or has expired" }), { status: 401 })) as unknown as typeof fetch;
-    expect(await signInWithBrowserGrant(credential, spent)).toEqual({ ok: false, error: "pairing code is wrong or has expired" });
+    expect(await signInWithBrowserGrant(credential, "attempt-page-0002", spent)).toEqual({ ok: false, error: "pairing code is wrong or has expired" });
     expect(reasonWorthShowing(BROWSER_SIGN_IN_FAILED)).toBe(BROWSER_SIGN_IN_FAILED);
+  });
+
+  it("names the Cloud's owner afterwards only for a browser sign-in's session on a Cloud home", () => {
+    expect(cloudOwnerOf({ kind: "session", cloudHome: true, owner: "ada@example.test" })).toBe("ada@example.test");
+    for (const session of [{ kind: "session", owner: "ada@example.test" }, { kind: "session", cloudHome: true }, { kind: "loopback" },
+      { cloudHome: true, owner: 7 }, { cloudHome: "yes", owner: "ada@example.test" }, null, undefined]) expect(cloudOwnerOf(session)).toBeNull();
   });
 });
 

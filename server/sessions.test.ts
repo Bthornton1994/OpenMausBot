@@ -129,6 +129,34 @@ describe("a browser sign-in window (an OMB Cloud page's \"Use in your browser\")
     expect(registry.exchange({ code: credential, label: "", source: "10.0.0.8", attemptId: "attempt-browser-1", browser: true })).toEqual(first);
     expect(registry.exchange({ code: credential, label: "", source: "10.0.0.8", attemptId: "attempt-browser-1" }).ok).toBe(false);
   });
+
+  it("names its owner before anything is redeemed, and gives its session that owner and the cookie alone", () => {
+    const { credential } = registry.openPairing({ browser: true, owner: "ada@example.test", ttlMs: 120_000 });
+    // Showing it consumes nothing, and only a browser sign-in's own credential matches.
+    expect(registry.previewBrowserSignIn(credential)).toEqual({ owner: "ada@example.test", expiresAt: clock + 120_000 });
+    expect(registry.previewBrowserSignIn(credential)).toEqual({ owner: "ada@example.test", expiresAt: clock + 120_000 });
+    const ordinary = registry.openPairing({ owner: "ignored@example.test" });
+    expect(registry.previewBrowserSignIn(ordinary.credential)).toBeNull();
+    expect(registry.previewBrowserSignIn(ordinary.code)).toBeNull();
+    const signedIn = registry.exchange({ code: credential, label: "", source: "10.0.0.9", browser: true });
+    if (!signedIn.ok) throw new Error(signedIn.error);
+    expect(signedIn.session.owner).toBe("ada@example.test");
+    expect(registry.authenticate(signedIn.token)).toMatchObject({ cookieOnly: true, owner: "ada@example.test" });
+    expect(registry.previewBrowserSignIn(credential)).toBeNull();
+    // An ordinary pairing's session is neither.
+    const app = registry.exchange({ code: ordinary.code, label: "", source: "10.0.0.9" });
+    if (!app.ok) throw new Error(app.error);
+    expect(registry.authenticate(app.token)).not.toHaveProperty("cookieOnly");
+    expect(app.session).not.toHaveProperty("owner");
+    // Survives a restart.
+    const reloaded = new SessionRegistry({ file: file(), now: () => clock });
+    expect(reloaded.authenticate(signedIn.token)).toMatchObject({ cookieOnly: true, owner: "ada@example.test" });
+  });
+
+  it("is looked at without counting toward the lockout", () => {
+    for (let attempt = 0; attempt < LOCKOUT.failures * 2; attempt += 1) registry.previewBrowserSignIn(generatePairingCredential());
+    expect(registry.failureSources()).toEqual([]);
+  });
 });
 
 function pair(label = "MacBook", source = "10.0.0.2") {
@@ -222,6 +250,17 @@ describe("pairing codes", () => {
     const explicit = registry.exchange({ code: c.code, label: "Kitchen iPad", source: "s3", fallbackLabel: "Safari on iPad" });
     if (!explicit.ok) throw new Error(explicit.error);
     expect(explicit.session.label).toBe("Kitchen iPad");
+  });
+
+  it("drops control and bidirectional-formatting characters from a device's name", () => {
+    const { code } = registry.openPairing();
+    const named = registry.exchange({ code, label: "Safari\u202E on iPad\n\u0007\u2066", source: "s4" });
+    if (!named.ok) throw new Error(named.error);
+    expect(named.session.label).toBe("Safari on iPad");
+    const blank = registry.exchange({ code: registry.openPairing().code, label: "\u202E\u0000", source: "s5", fallbackLabel: "Chrome\u200F on Mac" });
+    if (!blank.ok) throw new Error(blank.error);
+    expect(blank.session.label).toBe("Chrome on Mac");
+    expect(registry.issue({ label: "Ada\u202Es phone\r", scopes: ["client"] }).session.label).toBe("Adas phone");
   });
 
   it("carries scopes from the code into the session, deduplicated", () => {

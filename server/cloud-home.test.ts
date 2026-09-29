@@ -217,20 +217,23 @@ it("keeps every window single use and short lived, capping what the Admin asks f
 
 it("opens a browser sign-in only a browser redeems, by credential alone, for at most two minutes", () => {
   const f = fixture();
-  const granted = f.mint(f.sign(JSON.stringify({ label: "Web browser (Cloud page)", ttlSeconds: 120, purpose: "browser" })));
+  const granted = f.mint(f.sign(JSON.stringify({ label: "Web browser (Cloud page)", ttlSeconds: 120, purpose: "browser", owner: "ada@example.test" })));
   expect(granted.status).toBe(200);
   // No code to type, and `purpose` said back so the Admin knows this machine made one.
   expect(Object.keys(granted.body).sort()).toEqual(["credential", "expiresAt", "purpose"]);
   expect(granted.body).toMatchObject({ credential: expect.stringMatching(/^omb_pair_[A-Za-z0-9_-]{43}$/), expiresAt: f.now() + 120_000, purpose: "browser" });
   const credential = granted.body.credential as string;
+  // The sign-in page can show whose Cloud this is before anything is redeemed.
+  expect(f.sessions.previewBrowserSignIn(credential)).toEqual({ owner: "ada@example.test", expiresAt: f.now() + 120_000 });
   // An app, or anything that is not a browser sign-in, cannot use it.
   expect(f.exchange(credential).ok).toBe(false);
-  expect(f.exchange(credential, "198.51.100.4", true)).toMatchObject({ ok: true, session: { scopes: ["admin", "client"] } });
+  expect(f.exchange(credential, "198.51.100.4", true)).toMatchObject({ ok: true, session: { scopes: ["admin", "client"], owner: "ada@example.test" } });
+  expect(f.sessions.previewBrowserSignIn(credential)).toBeNull();
   expect(f.exchange(credential, "198.51.100.5", true).ok).toBe(false);
   // Capped at two minutes whatever is asked, and two minutes when nothing is.
-  const long = f.mint(f.sign(JSON.stringify({ ttlSeconds: 600, purpose: "browser" })));
+  const long = f.mint(f.sign(JSON.stringify({ ttlSeconds: 600, purpose: "browser", owner: "ada@example.test" })));
   expect(long.body.expiresAt).toBe(f.now() + CLOUD_BROWSER_SIGN_IN_MAX_TTL_S * 1000);
-  expect(f.mint(f.sign(JSON.stringify({ purpose: "browser" }))).body.expiresAt).toBe(f.now() + CLOUD_BROWSER_SIGN_IN_MAX_TTL_S * 1000);
+  expect(f.mint(f.sign(JSON.stringify({ purpose: "browser", owner: "ada@example.test" }))).body.expiresAt).toBe(f.now() + CLOUD_BROWSER_SIGN_IN_MAX_TTL_S * 1000);
   f.advance(CLOUD_BROWSER_SIGN_IN_MAX_TTL_S * 1000);
   expect(f.exchange(long.body.credential as string, "198.51.100.4", true).ok).toBe(false);
   // An ordinary window is never a browser sign-in.
@@ -243,7 +246,11 @@ it("refuses a body that is not the expected JSON", () => {
   const f = fixture();
   for (const body of ["[]", "not json", JSON.stringify({ label: "tab\there" }), JSON.stringify({ label: "x".repeat(81) }),
     JSON.stringify({ ttlSeconds: 0 }), JSON.stringify({ ttlSeconds: 1.5 }), JSON.stringify({ ttlSeconds: "300" }),
-    JSON.stringify({ purpose: "app" }), JSON.stringify({ purpose: true })]) {
+    JSON.stringify({ purpose: "app" }), JSON.stringify({ purpose: true }),
+    // A browser sign-in must name its owner, as one plain address.
+    ...[undefined, "", "ada", "ada@", 7, "ada@example.test\u202Eevil", "ada@exa mple.test", "a\nb@example.test", `${"a".repeat(250)}@example.test`]
+      .map((owner) => JSON.stringify({ purpose: "browser", owner })),
+    JSON.stringify({ owner: "not an address" })]) {
     expect(f.mint(f.sign(body)).status).toBe(400);
   }
   expect(f.sessions.openPairings()).toHaveLength(0);

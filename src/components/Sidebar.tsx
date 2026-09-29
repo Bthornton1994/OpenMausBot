@@ -96,6 +96,7 @@ import { botListItemPointerIntent } from "@/lib/sidebar-selection";
 import { phoneSettingsAction, SidebarPhoneButton } from "./SidebarPhoneButton";
 import { SidebarMoreMenu } from "./SidebarMoreMenu";
 import { DesktopWorkspaceSwitcher } from "./DesktopWorkspaceSwitcher";
+import { CloudOwner } from "./CloudOwner";
 import { profileInitials, SidebarProfileMenu } from "./SidebarProfileMenu";
 import { SidebarSectionHeader } from "./SidebarSectionHeader";
 import { useShowThreads } from "@/lib/thread-preferences";
@@ -2105,6 +2106,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
 
       <DesktopWorkspaceSwitcher compact={density === "icons"} />
       <OrganizationIdentity compact={density === "icons"} />
+      <CloudOwner compact={density === "icons"} />
       {/* Search */}
       <div className={cn("pt-1 pb-3", density === "icons" ? "hidden" : "px-3")}>
         <div className="flex items-center gap-2 rounded-md border border-hairline/40 bg-inset/40 px-2.5 py-1.5 focus-within:border-focus">
