@@ -80,6 +80,9 @@ export function readMemoryOnlyFromRegularFiles(): void {
  * and, on a Cloud home, when it is not a regular file. */
 export function readMemoryText(path: string): string {
   if (!regularMemoryFilesOnly) return readFileSync(path, "utf8");
+  // O_NOFOLLOW refuses a link at open where there is one; Windows has none
+  // (and opens what a link points at), so the entry is looked at first too.
+  if (!lstatSync(path).isFile()) throw Object.assign(new Error(`not a regular file: ${path}`), { code: "EINVAL" });
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     if (!fstatSync(fd).isFile()) throw Object.assign(new Error(`not a regular file: ${path}`), { code: "EINVAL" });
