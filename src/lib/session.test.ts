@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { isConnected, isOwnerOrAdmin, readSessionState, reasonWorthShowing, SERVICE_TRUST_REASON, takeInvitedEmailFromLocation } from "./session";
+import {
+  BROWSER_SIGN_IN_FAILED, isConnected, isOwnerOrAdmin, readSessionState, reasonWorthShowing, SERVICE_TRUST_REASON, signInWithBrowserGrant, takeBrowserSignInFromLocation,
+  takeInvitedEmailFromLocation, takePairingCodeFromLocation,
+} from "./session";
 
 describe("what the pair page says about why it was shown", () => {
   it("stays quiet for the ordinary no-session case and repeats anything else", () => {
@@ -24,6 +27,52 @@ describe("the invited address on a pair link", () => {
     vi.stubGlobal("location", { search: "", pathname: "/pair", hash: "" });
     expect(takeInvitedEmailFromLocation()).toBeNull();
     vi.unstubAllGlobals();
+  });
+});
+
+describe("the OMB Cloud page's \"Use in your browser\" link", () => {
+  const credential = `omb_pair_${"b".repeat(43)}`;
+  it("is taken off the address bar and out of history before anything renders, whatever it carries", () => {
+    const replaceState = vi.fn();
+    vi.stubGlobal("history", { replaceState });
+    vi.stubGlobal("location", { pathname: "/pair", search: "", hash: `#signin=${credential}` });
+    expect(takeBrowserSignInFromLocation()).toBe(credential);
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/pair");
+    // A malformed one is still removed, and is not a code for the pair form either.
+    replaceState.mockClear();
+    vi.stubGlobal("location", { pathname: "/pair", search: "", hash: "#signin=ABCD-EFGH-JKLM" });
+    expect(takeBrowserSignInFromLocation()).toBeNull();
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/pair");
+    // An ordinary pairing link is left to the pair form.
+    replaceState.mockClear();
+    vi.stubGlobal("location", { pathname: "/pair", search: "", hash: "#code=ABCD-EFGH-JKLM" });
+    expect(takeBrowserSignInFromLocation()).toBeNull();
+    expect(replaceState).not.toHaveBeenCalled();
+    expect(takePairingCodeFromLocation()).toBe("ABCD-EFGH-JKLM");
+    vi.unstubAllGlobals();
+  });
+
+  it("is redeemed as a browser sign-in into this browser's cookie, and not at all when this browser is already connected", async () => {
+    const requests: Array<{ path: string; body: unknown }> = [];
+    const server = (session: number) => (async (path: string, init?: RequestInit) => {
+      requests.push({ path, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (path === "/api/auth/session") return new Response(JSON.stringify({ error: "pair" }), { status: session });
+      return new Response(JSON.stringify({ session: {} }), { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await signInWithBrowserGrant(credential, server(401))).toEqual({ ok: true });
+    expect(requests.map((r) => r.path)).toEqual(["/api/auth/session", "/api/auth/pair"]);
+    expect(requests[1]?.body).toMatchObject({ code: credential, cookie: true, browser: true, attemptId: expect.any(String) });
+    requests.length = 0;
+    const connected = (async (path: string) => {
+      requests.push({ path, body: undefined });
+      return new Response(JSON.stringify({ kind: "session", id: "s", label: "Chrome on Mac", scopes: ["admin", "client"], expiresAt: 1 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await signInWithBrowserGrant(credential, connected)).toEqual({ ok: true });
+    expect(requests.map((r) => r.path)).toEqual(["/api/auth/session"]);
+    // A spent or expired one says so on the pair page.
+    const spent = (async () => new Response(JSON.stringify({ error: "pairing code is wrong or has expired" }), { status: 401 })) as unknown as typeof fetch;
+    expect(await signInWithBrowserGrant(credential, spent)).toEqual({ ok: false, error: "pairing code is wrong or has expired" });
+    expect(reasonWorthShowing(BROWSER_SIGN_IN_FAILED)).toBe(BROWSER_SIGN_IN_FAILED);
   });
 });
 

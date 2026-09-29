@@ -13994,7 +13994,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const wantsCookie = body?.cookie === true;
       const label = typeof body?.label === "string" ? body.label : "";
       const attemptId = typeof body?.attemptId === "string" ? body.attemptId : undefined;
-      const result = sessions.exchange({ code, label, attemptId, source: requestSource(req), fallbackLabel: labelFromUserAgent(req.headers["user-agent"]) });
+      // A browser sign-in (the OMB Cloud page's "Use in your browser", docs/cloud-pro.md)
+      // redeems only a window opened for one, and only into this browser's cookie.
+      const browser = body?.browser === true;
+      if (browser && !wantsCookie) return json(res, 400, { error: "a browser sign-in sets this browser's cookie; send cookie: true" });
+      const result = sessions.exchange({ code, label, attemptId, browser, source: requestSource(req), fallbackLabel: labelFromUserAgent(req.headers["user-agent"]) });
       if (!result.ok) {
         console.warn(`pairing refused from ${requestSource(req)}: ${result.error}`);
         return json(res, result.status, { error: result.error });

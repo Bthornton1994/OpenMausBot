@@ -98,6 +98,39 @@ describe("the native-app encoding of a pairing window", () => {
   });
 });
 
+describe("a browser sign-in window (an OMB Cloud page's \"Use in your browser\")", () => {
+  it("is redeemed only by a browser sign-in, only by its credential, and only once", () => {
+    const { code, credential } = registry.openPairing({ scopes: ["admin", "client"], label: "Web browser", browser: true });
+    // Not by an app or a typed code, which leave it open.
+    expect(registry.exchange({ code: credential, label: "", source: "10.0.0.5" }).ok).toBe(false);
+    expect(registry.exchange({ code, label: "", source: "10.0.0.5", browser: true }).ok).toBe(false);
+    expect(registry.openPairings()).toHaveLength(1);
+    const signedIn = registry.exchange({ code: credential, label: "Safari on iPad", source: "10.0.0.5", browser: true });
+    expect(signedIn).toMatchObject({ ok: true, session: { label: "Safari on iPad", scopes: ["admin", "client"] } });
+    // A replay, from anywhere and either way, is refused.
+    expect(registry.exchange({ code: credential, label: "", source: "10.0.0.6", browser: true }).ok).toBe(false);
+    expect(registry.exchange({ code: credential, label: "", source: "10.0.0.6" }).ok).toBe(false);
+  });
+
+  it("never redeems an ordinary window, and expires with its own term", () => {
+    const ordinary = registry.openPairing({ label: "Pixel" });
+    expect(registry.exchange({ code: ordinary.credential, label: "", source: "10.0.0.7", browser: true }).ok).toBe(false);
+    expect(registry.exchange({ code: ordinary.code, label: "", source: "10.0.0.7", browser: true }).ok).toBe(false);
+    expect(registry.exchange({ code: ordinary.credential, label: "", source: "10.0.0.7" }).ok).toBe(true);
+    const { credential } = registry.openPairing({ ttlMs: 120_000, browser: true });
+    clock += 120_000;
+    expect(registry.exchange({ code: credential, label: "", source: "10.0.0.7", browser: true }).ok).toBe(false);
+  });
+
+  it("answers a lost-response retry only as the same kind of sign-in", () => {
+    const { credential } = registry.openPairing({ browser: true });
+    const first = registry.exchange({ code: credential, label: "", source: "10.0.0.8", attemptId: "attempt-browser-1", browser: true });
+    expect(first.ok).toBe(true);
+    expect(registry.exchange({ code: credential, label: "", source: "10.0.0.8", attemptId: "attempt-browser-1", browser: true })).toEqual(first);
+    expect(registry.exchange({ code: credential, label: "", source: "10.0.0.8", attemptId: "attempt-browser-1" }).ok).toBe(false);
+  });
+});
+
 function pair(label = "MacBook", source = "10.0.0.2") {
   const { code } = registry.openPairing();
   const result = registry.exchange({ code, label, source });

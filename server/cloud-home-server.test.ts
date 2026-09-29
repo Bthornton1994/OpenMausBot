@@ -158,6 +158,39 @@ it("pairs the app on a signed request and tells it its first run is the engine s
   expect(JSON.stringify(instances)).not.toContain("cloud.example.test");
 });
 
+it("signs a browser in from the Cloud page's \"Use in your browser\" into an owner's session, once, and never logs it", async () => {
+  const body = JSON.stringify({ label: "Web browser (Cloud page)", ttlSeconds: 120, purpose: "browser" });
+  const timestamp = String(Math.floor(Date.now() / 1000)), nonce = randomBytes(16).toString("base64url");
+  const granted = await api("POST", "/api/cloud/pairing", { remote: true, headers: {
+    "content-type": "application/json", "x-omb-cloud-timestamp": timestamp, "x-omb-cloud-nonce": nonce,
+    "x-omb-cloud-signature": `v1=${cloudPairingSignature(secret, timestamp, nonce, body)}`,
+  }, body: JSON.parse(body) });
+  expect(granted.status, JSON.stringify(granted.body)).toBe(200);
+  expect(granted.body).toMatchObject({ purpose: "browser", credential: expect.stringMatching(/^omb_pair_/) });
+  expect(granted.body).not.toHaveProperty("code");
+  const credential = granted.body.credential as string;
+  // The web page's own request (src/lib/session.ts signInWithBrowserGrant). An app's exchange, or one asking for a
+  // bearer token instead of this browser's cookie, gets nothing and leaves it open.
+  expect((await api("POST", "/api/auth/pair", { remote: true, body: { code: credential } })).status).toBe(401);
+  expect((await api("POST", "/api/pair", { remote: true, body: { credential } })).status).toBe(401);
+  expect((await api("POST", "/api/auth/pair", { remote: true, body: { code: credential, browser: true } })).status).toBe(400);
+  const signIn = () => fetch(`${base}/api/auth/pair`, { method: "POST", headers: { host: HOST, "x-forwarded-for": "203.0.113.9", "x-forwarded-proto": "https",
+    "content-type": "application/json" }, body: JSON.stringify({ code: credential, label: "Safari on iPad", cookie: true, browser: true, attemptId: randomBytes(12).toString("base64url") }) });
+  const signedIn = await signIn();
+  expect(signedIn.status).toBe(200);
+  expect(await signedIn.json()).not.toHaveProperty("token");
+  const cookie = signedIn.headers.get("set-cookie") ?? "";
+  expect(cookie).toMatch(/HttpOnly/);
+  expect(cookie).toMatch(/Secure/);
+  expect(cookie).toMatch(/SameSite=Lax/);
+  const session = await api("GET", "/api/auth/session", { remote: true, headers: { cookie: cookie.split(";")[0] } });
+  // The owner's admin scope, exactly what the app gets from its own Cloud pairing.
+  expect(session.body).toMatchObject({ kind: "session", label: "Safari on iPad", scopes: ["admin", "client"], cloudHome: true });
+  // A replay gets nothing.
+  expect((await signIn()).status).toBe(401);
+  expect(log).not.toContain(credential);
+});
+
 it("never hands the included tokens or the signing secret to a CLI it probes", async () => {
   // POST /api/cli-test runs `<cli> --version` with a copy of the server's own
   // environment, less every credential on the shared lists (config.ts). That

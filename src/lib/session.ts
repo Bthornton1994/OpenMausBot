@@ -68,6 +68,19 @@ export function takePairingCodeFromLocation(): string | null {
   return decodeURIComponent(m[1]);
 }
 
+/** The OMB Cloud page's "Use in your browser" link, `/pair#signin=omb_pair_…`:
+ * a single-use browser sign-in the Cloud's Admin opened on this machine. Taken
+ * off the URL and out of history before anything renders, and never shown. */
+export function takeBrowserSignInFromLocation(): string | null {
+  if (!/[#&]signin=/.test(location.hash)) return null;
+  const m = /[#&]signin=(omb_pair_[A-Za-z0-9_-]{43})(?:&|$)/.exec(location.hash);
+  history.replaceState(null, "", location.pathname + location.search);
+  return m ? m[1] : null;
+}
+
+/** What the pair page says when that sign-in could not be used. */
+export const BROWSER_SIGN_IN_FAILED = "This sign-in link has expired or was already used. On My Cloud, choose “Use in your browser” again.";
+
 /** The invited address carried on a pair link (`/pair?email=…`): prefilled
  * on the sign-in page and dropped from the address bar. Never trusted on
  * its own; the one-time code still goes to the address itself. */
@@ -96,7 +109,7 @@ export function newAttemptId(): string {
 }
 
 export async function pairWithCode(
-  input: { code: string; label: string; attemptId?: string },
+  input: { code: string; label: string; attemptId?: string; browser?: boolean },
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   let res: Response;
@@ -105,7 +118,7 @@ export async function pairWithCode(
       method: "POST",
       credentials: "same-origin",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ code: input.code, label: input.label, cookie: true, attemptId: input.attemptId ?? newAttemptId() }),
+      body: JSON.stringify({ code: input.code, label: input.label, cookie: true, attemptId: input.attemptId ?? newAttemptId(), ...(input.browser ? { browser: true } : {}) }),
     });
   } catch (error) {
     return { ok: false, error: `could not reach the server (${error instanceof Error ? error.message : String(error)})` };
@@ -114,6 +127,14 @@ export async function pairWithCode(
   if (res.ok) return { ok: true };
   const error = Reflect.get(Object(body), "error");
   return { ok: false, error: typeof error === "string" ? error : `${res.status} ${res.statusText}` };
+}
+
+/** Redeem a browser sign-in (takeBrowserSignInFromLocation) for this
+ * browser's session cookie. A browser already connected here redeems nothing:
+ * the unused sign-in expires within two minutes. */
+export async function signInWithBrowserGrant(credential: string, fetchImpl: typeof fetch = fetch): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (isConnected(await readSessionState(fetchImpl))) return { ok: true };
+  return pairWithCode({ code: credential, label: defaultDeviceLabel(), browser: true }, fetchImpl);
 }
 
 /** Server-side JSON exchanges that end in a session cookie. */

@@ -106,6 +106,10 @@ export interface PairingCode {
   label: string;
   createdAt: number;
   expiresAt: number;
+  /** A browser sign-in (an OMB Cloud page's "Use in your browser"): only a
+   * browser sign-in redeems it, only by its credential, and a browser sign-in
+   * redeems no other window. */
+  browser?: true;
 }
 
 export interface PublicPairing {
@@ -199,7 +203,7 @@ export class SessionRegistry {
   private pairings: PairingCode[] = [];
   private tickets = new Map<string, { sessionId: string; expiresAt: number }>();
   private failures = new Map<string, { count: number; windowStart: number; lockedUntil: number }>();
-  private replays: Array<{ codeHash: string; attemptId: string; result: ExchangeResult; expiresAt: number }> = [];
+  private replays: Array<{ codeHash: string; attemptId: string; browser: boolean; result: ExchangeResult; expiresAt: number }> = [];
   private readonly onRevoked = new Set<(sessionId: string) => void>();
   private lastSeenWrites = new Map<string, number>();
   private readonly now: () => number;
@@ -305,7 +309,7 @@ export class SessionRegistry {
 
   // ── pairing ────────────────────────────────────────────────────────────
 
-  openPairing(input: { scopes?: Scope[]; label?: string; ttlMs?: number } = {}): { id: string; code: string; credential: string; expiresAt: number } {
+  openPairing(input: { scopes?: Scope[]; label?: string; ttlMs?: number; browser?: boolean } = {}): { id: string; code: string; credential: string; expiresAt: number } {
     this.prune();
     const now = this.now();
     const code = generatePairingCode();
@@ -319,6 +323,7 @@ export class SessionRegistry {
       label: (input.label ?? "").trim().slice(0, 80),
       createdAt: now,
       expiresAt: now + (input.ttlMs ?? PAIRING_CODE_TTL_MS),
+      ...(input.browser ? { browser: true as const } : {}),
     };
     this.pairings.push(pairing);
     return { id: pairing.id, code, credential, expiresAt: pairing.expiresAt };
@@ -369,8 +374,9 @@ export class SessionRegistry {
    * the lockout (an IP); `label` names the device in the sessions list. */
   /** `label` is what the client asked to be called; the code's own label
    * (set by whoever minted it) comes next; `fallbackLabel` (derived from the
-   * user agent) last. */
-  exchange(input: { code: string; label: string; source: string; fallbackLabel?: string; attemptId?: string }): ExchangeResult {
+   * user agent) last. `browser`: this is a browser sign-in (PairingCode
+   * `browser`), which redeems only a window opened for one. */
+  exchange(input: { code: string; label: string; source: string; fallbackLabel?: string; attemptId?: string; browser?: boolean }): ExchangeResult {
     this.prune();
     const now = this.now();
     // A credential is hashed as presented. Normalizing it would be actively
@@ -379,16 +385,17 @@ export class SessionRegistry {
     const presented = isPairingCredential(input.code)
       ? sha256(input.code)
       : sha256(normalizePairingCode(input.code));
+    const browser = input.browser === true;
     const attemptId = typeof input.attemptId === "string" && /^[\w-]{8,64}$/.test(input.attemptId) ? input.attemptId : null;
-    const replay = attemptId ? this.replays.find((r) => r.attemptId === attemptId && sameDigest(r.codeHash, presented)) : undefined;
+    const replay = attemptId ? this.replays.find((r) => r.attemptId === attemptId && r.browser === browser && sameDigest(r.codeHash, presented)) : undefined;
     if (replay) return replay.result;
     const lock = this.lockState(input.source);
     if (lock.locked) {
       const seconds = Math.ceil(lock.retryAfterMs / 1000);
       return { ok: false, status: 429, error: `too many failed pairing attempts from your address; try again in ${seconds}s` };
     }
-    const index = this.pairings.findIndex((p) =>
-      sameDigest(p.codeHash, presented) || sameDigest(p.credentialHash, presented));
+    const index = this.pairings.findIndex((p) => (p.browser === true) === browser &&
+      (sameDigest(p.credentialHash, presented) || (!p.browser && sameDigest(p.codeHash, presented))));
     if (index < 0) {
       this.recordFailure(input.source);
       return { ok: false, status: 401, error: "pairing code is wrong or has expired; create a new one on the server" };
@@ -411,7 +418,7 @@ export class SessionRegistry {
     this.lastSeenWrites.set(record.id, now); // the exchange itself was the first sighting
     this.persist();
     const result: ExchangeResult = { ok: true, token, session: publicSession(record) };
-    if (attemptId) this.replays.push({ codeHash: presented, attemptId, result, expiresAt: now + EXCHANGE_REPLAY_MS });
+    if (attemptId) this.replays.push({ codeHash: presented, attemptId, browser, result, expiresAt: now + EXCHANGE_REPLAY_MS });
     return result;
   }
 
