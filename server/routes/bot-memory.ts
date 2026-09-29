@@ -42,6 +42,10 @@ export interface BotMemoryRouteDeps {
   upkeep: Pick<MemoryUpkeep, "status" | "tidy">;
   aboutMe(): string;
   saveAboutMe(text: string): void;
+  /** On an OMB Cloud home: whether this bot's memory was changed where the
+   * owner did not write, and the owner's one-click acceptance of it as it is
+   * now (server/lending-memory.ts). Absent elsewhere. */
+  lendingReview?: { needed(botId: string): boolean; accept(botId: string): void };
 }
 
 export function createBotMemoryRoutes(deps: BotMemoryRouteDeps): RouteHandler {
@@ -76,7 +80,8 @@ export function createBotMemoryRoutes(deps: BotMemoryRouteDeps): RouteHandler {
         const overview = memoryOverview(m[1]);
         // `text` and `truncated` ride along one release for clients of the
         // old whole-file shape; the panel reads the file through /memory/file
-        return json(res, 200, { ...overview, text: readMemoryDoc(m[1], MEMORY_INDEX).text, truncated: overview.index.truncated });
+        return json(res, 200, { ...overview, text: readMemoryDoc(m[1], MEMORY_INDEX).text, truncated: overview.index.truncated,
+          ...(deps.lendingReview?.needed(m[1]) ? { lendingReview: true } : {}) });
       } catch (error) {
         return replyMemoryError(res, error);
       }
@@ -97,6 +102,12 @@ export function createBotMemoryRoutes(deps: BotMemoryRouteDeps): RouteHandler {
         if (error instanceof MemoryStoreError && error.code === "too-large") return json(res, 400, { error: error.message });
         return replyMemoryError(res, error);
       }
+    }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/reviewed$/);
+    if (m && method === "POST" && deps.lendingReview) {
+      if (!deps.bot(m[1])) return json(res, 404, { error: "no such bot" });
+      deps.lendingReview.accept(m[1]);
+      return json(res, 200, { ok: true, lendingReview: false });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/memory\/file$/);
     if (m && method === "GET") {

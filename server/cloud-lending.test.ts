@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { cloudHomeLendingRefusal, cloudHomeTurnMayLend, createCloudRoutineAuthors, routineFingerprint, type CloudLendingTurn } from "./cloud-lending.ts";
+import { cloudHomeLendingRefusal, cloudHomeTurnMayLend, createCloudRoutineAuthors, ownerOnlyConversation, routineFingerprint, type CloudLendingTurn } from "./cloud-lending.ts";
 
 const OWNER = "p_owner", GUEST = "p_guest";
 const ownerPerson = (person: string | undefined) => person === OWNER;
@@ -63,6 +63,13 @@ describe("who may use a Mac lent to a Cloud home (review: guests, webhooks)", ()
     const routineThread = [said("m1"), reply("r1")];
     expect(cloudHomeTurnMayLend(turn({ request: request("m1", { automation: "schedule" }), thread: routineThread, routineRun: run() }))).toBe(true);
     expect(cloudHomeTurnMayLend(turn({ request: request("m1", { automation: "schedule" }), thread: [said("x0"), ...routineThread], routineRun: run() }))).toBe(false);
+  });
+  it("an owner-only conversation is the same test for what may feed other turns (memory, recall, the brief)", () => {
+    expect(ownerOnlyConversation([said("o1", OWNER), reply("r1")], ownerPerson, cardAnswerer)).toBe(true);
+    expect(ownerOnlyConversation([said("g1", GUEST), said("o1", OWNER)], ownerPerson, cardAnswerer)).toBe(false);
+    expect(ownerOnlyConversation([said("x1"), reply("r1")], ownerPerson, cardAnswerer)).toBe(false);
+    expect(ownerOnlyConversation([said("x1"), reply("r1")], ownerPerson, cardAnswerer, "x1")).toBe(true);
+    expect(ownerOnlyConversation([], ownerPerson, cardAnswerer)).toBe(true);
   });
   it("says why: unproven, not the owner's, or someone else wrote here", () => {
     expect(cloudHomeLendingRefusal(turn({ request: undefined }))).toBe("unproven");

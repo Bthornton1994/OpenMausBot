@@ -39,8 +39,10 @@ import {
   type MemoryFileInfo,
   type MemoryJournalRow,
   type MemoryOverview,
+  markMemoryReviewed,
 } from "@/lib/memory";
 import { shortPath } from "@/lib/short-path";
+import { t } from "@/lib/i18n";
 import { useStore, type Bot } from "@/state/store";
 import { Switch } from "../SettingsPrimitives";
 import { useDesktopCapabilities } from "../DesktopCapabilities";
@@ -67,6 +69,20 @@ interface Conflict {
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** On an OMB Cloud home: this bot's memory changed in a conversation the
+ * owner did not write, so its turns cannot use the owner's lent Mac until
+ * the owner has looked. One click accepts it as it is; no confirmation. */
+export function LendingReviewNotice({ busy, onReviewed }: { busy: boolean; onReviewed: () => void }) {
+  return (
+    <div role="status" className="rounded-xl border border-danger/40 bg-card p-4">
+      <p className="text-[13px] leading-relaxed text-ink">{t("memory.lendingReview")}</p>
+      <button type="button" className={cn(buttonCls, "mt-3")} disabled={busy} onClick={onReviewed}>
+        {t("memory.lendingReviewed")}
+      </button>
+    </div>
+  );
+}
+
 export function MemorySection({ bot, active = true }: { bot: Bot; active?: boolean }) {
   const { capabilities } = useDesktopCapabilities();
   const [overview, setOverview] = useState<MemoryOverview | null>(null);
@@ -81,6 +97,9 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
   const [newTopic, setNewTopic] = useState("");
   const [upkeep, setUpkeep] = useState<UpkeepStatus | null>(null);
   const [tidying, setTidying] = useState(false);
+  // OMB Cloud home: memory changed where the owner did not write.
+  const [lendingReview, setLendingReview] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
   const { dispatch } = useStore();
 
   const refresh = async (openPath?: string) => {
@@ -90,6 +109,7 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
       fetchUpkeepStatus(bot.id).catch(() => null),
     ]);
     setOverview(nextOverview);
+    setLendingReview(nextOverview.lendingReview === true);
     setJournal(nextJournal);
     setUpkeep(nextUpkeep);
     if (openPath) {
@@ -256,6 +276,19 @@ export function MemorySection({ bot, active = true }: { bot: Bot; active?: boole
           </div>
         )}
       </div>
+
+      {lendingReview && (
+        <LendingReviewNotice
+          busy={reviewing}
+          onReviewed={() => {
+            setReviewing(true);
+            markMemoryReviewed(bot.id)
+              .then(() => setLendingReview(false))
+              .catch((e: unknown) => setError(errorText(e)))
+              .finally(() => setReviewing(false));
+          }}
+        />
+      )}
 
       {overview && <MemoryGauge index={overview.index} />}
 

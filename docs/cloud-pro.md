@@ -242,10 +242,25 @@ On the Cloud home (`server/shared-computers.ts`, `server/index.ts`):
   **Computer** setting is off cannot use lent apps and screen.
 - On a Cloud home only the owner's own devices (admin sessions) can answer a
   card or remember an approval; a guest can read along but never answer.
-- What this does not cover: a bot's own memory. Notes a bot keeps while
-  talking with a guest load into that bot's later conversations, the owner's
-  included. Pairing a guest to your Cloud lets them talk to your bots; lend
-  your Mac only while you trust everyone paired there.
+- A bot's memory and its other conversations reach every one of its turns,
+  so on a Cloud home nothing a conversation the owner did not write produces
+  flows into them (`server/lending-memory.ts`):
+  - memory capture skips such conversations, and they leave no line in the
+    bot's daily log;
+  - the bot's memory tools (`memory_update`, `memory_log`) refuse to write from
+    them;
+  - recall and the recent-work brief draw only on conversations the owner
+    alone wrote in;
+  - a change to MEMORY.md, a topic file or a daily log while such a turn runs
+    (a bot writing the files with its own tools) flags the bot: its turns
+    cannot use the Mac, and the bot says "This bot's memory was changed in a
+    conversation you didn't write. Review it in Memory to use your Mac
+    again." The bot's **Memory** panel shows the same notice with **Mark
+    reviewed** (one click, owner only). The owner's own turns, their Memory
+    edits and upkeep on their conversations never flag it.
+- What this cannot stop: a guest who can drive a Full-access bot's shell on
+  the Cloud controls the machine, including these records. Pair only people
+  you trust with your Cloud while you lend your Mac.
 
 ### What the Cloud can see: `GET /api/shared-computers`
 

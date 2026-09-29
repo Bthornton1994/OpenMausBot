@@ -24,6 +24,9 @@ export interface MemoryFileInfo {
 }
 
 export interface MemoryOverview {
+  /** On an OMB Cloud home: this bot's memory changed in a conversation the
+   * owner did not write; its turns cannot use a lent Mac until reviewed. */
+  lendingReview?: boolean;
   botId: string;
   workspacePath: string;
   index: MemoryCapacity;
@@ -143,6 +146,11 @@ export function noticedCount(report: CaptureReport | undefined): number {
 
 export function fetchUpkeepStatus(botId: string): Promise<UpkeepStatus> {
   return api(`/api/bots/${botId}/memory/upkeep`);
+}
+
+/** The owner accepts this bot's memory as it is now (OMB Cloud home only). */
+export function markMemoryReviewed(botId: string): Promise<{ ok: true; lendingReview: false }> {
+  return api(`/api/bots/${botId}/memory/reviewed`, { method: "POST" });
 }
 
 export function tidyMemoryNow(botId: string): Promise<{ report: TidyReport; overview: MemoryOverview }> {

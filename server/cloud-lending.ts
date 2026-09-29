@@ -66,10 +66,25 @@ export function cloudHomeLendingRefusal(turn: CloudLendingTurn): CloudLendingRef
   // be anywhere in this conversation, before or after the request, as a line
   // (sent, queued, steered or handed in) or as the answer to a card. A
   // routine's own prompt line names nobody; its provenance was proven above.
-  const clean = turn.thread.every((line, at) =>
-    (line.role !== "user" || (at === index && request.automation !== undefined) || turn.ownerPerson(personOf(line))) &&
-    (!answeredByPerson(line.card) || turn.ownerPerson(turn.cardAnswerer(line.card!))));
+  const clean = ownerOnlyConversation(turn.thread, turn.ownerPerson, turn.cardAnswerer,
+    request.automation !== undefined ? request.messageId : undefined);
   return clean ? null : "someone-else";
+}
+
+/** A conversation only the owner has written in: every user line is theirs
+ * and every card someone answered was answered by them (`exempt`: one line,
+ * a routine's own prompt, that names nobody). The same test decides which of
+ * a bot's other conversations may feed a turn on a Cloud home (recall, the
+ * recent-work brief, memory capture, the daily log). */
+export function ownerOnlyConversation(
+  thread: readonly Line[],
+  ownerPerson: (person: string | undefined) => boolean,
+  cardAnswerer: (card: Card) => string | undefined,
+  exempt?: string,
+): boolean {
+  return thread.every(line =>
+    (line.role !== "user" || line.id === exempt || ownerPerson(personOf(line))) &&
+    (!answeredByPerson(line.card) || ownerPerson(cardAnswerer(line.card!))));
 }
 
 /** A card someone answered: a person's verdict or words. The harness's own

@@ -11,7 +11,7 @@ vi.mock("../DesktopCapabilities", () => ({
   useDesktopCapabilities: () => ({ capabilities: { host: { homeDir: undefined, platform: "other" } } }),
 }));
 
-const { ConflictNotice, MemoryFileRows, MemoryGauge, MemoryJournalList, MemoryUpkeepCard } = await import("./MemorySection");
+const { ConflictNotice, LendingReviewNotice, MemoryFileRows, MemoryGauge, MemoryJournalList, MemoryUpkeepCard } = await import("./MemorySection");
 
 // renderToStaticMarkup HTML-escapes quotes and apostrophes; decode before
 // comparing against plain-text fixtures.
@@ -164,5 +164,17 @@ describe("MemoryUpkeepCard", () => {
     expect(markup).toContain("can't make the quick background model call");
     const noticed = render(createElement(MemoryUpkeepCard, { enabled: true, status: { enabled: true, modelSteps: true, lastCapture: { at: Date.now() - 60_000, added: 1, topics: 2, aboutMe: 1 } }, tidying: false, onToggle: noop, onTidy: noop }));
     expect(noticed).toContain("Last noticed 3 facts");
+  });
+});
+
+describe("LendingReviewNotice", () => {
+  it("says plainly why the bot cannot use the Mac and marks the memory reviewed in one click", () => {
+    const onReviewed = vi.fn();
+    const markup = render(createElement(LendingReviewNotice, { busy: false, onReviewed }));
+    expect(markup).toContain("This bot's memory was changed in a conversation you didn't write, so it can't use your Mac.");
+    expect(markup).toContain(">Mark reviewed<");
+    const tree = LendingReviewNotice({ busy: false, onReviewed }) as { props: { children: Array<{ type: string; props: { onClick?: () => void } }> } };
+    tree.props.children.find((child) => child.type === "button")!.props.onClick!();
+    expect(onReviewed).toHaveBeenCalledOnce();
   });
 });
