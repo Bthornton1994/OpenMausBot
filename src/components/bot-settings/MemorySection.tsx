@@ -81,7 +81,7 @@ export function LendingReviewNotice({ changed, stale, busy, onReviewed }: { chan
       <p className="text-[13px] leading-relaxed text-ink">{t(stale ? "memory.lendingReviewStale" : "memory.lendingReview")}</p>
       {changed.length > 0 && (
         <>
-          <p className="mt-2 text-[12px] text-ink-muted">{t("memory.lendingReviewChanged")}</p>
+          <p className="mt-2 text-[12px] text-ink-secondary">{t("memory.lendingReviewChanged")}</p>
           <ul className="mt-1 space-y-0.5">
             {changed.map((file) => (
               <li key={file} className="break-all font-mono text-[12px] text-ink">{file}</li>
