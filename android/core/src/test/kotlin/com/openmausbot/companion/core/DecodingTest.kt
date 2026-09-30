@@ -61,6 +61,18 @@ class DecodingTest {
     }
 
     @Test
+    fun routineRunOutcomeIsOptionalAndOnlyMarksACompletedRun() {
+        val run = """{"id":"r1","routineId":"x","routineName":"Balance","botId":"b","runOn":"maus","scheduledFor":1,"status":"completed","manual":false,"createdAt":1"""
+        val legacy = CompanionJson.decodeFromString<RoutineRun>("$run}")
+        val blocked = CompanionJson.decodeFromString<RoutineRun>("$run,\"outcome\":\"blocked\"}")
+
+        assertEquals(null, legacy.outcome)
+        assertEquals("completed", legacy.displayStatus)
+        assertEquals("attention", blocked.displayStatus)
+        assertEquals("failed", blocked.copy(status = "failed").displayStatus)
+    }
+
+    @Test
     fun futureRoutineScheduleKindRemainsVisibleAsUnknown() {
         val schedule = CompanionJson.decodeFromString<RoutineSchedule>(
             """{"type":"weekly","time":"09:00","weekdays":[1]}""",

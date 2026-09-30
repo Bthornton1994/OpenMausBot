@@ -44,6 +44,18 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(BotTask.self, from: JSONEncoder().encode(execution)), execution)
     }
 
+    func testRoutineRunOutcomeIsOptionalAndOnlyMarksACompletedRun() throws {
+        let run = #"{"id":"r1","routineId":"x","routineName":"Balance","botId":"b","runOn":"maus","scheduledFor":1,"status":"completed","manual":false,"createdAt":1"#
+        let legacy = try JSONDecoder().decode(RoutineRun.self, from: Data((run + "}").utf8))
+        let blocked = try JSONDecoder().decode(RoutineRun.self, from: Data((run + #","outcome":"blocked"}"#).utf8))
+        XCTAssertNil(legacy.outcome)
+        XCTAssertEqual(legacy.displayStatus, "completed")
+        XCTAssertEqual(blocked.displayStatus, "attention")
+        var failed = blocked
+        failed.status = "failed"
+        XCTAssertEqual(failed.displayStatus, "failed")
+    }
+
     func testDecodesThePagedFleet() throws {
         let fleet = try decode(Fleet.self, "bots-paged")
         XCTAssertFalse(fleet.bots.isEmpty)
