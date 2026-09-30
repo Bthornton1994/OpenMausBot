@@ -1,10 +1,10 @@
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ensureDirs } from "../config.ts";
+import { DATA_DIR, ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
@@ -32,6 +32,8 @@ import {
   type AntigravityReleaseAsset,
 } from "./antigravity-release.ts";
 import { installAntigravityRuntime, resolveAntigravityRuntime } from "./antigravity-runtime.ts";
+import * as antigravityTemp from "./antigravity-temp.ts";
+import { antigravityTempDir, sweepAntigravityTemp } from "./antigravity-temp.ts";
 import {
   AntigravityDriver,
   STATIC_ANTIGRAVITY_MODELS,
@@ -207,9 +209,10 @@ createInterface({ input: process.stdin }).on('line', line => {
 });
 
 describe("stopping the runtime before touching its files", () => {
-  it.skipIf(process.platform === "win32")("waits through forced shutdown when the verified runtime ignores TERM", async () => {
+  it.skipIf(process.platform === "win32")("waits through forced shutdown when the verified runtime ignores EOF and TERM", async () => {
     const fake = fakeRuntime();
-    writeFileSync(fake.executable, `#!/usr/bin/env node\nprocess.on('SIGTERM', () => {});\nawait import(${JSON.stringify(pathToFileURL(FAKE_ACP).href)});\n`);
+    // Stays up after its input ends, so close() must go on to force it.
+    writeFileSync(fake.executable, `#!/usr/bin/env node\nprocess.on('SIGTERM', () => {});\nsetInterval(() => {}, 1 << 30);\nawait import(${JSON.stringify(pathToFileURL(FAKE_ACP).href)});\n`);
     const runtime = await resolveAntigravityRuntime(fake.executable);
     vi.stubEnv("FAKE_ACP_AGENT_NAME", "Google Antigravity");
     vi.stubEnv("FAKE_ACP_AGENT_VERSION", "1.1.1");
@@ -221,7 +224,25 @@ describe("stopping the runtime before touching its files", () => {
     } finally {
       await Promise.all(spawned.mock.results.map(({ value }) => procs.killCliTree(value, 0)));
     }
-  }, 10_000);
+  }, 20_000);
+
+  it("ends the runtime's input and lets it exit by itself before any forced stop", async () => {
+    // On Windows a forced stop skips the runtime's own cleanup of the
+    // 0.34-1.26 GB it unpacked. An exit of its own removes them.
+    const fake = fakeRuntime();
+    const runtime = await resolveAntigravityRuntime(fake.executable);
+    const profile = await prepareAntigravityProfile({ instanceId: "graceful-close", runtime, baseDir: fake.directory });
+    const client = new AntigravityAcpClient(runtime, profile, fake.directory);
+    await client.initialize();
+    const kill = vi.spyOn(procs, "killCliTree");
+    client.close();
+    expect(client.child.stdin?.writableEnded).toBe(true);
+    expect(kill).not.toHaveBeenCalled();
+    expect(await client.closeAndWait()).toBe(true);
+    // Exit code 0 and no signal: not SIGTERM (POSIX) and not taskkill's 1.
+    expect(client.child.exitCode).toBe(0);
+    expect(client.child.signalCode).toBeNull();
+  });
 
   it("validates a real fake runtime and waits for its process to close before returning", async () => {
     const fake = fakeRuntime();
@@ -544,6 +565,71 @@ describe("official Antigravity runtime", () => {
     expect(first.environment.ANTIGRAVITY_HARNESS_PATH).toBe(fake.harness);
   });
 
+  it("points TEMP on Windows at one stable folder per instance under DATA_DIR/tmp", async () => {
+    const fake = fakeRuntime();
+    const runtime = await resolveAntigravityRuntime(fake.executable);
+    const input = {
+      instanceId: "work",
+      runtime,
+      baseDir: fake.directory,
+      platform: "win32" as const,
+      baseEnv: { Temp: "C:\\Users\\ada\\AppData\\Local\\Temp", tmp: "C:\\Temp", PATH: process.env.PATH },
+    };
+    const first = await prepareAntigravityProfile(input);
+    const again = await prepareAntigravityProfile(input);
+    const expected = antigravityTempDir(fake.directory, "work");
+    expect(first.tempDirectory).toBe(expected);
+    expect(first.environment.TEMP).toBe(expected);
+    expect(first.environment.TMP).toBe(expected);
+    expect(Object.keys(first.environment).filter((key) => /^(?:temp|tmp)$/iu.test(key)).sort()).toEqual(["TEMP", "TMP"]);
+    expect(statSync(expected).isDirectory()).toBe(true);
+    // Stable across launches: the pool's spawn contract hashes this environment.
+    expect(again.environment).toEqual(first.environment);
+    // Beside the profile, never inside it (Windows paths stop at 260 characters).
+    expect(expected.startsWith(join(fake.directory, "tmp", "agy"))).toBe(true);
+    expect(expected.startsWith(first.directory)).toBe(false);
+    const other = await prepareAntigravityProfile({ ...input, instanceId: "personal" });
+    expect(other.environment.TEMP).not.toBe(expected);
+  });
+
+  it("leaves TEMP alone on macOS and Linux", async () => {
+    const fake = fakeRuntime();
+    const runtime = await resolveAntigravityRuntime(fake.executable);
+    for (const platform of ["darwin", "linux"] as const) {
+      const profile = await prepareAntigravityProfile({
+        instanceId: "work", runtime, baseDir: fake.directory, platform, baseEnv: { TEMP: "/inherited", TMPDIR: "/inherited-dir" },
+      });
+      expect(profile.tempDirectory).toBeUndefined();
+      expect(profile.environment.TEMP).toBe("/inherited");
+      expect(profile.environment.TMPDIR).toBe("/inherited-dir");
+    }
+    expect(existsSync(join(fake.directory, "tmp"))).toBe(false);
+  });
+
+  it("clears what an earlier run of this instance left behind when the driver starts", async () => {
+    ensureDirs();
+    const instanceId = "antigravity-leftovers";
+    // Owned by an ID no process can have, so it is certainly abandoned.
+    const abandoned = join(antigravityTempDir(DATA_DIR, instanceId), `_MEI7ffffff02`);
+    mkdirSync(join(abandoned, "google3"), { recursive: true });
+    writeFileSync(join(abandoned, "google3", "payload.bin"), "unpacked");
+    const scheduled = vi.spyOn(antigravityTemp, "scheduleAntigravityTempSweep");
+    const instance = await AntigravityDriver.create({
+      instanceId,
+      displayName: "Antigravity fixture",
+      enabled: true,
+      config: { cli: join(DATA_DIR, "not-installed"), fullAuto: false },
+      environment: {},
+    });
+    try {
+      expect(scheduled).toHaveBeenCalledWith(instanceId);
+      await sweepAntigravityTemp(instanceId);
+      expect(existsSync(abandoned)).toBe(false);
+    } finally {
+      await instance.dispose();
+    }
+  });
+
   it("bounds model discovery with one deadline", async () => {
     const fake = fakeRuntime();
     const runtime = await resolveAntigravityRuntime(fake.executable);
@@ -666,6 +752,8 @@ describe("Antigravity driver over shared ACP", () => {
     expect(dumpState.env.GEMINI_HOME).toBe(antigravityProfileDirectory(instanceId));
     expect(dumpState.env.GEMINI_API_KEY).toBeUndefined();
     expect(dumpState.env.GOOGLE_API_KEY).toBeUndefined();
+    // The real launch path on Windows unpacks into OMB's own folder.
+    if (process.platform === "win32") expect(dumpState.env.TEMP).toBe(antigravityTempDir(DATA_DIR, instanceId));
     const calls = JSON.parse(readFileSync(`${dump}.config.json`, "utf8"));
     expect(calls).toEqual([
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: "gemini-3.8-flash-low" } },
