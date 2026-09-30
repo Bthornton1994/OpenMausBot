@@ -67,9 +67,15 @@ export function serializeCatalog(doc) {
   return `${out}}}\n`;
 }
 
+/** .gitattributes pins the snapshot and the licence files to LF. This keeps a
+ * working tree that still has CRLF (checked out before that rule) from failing
+ * over line endings, which git owns, rather than over content. */
+export const toLf = (text) => text.replace(/\r\n/g, "\n");
+
 /** Problems with a snapshot's text, or an empty list when it is sound. */
-export function snapshotProblems(text) {
+export function snapshotProblems(input) {
   const problems = [];
+  const text = toLf(input);
   let doc;
   try {
     doc = JSON.parse(text);
@@ -123,7 +129,7 @@ async function main() {
   const doc = buildCatalogDocument(JSON.parse(text), {
     commit: values.commit,
     updatedAt: values["updated-at"],
-    licenseText: readFileSync(LICENSE_PATH, "utf8"),
+    licenseText: toLf(readFileSync(LICENSE_PATH, "utf8")),
     onDrop: (drop) => drops.push(drop),
   });
   const serialized = serializeCatalog(doc);

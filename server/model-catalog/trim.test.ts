@@ -96,6 +96,16 @@ describe("trimModelsDevCatalog brace filter", () => {
     expect(drops).toEqual([{ provider: "p", model: "m", reason: "brace" }]);
   });
 
+  it("drops a model whose key alone holds a brace", () => {
+    // No `id` and a clean name: only the key carries the substitution.
+    const text = '{"p":{"id":"p","name":"P","env":[],"models":{' +
+      '"x{env:OMB_MP_KEY_OTHER}":{"name":"clean","tool_call":true,"modalities":{"input":["text"]}},' +
+      '"ok":{"name":"ok","tool_call":true,"modalities":{"input":["text"]}}}}}';
+    const { providers, drops } = trimWithDrops(JSON.parse(text));
+    expect(Object.keys(providers.p!.models)).toEqual(["ok"]);
+    expect(drops).toEqual([{ provider: "p", model: "x{env:OMB_MP_KEY_OTHER}", reason: "brace" }]);
+  });
+
   it("never lets a brace through, whatever the input", () => {
     const hostile = {
       a: provider("a", { "{": model("{"), "}": model("}"), ok: model("ok", { modalities: { input: ["text", "{x}"] } }) }),
@@ -177,6 +187,23 @@ describe("trimModelsDevCatalog shape", () => {
     expect(drops.map((drop) => `${drop.provider}/${drop.model ?? ""}:${drop.reason}`).sort()).toEqual([
       "Bad ID/:invalid", "envs/:invalid", "mismatch/:invalid", "notobject/:invalid", "p/has space:invalid", "p/wrongid:invalid",
     ]);
+  });
+
+  it("gives ids like __proto__ and constructor no special meaning", () => {
+    const text = '{"p":{"id":"p","name":"P","env":[],"models":{' +
+      '"__proto__":{"name":"proto","tool_call":true,"reasoning":false,"modalities":{"input":["text"]}},' +
+      '"ok":{"name":"ok","tool_call":true,"modalities":{"input":["text"]}}}}}';
+    const { providers, drops } = trimWithDrops(JSON.parse(text));
+    const models = providers.p!.models;
+    expect(Object.keys(models)).toEqual(["ok"]);
+    expect(drops).toEqual([{ provider: "p", model: "__proto__", reason: "invalid" }]);
+    // The `__proto__` entry did not become the map's prototype, and names
+    // inherited from Object.prototype are not catalog hits either.
+    for (const id of ["name", "reasoning", "constructor", "toString", "hasOwnProperty"]) {
+      expect(models[id], id).toBeUndefined();
+      expect(providers[id], id).toBeUndefined();
+    }
+    expect(trimModelsDevCatalog(null)["constructor"]).toBeUndefined();
   });
 
   it("returns an empty catalog for non-object input", () => {

@@ -47,6 +47,9 @@ export interface ProviderPreset {
   recommended?: number;
   /** OpenAI-compatible base URL. Wins over models.dev's `api`. */
   api: string;
+  /** The AI SDK package OpenCode must load to reach `api`, when models.dev's
+   * `npm` is for a different endpoint (MiniMax: its Anthropic one). */
+  npm?: string;
   /** Key variable name, for rows models.dev does not list. */
   env?: string;
   /** "Get a key" link, for rows models.dev does not list. */
@@ -66,6 +69,9 @@ export interface ProviderPreset {
 }
 
 const CHECKED = "2026-09-30";
+
+/** The AI SDK package for any OpenAI-compatible base URL. */
+export const OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible";
 
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
   {
@@ -161,13 +167,15 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
     checkedAt: CHECKED,
   },
   {
-    // models.dev lists MiniMax's Anthropic endpoint as its `api`; the chat
-    // engine and OpenCode's OpenAI-compatible block need the OpenAI one.
+    // models.dev lists MiniMax's Anthropic endpoint as its `api` (with
+    // @ai-sdk/anthropic); the chat engine and OpenCode need the OpenAI one,
+    // and OpenCode needs the matching SDK with it.
     id: "minimax",
     catalogId: "minimax",
     label: "MiniMax",
     recommended: 12,
     api: "https://api.minimax.io/v1",
+    npm: OPENAI_COMPATIBLE_NPM,
     anthropic: { baseUrl: "https://api.minimax.io/anthropic" },
     chat: "after-check",
     checkedAt: CHECKED,

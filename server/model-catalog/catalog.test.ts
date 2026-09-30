@@ -142,6 +142,7 @@ describe("offline fallback", () => {
   it("returns an empty catalog, not an error, when there is nothing at all", () => {
     const { store, logs } = harness({ snapshot: null });
     expect(store.get()).toEqual({ origin: "empty", updatedAt: new Date(0).toISOString(), providers: {} });
+    expect(store.get().providers["constructor"]).toBeUndefined();
     expect(logs.some((line) => line.includes("snapshot is missing"))).toBe(true);
   });
 });
@@ -364,6 +365,26 @@ describe("catalogEntries", () => {
     expect(entries.find((entry) => entry.id === "minimax")?.api).toBe("https://api.minimax.io/v1");
   });
 
+  it("pairs each preset's pinned address with an SDK package that speaks to it", () => {
+    const npm = (entries: ReturnType<typeof catalogEntries>, id: string) => entries.find((entry) => entry.id === id)?.npm;
+    const entries = catalogEntries(catalog({
+      ...rawCatalog("minimax", "mm1", { npm: "@ai-sdk/anthropic", api: "https://api.minimax.io/anthropic/v1" }),
+      ...rawCatalog("openrouter", "or1", { npm: "@openrouter/ai-sdk-provider", api: "https://openrouter.ai/api/v1" }),
+      ...rawCatalog("groq", "g1", { npm: "@ai-sdk/groq", api: undefined }),
+      ...rawCatalog("fireworks-ai", "fw1", { npm: "@ai-sdk/anthropic", api: "https://api.fireworks.ai/inference" }),
+    }));
+    // MiniMax: models.dev's package is for its Anthropic endpoint, not the pinned OpenAI one.
+    expect(npm(entries, "minimax")).toBe("@ai-sdk/openai-compatible");
+    // Kept when it describes the pinned address, or the SDK's own default address.
+    expect(npm(entries, "openrouter")).toBe("@openrouter/ai-sdk-provider");
+    expect(npm(entries, "groq")).toBe("@ai-sdk/groq");
+    // A catalog that moves a preset to another endpoint does not move the package.
+    expect(npm(entries, "fireworks-ai")).toBe("@ai-sdk/openai-compatible");
+    // MiniMax's row pins the package even if models.dev pairs its OpenAI address with the Anthropic SDK.
+    const paired = catalogEntries(catalog(rawCatalog("minimax", "mm1", { npm: "@ai-sdk/anthropic", api: "https://api.minimax.io/v1" })));
+    expect(npm(paired, "minimax")).toBe("@ai-sdk/openai-compatible");
+  });
+
   it("merges the bundled snapshot with every preset", () => {
     const store = new ModelCatalogStore({ dataDir: tempDir(), env: {}, openCodeCachePath: null, log: () => {} });
     const entries = catalogEntries(store.get());
@@ -371,5 +392,6 @@ describe("catalogEntries", () => {
     expect(new Set(entries.map((entry) => entry.id)).size).toBe(entries.length);
     expect(entries.filter((entry) => entry.recommended !== undefined)).toHaveLength(13);
     for (const entry of entries) if (entry.doc) expect(entry.doc.startsWith("https://")).toBe(true);
+    expect(entries.find((entry) => entry.id === "minimax")).toMatchObject({ npm: "@ai-sdk/openai-compatible", api: "https://api.minimax.io/v1" });
   });
 });

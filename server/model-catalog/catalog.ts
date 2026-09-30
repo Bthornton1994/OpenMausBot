@@ -52,7 +52,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeFileAtomic } from "../atomic.ts";
-import { PROVIDER_PRESETS, type ProviderPreset } from "./presets.ts";
+import { OPENAI_COMPATIBLE_NPM, PROVIDER_PRESETS, type ProviderPreset } from "./presets.ts";
 import {
   MODEL_CATALOG_SCHEMA,
   catalogStats,
@@ -179,7 +179,7 @@ export class ModelCatalogStore {
       this.memo = { origin: candidate.origin, updatedAt: new Date(candidate.updatedAt).toISOString(), providers };
       return this.memo;
     }
-    this.memo = { origin: "empty", updatedAt: new Date(0).toISOString(), providers: {} };
+    this.memo = { origin: "empty", updatedAt: new Date(0).toISOString(), providers: trimModelsDevCatalog(undefined) };
     return this.memo;
   }
 
@@ -353,6 +353,8 @@ export interface CatalogEntry {
   catalogId?: string;
   label: string;
   env: string[];
+  /** The AI SDK package that speaks to `api`. For a preset it can differ from
+   * models.dev's `npm`, so OpenCode's block must set it along with baseURL. */
   npm?: string;
   /** OpenAI-compatible base URL. A preset's pinned URL wins over models.dev's. */
   api?: string;
@@ -361,6 +363,16 @@ export interface CatalogEntry {
   modelCount: number;
   recommended?: number;
   preset?: ProviderPreset;
+}
+
+/** The SDK package for a preset's pinned `api`. models.dev's `npm` describes
+ * models.dev's `api` (or, when it lists none, the SDK's own default address,
+ * which the preset pins too), so it is kept only when that is the address the
+ * preset pins. Otherwise the pinned address is OpenAI-compatible by definition. */
+function presetNpm(preset: ProviderPreset, provider: CatalogProviders[string] | undefined): string | undefined {
+  if (preset.npm) return preset.npm;
+  if (!provider?.npm) return undefined;
+  return provider.api === undefined || provider.api === preset.api ? provider.npm : OPENAI_COMPATIBLE_NPM;
 }
 
 /** The catalog merged with the presets: recommended rows first, in their
@@ -381,7 +393,8 @@ export function catalogEntries(catalog: ModelCatalog, presets: readonly Provider
       preset,
     };
     if (provider) entry.catalogId = provider.id;
-    if (provider?.npm) entry.npm = provider.npm;
+    const npm = presetNpm(preset, provider);
+    if (npm) entry.npm = npm;
     const doc = preset.doc ?? provider?.doc;
     if (doc) entry.doc = doc;
     if (preset.recommended !== undefined) entry.recommended = preset.recommended;

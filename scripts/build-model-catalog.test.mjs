@@ -1,10 +1,15 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { LICENSE_PATH, MAX_GZIP_BYTES, SNAPSHOT_PATH, buildCatalogDocument, serializeCatalog, snapshotProblems } from "./build-model-catalog.mjs";
+import { LICENSE_PATH, MAX_GZIP_BYTES, SNAPSHOT_PATH, buildCatalogDocument, serializeCatalog, snapshotProblems, toLf } from "./build-model-catalog.mjs";
 
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+// As checked out: CRLF in a Windows working tree written before .gitattributes pinned it.
 const committed = readFileSync(SNAPSHOT_PATH, "utf8");
-const licenseText = readFileSync(LICENSE_PATH, "utf8");
+const licenseText = toLf(readFileSync(LICENSE_PATH, "utf8"));
 const raw = {
   good: {
     id: "good", name: "Good", env: ["GOOD_API_KEY"], api: "https://api.good.example/v1/", doc: "https://good.example",
@@ -19,9 +24,23 @@ const raw = {
 describe("model catalog snapshot", () => {
   it("is sound as committed: trimmed, brace-free, formatted, licensed and within budget", () => {
     expect(snapshotProblems(committed)).toEqual([]);
-    expect(gzipSync(committed).length).toBeLessThanOrEqual(MAX_GZIP_BYTES);
+    expect(gzipSync(toLf(committed)).length).toBeLessThanOrEqual(MAX_GZIP_BYTES);
     const doc = JSON.parse(committed);
     expect(doc.source).toMatchObject({ name: "models.dev", commit: "7f91a155297c92203cc1111dac7f0ca42d478f22", license: "MIT", licenseText });
+  });
+
+  it("is checked out with LF on every platform", () => {
+    // Windows CI checks text out as CRLF unless .gitattributes says otherwise,
+    // and the snapshot and its licence text are compared byte for byte.
+    const paths = ["server/model-catalog/models-dev.snapshot.json", "third_party/models-dev/LICENSE", "third_party/opencode/LICENSE"];
+    const attrs = execFileSync("git", ["check-attr", "eol", "--", ...paths], { cwd: root, encoding: "utf8" });
+    expect(attrs.trim().split(/\r?\n/)).toEqual(paths.map((path) => `${path}: eol: lf`));
+  });
+
+  it("still passes when the working tree has CRLF line endings", () => {
+    const crlf = toLf(committed).replace(/\n/g, "\r\n");
+    expect(crlf).not.toBe(toLf(committed));
+    expect(snapshotProblems(crlf)).toEqual([]);
   });
 
   it("flags a brace or a hand edit", () => {

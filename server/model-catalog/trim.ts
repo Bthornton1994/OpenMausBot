@@ -118,6 +118,14 @@ export function containsBrace(value: unknown, depth = 0): boolean {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
+/** A map keyed by provider or model id. It has no prototype, so an id such as
+ * `constructor` or `toString` finds nothing unless the catalog lists it, and a
+ * `__proto__` key could not replace the prototype (it is also rejected). */
+const idMap = <T>(): Record<string, T> => Object.create(null) as Record<string, T>;
+
+/** Never a real id; as a plain-object key it would set the prototype. */
+const RESERVED_KEY = "__proto__";
+
 const finite = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 
@@ -150,7 +158,8 @@ function apiUrl(value: unknown): string | undefined {
 function trimModel(key: string, raw: unknown): CatalogModel | "skip" | "invalid" {
   if (!isRecord(raw)) return "invalid";
   if (raw.id !== undefined && raw.id !== key) return "invalid";
-  if (!key || key.length > 256 || CONTROL.test(key) || /\s/u.test(key)) return "invalid";
+  // The caller already drops a key with a brace; this is the backstop.
+  if (!key || key.length > 256 || key === RESERVED_KEY || hasBrace(key) || CONTROL.test(key) || /\s/u.test(key)) return "invalid";
   // Only models an agent can drive: current, tool-calling, text in.
   if (raw.status === "deprecated" || raw.tool_call !== true) return "skip";
   const modalities = isRecord(raw.modalities) ? raw.modalities : undefined;
@@ -196,7 +205,7 @@ function trimProvider(key: string, raw: unknown, options: TrimOptions): CatalogP
   const env = Array.isArray(raw.env) ? raw.env : [];
   if (!env.every((name): name is string => typeof name === "string" && ENV_NAME.test(name))) return drop("invalid");
 
-  const models: Record<string, CatalogModel> = {};
+  const models = idMap<CatalogModel>();
   if (isRecord(rawModels)) {
     let kept = 0;
     for (const modelKey of Object.keys(rawModels).sort()) {
@@ -224,9 +233,10 @@ function trimProvider(key: string, raw: unknown, options: TrimOptions): CatalogP
 
 /** models.dev api.json (or an already-trimmed catalog) → the trimmed,
  * brace-free provider map, sorted by provider and model id. Anything that is
- * not an object yields an empty map. */
+ * not an object yields an empty map. The provider map and every model map
+ * have no prototype, so looking up an id the catalog lacks gives undefined. */
 export function trimModelsDevCatalog(raw: unknown, options: TrimOptions = {}): CatalogProviders {
-  const providers: CatalogProviders = {};
+  const providers = idMap<CatalogProvider>();
   if (!isRecord(raw)) return providers;
   for (const key of Object.keys(raw).sort().slice(0, MAX_PROVIDERS)) {
     const provider = trimProvider(key, raw[key], options);
