@@ -29,7 +29,7 @@ import {
   resolveAntigravityRuntime,
 } from "./antigravity-runtime.ts";
 import { resolveAntigravityReleaseAsset } from "./antigravity-release.ts";
-import { scheduleAntigravityTempSweep } from "./antigravity-temp.ts";
+import { VERIFICATION_TEMP_KEY, scheduleAntigravityTempSweep } from "./antigravity-temp.ts";
 import { augmentedPath } from "../env-path.ts";
 
 export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
@@ -155,6 +155,8 @@ export const AntigravityDriver: ProviderDriver<AcpConfig> = {
     // this instance's folder under DATA_DIR/tmp/agy, only folders whose
     // process is gone; the system temp folder is cleaned only on request.
     scheduleAntigravityTempSweep(input.instanceId);
+    // The same for a runtime verification whose runtime would not stop.
+    scheduleAntigravityTempSweep(VERIFICATION_TEMP_KEY);
     const auth = new AntigravityAuthController();
     let installFailure: string | undefined;
     const runtimeAndProfile = async () => {

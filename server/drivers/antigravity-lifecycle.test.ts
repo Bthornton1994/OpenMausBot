@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -9,6 +9,7 @@ import { DATA_DIR } from "../config.ts";
 import { killCliTree, spawnCli } from "../procs.ts";
 import { AntigravityAcpClient, validateAntigravityRuntime } from "./antigravity-acp.ts";
 import type { AntigravityRuntime } from "./antigravity-runtime.ts";
+import { VERIFICATION_TEMP_KEY, antigravityTempDir } from "./antigravity-temp.ts";
 
 const scratch = vi.hoisted(() => [] as string[]);
 vi.mock("../procs.ts", () => ({ spawnCli: vi.fn(), killCliTree: vi.fn() }));
@@ -154,8 +155,14 @@ describe("Antigravity validation shutdown", () => {
     expect(existsSync(scratch[0])).toBe(true);
   });
 
-  it("unpacks the Windows verification run into OMB's own temp folder and removes it after close", async () => {
+  it("unpacks the Windows verification run into one shared, swept folder and clears it after close", async () => {
     fakeChild();
+    const shared = antigravityTempDir(DATA_DIR, VERIFICATION_TEMP_KEY);
+    // Left by an earlier verification whose runtime would not stop, and
+    // since gone (an ID no process can have); and one still running.
+    const abandoned = join(shared, "_MEI7ffffff02");
+    const running = join(shared, `_MEI${process.pid.toString(16).padStart(8, "0")}2`);
+    for (const folder of [abandoned, running]) mkdirSync(join(folder, "google3"), { recursive: true });
     // Nothing is spawned here (spawnCli is a fake), so the Windows branch can
     // run on every OS.
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -166,12 +173,15 @@ describe("Antigravity validation shutdown", () => {
       Object.defineProperty(process, "platform", platform);
     }
     const environment = vi.mocked(spawnCli).mock.calls[0][2].env!;
-    expect(environment.TEMP).toBeDefined();
-    expect(environment.TMP).toBe(environment.TEMP);
-    expect(environment.TEMP!.startsWith(join(DATA_DIR, "tmp", "agy"))).toBe(true);
+    // One fixed folder for every verification, so nothing a run leaves is
+    // orphaned under a name no later sweep looks at.
+    expect(environment.TEMP).toBe(shared);
+    expect(environment.TMP).toBe(shared);
     expect(environment.GEMINI_HOME).toBe(scratch[0]);
     expect(existsSync(scratch[0])).toBe(false);
-    expect(existsSync(environment.TEMP!)).toBe(false);
+    expect(existsSync(abandoned)).toBe(false);
+    expect(existsSync(running)).toBe(true);
+    rmSync(shared, { recursive: true, force: true });
   });
 
   it("ends the runtime's input first and stops it by force only after five seconds", async () => {

@@ -48,6 +48,13 @@ export function antigravityTempRoot(dataDir: string = DATA_DIR): string {
   return join(dataDir, "tmp", "agy");
 }
 
+/** Used in place of an instance ID for the one temp folder every runtime
+ * verification shares. It has a space, which no instance ID has, so no
+ * instance shares the folder. Being one fixed folder, what a verification
+ * leaves behind (a runtime that would not stop) is swept like an instance's
+ * leftovers: after the next verification and when the driver starts. */
+export const VERIFICATION_TEMP_KEY = "runtime verification";
+
 /** One stable, short temp folder per instance. Short, because the runtime
  * unpacks files up to 120 characters deep and Windows paths stop at 260.
  * Hashed, so instance IDs that differ only in case stay apart on
@@ -142,14 +149,19 @@ function ownedByDeadProcess(name: string, isAlive: (pid: number) => boolean): bo
   return pids !== null && !pids.some((pid) => isAlive(pid));
 }
 
-/** A real directory, not a link or junction to one. */
-async function realDirectory(path: string): Promise<boolean> {
+/** A real directory (not a link or junction to one), nothing there at all,
+ * or anything else. */
+async function entryKind(path: string): Promise<"directory" | "gone" | "other"> {
   try {
     const info = await lstat(path);
-    return info.isDirectory() && !info.isSymbolicLink();
-  } catch {
-    return false;
+    return info.isDirectory() && !info.isSymbolicLink() ? "directory" : "other";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "gone" : "other";
   }
+}
+
+async function realDirectory(path: string): Promise<boolean> {
+  return (await entryKind(path)) === "directory";
 }
 
 async function listDirectory(path: string): Promise<Dirent[]> {
@@ -261,17 +273,22 @@ async function folderBytes(directory: string, deadline = Infinity): Promise<{ by
 /** Claim a folder by renaming it, then delete it. On Windows the rename
  * fails while any process still has a file inside open (every live runtime
  * has its DLLs loaded), which is a second check after the process ID.
- * Returns the bytes freed, or null when the folder was left alone. */
-async function claimAndRemove(directory: string, countBytes: boolean): Promise<number | null> {
+ * Returns the bytes freed; "gone" when someone else (the automatic sweep and
+ * "Free up space" can pick the same folder) removed it first; or null when
+ * the folder was left alone. */
+async function claimAndRemove(directory: string, countBytes: boolean): Promise<number | "gone" | null> {
   const name = basename(directory);
   // Checked again at the last moment: the listing may be stale.
-  if (!(await realDirectory(directory))) return null;
+  const kind = await entryKind(directory);
+  if (kind !== "directory") return kind === "gone" ? "gone" : null;
   let claimed = directory;
   if (!name.startsWith(CLAIM_PREFIX)) {
     claimed = join(dirname(directory), `${CLAIM_PREFIX}${name}-${randomUUID().slice(0, 8)}`);
     try {
       await rename(directory, claimed);
-    } catch {
+    } catch (error) {
+      // Lost the race to another remover: the folder is gone, not in use.
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT" && (await entryKind(directory)) === "gone") return "gone";
       return null;
     }
   }
@@ -288,8 +305,9 @@ async function claimAndRemove(directory: string, countBytes: boolean): Promise<n
 const sweeps = new Map<string, Promise<number>>();
 
 /** Delete this instance's abandoned unpack folders. Runs when the driver
- * starts and before each launch. Touches nothing outside
- * dataDir/tmp/agy/<instance>. Returns how many folders it removed. */
+ * starts and before each launch (and, for VERIFICATION_TEMP_KEY, after each
+ * runtime verification). Touches nothing outside dataDir/tmp/agy/<instance>.
+ * Returns how many folders it removed. */
 export function sweepAntigravityTemp(instanceId: string, options: AntigravityTempOptions = {}): Promise<number> {
   const dataDir = options.dataDir ?? DATA_DIR;
   const key = antigravityTempDir(dataDir, instanceId);
@@ -300,7 +318,7 @@ export function sweepAntigravityTemp(instanceId: string, options: AntigravityTem
     let removed = 0;
     for (const directory of await ownedTempDirectories(dataDir, basename(key))) {
       for (const folder of await abandonedIn(directory, isAlive)) {
-        if (await claimAndRemove(folder, false) !== null) removed++;
+        if (typeof await claimAndRemove(folder, false) === "number") removed++;
       }
     }
     return removed;
@@ -364,13 +382,16 @@ export async function removeAntigravityLeftovers(options: LeftoverOptions = {}):
   const deadline = Date.now() + (options.budgetMs ?? 120_000);
   const candidates = await leftoverCandidates(options);
   let removed = 0;
+  let alreadyGone = 0;
   let freedBytes = 0;
   for (const candidate of candidates) {
     if (Date.now() > deadline) break;
     const bytes = await claimAndRemove(candidate.path, true);
-    if (bytes === null) continue;
+    if (bytes === "gone") alreadyGone++;
+    if (typeof bytes !== "number") continue;
     removed++;
     freedBytes += bytes;
   }
-  return { removed, freedBytes, remaining: candidates.length - removed };
+  // A folder another remover got to first is not "still in use".
+  return { removed, freedBytes, remaining: candidates.length - removed - alreadyGone };
 }

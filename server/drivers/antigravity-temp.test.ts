@@ -1,10 +1,12 @@
 // Antigravity's Windows unpack folders: where they go, and what may delete
 // them. Every test runs on every OS: Windows paths and process lookups are
 // injected, and the folders are real directories under a throwaway root.
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { removeTempDir } from "../testing/cleanup.ts";
 import {
@@ -19,8 +21,23 @@ import {
   unpackFolderOwnerPids,
 } from "./antigravity-temp.ts";
 
+// Runs just before the code under test renames (claims) a folder, so a test
+// can stage what another remover does in between. Unset: a plain rename.
+const beforeRename = vi.hoisted(() => ({ run: null as null | ((from: string) => void) }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...fs,
+    rename: async (...args: Parameters<typeof fs.rename>) => {
+      beforeRename.run?.(String(args[0]));
+      return fs.rename(...args);
+    },
+  };
+});
+
 const scratch: string[] = [];
 afterEach(async () => {
+  beforeRename.run = null;
   while (scratch.length) await removeTempDir(scratch.pop()!);
 });
 
@@ -201,8 +218,10 @@ describe("Free up space", () => {
 
   function fixture() {
     const dataDir = tempRoot("free");
-    // Resolved as the code resolves it (macOS keeps temp behind a link).
-    const systemTemp = realpathSync(tempRoot("free-system"));
+    // Resolved as the code resolves it, with the native call: macOS keeps
+    // temp behind a link, and Windows runners name it with an 8.3 short
+    // name (RUNNER~1) that only the native call expands.
+    const systemTemp = realpathSync.native(tempRoot("free-system"));
     const alive = new Set([0x1111]);
     const folders = {
       app: unpackFolder(antigravityTempDir(dataDir, "work"), hexName(0x2222), { bytes: 4_000 }),
@@ -251,6 +270,35 @@ describe("Free up space", () => {
     expect(scan.folders.map((folder) => folder.path)).toEqual([folders.app]);
     await removeAntigravityLeftovers({ ...options, platform: "linux" });
     expect(existsSync(folders.leftover)).toBe(true);
+  });
+
+  it("does not call a folder another remover got to first still in use", async () => {
+    // The automatic sweep and "Free up space" can pick the same folder.
+    const dataDir = tempRoot("race-listed");
+    const listed = unpackFolder(antigravityTempDir(dataDir, "work"), hexName(0x2222));
+    // Gone between the listing and the claim.
+    const isAlive = () => { rmSync(listed, { recursive: true, force: true }); return false; };
+    expect(await removeAntigravityLeftovers({ dataDir, isAlive, platform: "linux" }))
+      .toEqual({ removed: 0, remaining: 0, freedBytes: 0 });
+
+    // Claimed by the other remover between the last check and the rename.
+    const racedDir = tempRoot("race-claimed");
+    const raced = unpackFolder(antigravityTempDir(racedDir, "work"), hexName(0x2222));
+    beforeRename.run = (from) => {
+      if (from === raced) renameSync(raced, join(dirname(raced), `.omb-removing-${hexName(0x2222)}-0therone`));
+    };
+    expect(await removeAntigravityLeftovers({ dataDir: racedDir, isAlive: () => false, platform: "linux" }))
+      .toEqual({ removed: 0, remaining: 0, freedBytes: 0 });
+  });
+
+  it("still reports a folder it could not claim because it is in use", async () => {
+    const dataDir = tempRoot("in-use");
+    const busy = unpackFolder(antigravityTempDir(dataDir, "work"), hexName(0x2222));
+    // What Windows answers while the runtime still has its DLLs loaded.
+    beforeRename.run = () => { throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" }); };
+    expect(await removeAntigravityLeftovers({ dataDir, isAlive: () => false, platform: "linux" }))
+      .toEqual({ removed: 0, remaining: 1, freedBytes: 0 });
+    expect(existsSync(busy)).toBe(true);
   });
 
   it("reports a lower bound when counting runs out of time", async () => {

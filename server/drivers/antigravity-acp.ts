@@ -10,7 +10,12 @@ import { killCliTree, spawnCli } from "../procs.ts";
 import type { ModelCatalog } from "../contracts.ts";
 import type { ChildProcess } from "node:child_process";
 import type { AntigravityRuntime } from "./antigravity-runtime.ts";
-import { antigravityTempDir, setAntigravityTempEnvironment } from "./antigravity-temp.ts";
+import {
+  VERIFICATION_TEMP_KEY,
+  antigravityTempDir,
+  setAntigravityTempEnvironment,
+  sweepAntigravityTemp,
+} from "./antigravity-temp.ts";
 
 // Printed on stderr by Google's server, not stdout.
 export const ANTIGRAVITY_AUTH_PREFIX = "Open the following link to authenticate the ACP server: ";
@@ -355,8 +360,10 @@ export class AntigravityAcpClient {
 
   /** End the runtime's input and let it exit by itself, so it removes what
    * it unpacked; stop it by force only if it is still running after
-   * GRACEFUL_EXIT_MS. killCliTree also runs after a clean exit, to reap any
-   * helper process still in the group. */
+   * GRACEFUL_EXIT_MS. killCliTree also runs after a clean exit. On macOS and
+   * Linux that reaps any helper still in the process group. On Windows it
+   * does nothing once the runtime has exited (procs.ts stopCliTree), so a
+   * helper that outlives a clean exit is left running, as in the ACP pool. */
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -587,12 +594,13 @@ export async function validateAntigravityRuntime(runtime: AntigravityRuntime, ex
   let failed = false;
   let failure: unknown;
   try {
-    // On Windows this run unpacks into its own folder under DATA_DIR/tmp/agy,
-    // like every other launch. It is removed below once the runtime is gone.
+    // On Windows every verification unpacks into one shared folder under
+    // DATA_DIR/tmp/agy, swept below once the runtime is gone.
     const profile = await prepareAntigravityProfile({
       instanceId: `verify-${randomUUID()}`,
       runtime,
       profileDirectory,
+      tempDirectory: antigravityTempDir(DATA_DIR, VERIFICATION_TEMP_KEY),
     });
     tempDirectory = profile.tempDirectory;
     client = new AntigravityAcpClient(runtime, profile, profileDirectory);
@@ -619,12 +627,17 @@ export async function validateAntigravityRuntime(runtime: AntigravityRuntime, ex
     }
   }
   if (stopped) {
-    for (const directory of [profileDirectory, tempDirectory]) {
-      if (!directory) continue;
-      await rm(directory, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 })
-        .catch((error) => {
-          console.warn(`antigravity: could not remove verification files ${directory}: ${error instanceof Error ? error.message : String(error)}`);
-        });
+    await rm(profileDirectory, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 })
+      .catch((error) => {
+        console.warn(`antigravity: could not remove verification files ${profileDirectory}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    // The temp folder is shared, so only unpack folders whose process is
+    // gone go: this run's, and any an earlier run left when its runtime
+    // would not stop.
+    if (tempDirectory) {
+      await sweepAntigravityTemp(VERIFICATION_TEMP_KEY).catch((error) => {
+        console.warn(`antigravity: could not clear verification files: ${error instanceof Error ? error.message : String(error)}`);
+      });
     }
   }
   if (failed) throw failure;

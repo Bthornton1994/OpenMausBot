@@ -33,7 +33,7 @@ import {
 } from "./antigravity-release.ts";
 import { installAntigravityRuntime, resolveAntigravityRuntime } from "./antigravity-runtime.ts";
 import * as antigravityTemp from "./antigravity-temp.ts";
-import { antigravityTempDir, sweepAntigravityTemp } from "./antigravity-temp.ts";
+import { VERIFICATION_TEMP_KEY, antigravityTempDir, sweepAntigravityTemp } from "./antigravity-temp.ts";
 import {
   AntigravityDriver,
   STATIC_ANTIGRAVITY_MODELS,
@@ -611,8 +611,12 @@ describe("official Antigravity runtime", () => {
     const instanceId = "antigravity-leftovers";
     // Owned by an ID no process can have, so it is certainly abandoned.
     const abandoned = join(antigravityTempDir(DATA_DIR, instanceId), `_MEI7ffffff02`);
-    mkdirSync(join(abandoned, "google3"), { recursive: true });
-    writeFileSync(join(abandoned, "google3", "payload.bin"), "unpacked");
+    // And one a runtime verification left when its runtime would not stop.
+    const verification = join(antigravityTempDir(DATA_DIR, VERIFICATION_TEMP_KEY), `_MEI7ffffff03`);
+    for (const folder of [abandoned, verification]) {
+      mkdirSync(join(folder, "google3"), { recursive: true });
+      writeFileSync(join(folder, "google3", "payload.bin"), "unpacked");
+    }
     const scheduled = vi.spyOn(antigravityTemp, "scheduleAntigravityTempSweep");
     const instance = await AntigravityDriver.create({
       instanceId,
@@ -623,8 +627,11 @@ describe("official Antigravity runtime", () => {
     });
     try {
       expect(scheduled).toHaveBeenCalledWith(instanceId);
+      expect(scheduled).toHaveBeenCalledWith(VERIFICATION_TEMP_KEY);
       await sweepAntigravityTemp(instanceId);
+      await sweepAntigravityTemp(VERIFICATION_TEMP_KEY);
       expect(existsSync(abandoned)).toBe(false);
+      expect(existsSync(verification)).toBe(false);
     } finally {
       await instance.dispose();
     }
@@ -727,6 +734,9 @@ describe("Antigravity driver over shared ACP", () => {
         FAKE_ACP_MODELS: "gemini-3.8-flash-high,gemini-3.8-flash-low",
         FAKE_ACP_MODES: "default,yolo,auto_edit",
         FAKE_ACP_DUMP: dump,
+        // Inherited temp folders: replaced on Windows, passed through elsewhere.
+        TEMP: fake.directory,
+        TMP: fake.directory,
       },
       enabled: true,
       config: { cli: fake.executable, fullAuto: false },
@@ -759,8 +769,10 @@ describe("Antigravity driver over shared ACP", () => {
     ]);
     const mcp = JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8"));
     expect(mcp).toEqual([{ name: "docs", command: "docs-mcp", args: ["serve"], env: [{ name: "TOKEN", value: "scoped" }] }]);
-    // The real launch path on Windows unpacks into OMB's own folder.
-    if (process.platform === "win32") expect(dumpState.env.TEMP).toBe(antigravityTempDir(DATA_DIR, instanceId));
+    // The real launch path on Windows unpacks into OMB's own folder. Checked
+    // on every OS, so the macOS and Linux runs prove the dump carries TEMP.
+    const expectedTemp = process.platform === "win32" ? antigravityTempDir(DATA_DIR, instanceId) : fake.directory;
+    expect([dumpState.env.TEMP, dumpState.env.TMP]).toEqual([expectedTemp, expectedTemp]);
   });
 
   it("fails closed when Antigravity does not confirm its permission mode", async () => {
