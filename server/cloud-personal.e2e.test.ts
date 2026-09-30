@@ -8,10 +8,11 @@
 // key: the owner's old phone, and a friend the owner unpaired before the
 // upgrade, cannot be told apart, so both are adopted for who opened a
 // conversation and its level, and only proven keys reach lending and memory.
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -29,7 +30,7 @@ let child: ChildProcess | undefined;
 let cloud = false;
 /** From the first (self-hosted) run: a device with full access, a chat-only one, and what each opened. */
 const before = { device: "", deviceId: "", chatOnly: "", bot: { id: "", threadId: "" }, roomBot: { id: "", threadId: "" }, conversation: "", theirs: "",
-  lead: { id: "", threadId: "" }, member: { id: "", threadId: "" }, room: "", launch: "", plan: "", friends: "", routine: "" };
+  lead: { id: "", threadId: "" }, member: { id: "", threadId: "" }, room: "", launch: "", plan: "", friends: "", routine: "", approved: "", full: { id: "", threadId: "" } };
 const project = () => join(home, "projects", "site");
 
 async function api(method: string, path: string, options: { body?: unknown; token?: string } = {}) {
@@ -57,6 +58,7 @@ async function adminPairing(): Promise<string> {
 const held = () => join(home, "held.json");
 /** Polls until `check` holds (expect.poll works only inside a test). */
 let lastBusy = "";
+const proxies: ChildProcess[] = [];
 async function until(check: () => boolean | Promise<boolean>, what: string, timeout = 15_000) {
   const deadline = Date.now() + timeout;
   while (!(await check())) {
@@ -68,8 +70,11 @@ async function until(check: () => boolean | Promise<boolean>, what: string, time
 async function turn(start: () => Promise<unknown>) {
   rmSync(held(), { force: true });
   await start();
-  await until(() => existsSync(held()), "a turn to start");
-  const dump = JSON.parse(readFileSync(held(), "utf8"));
+  // The engine writes its dump as it starts: wait until it is whole.
+  let dump: any;
+  await until(() => {
+    try { dump = JSON.parse(readFileSync(held(), "utf8")); return true; } catch { return false; }
+  }, "a turn to start", 30_000);
   const argv = dump.argv as string[];
   return { mode: argv[argv.indexOf("--permission-mode") + 1], cwd: realpathSync(dump.cwd), restricted: argv.includes("--restricted") };
 }
@@ -149,6 +154,10 @@ await import(${JSON.stringify(pathToFileURL(join(SERVER_DIR, "testing", "fake-cl
   // The chat-only device's own conversation is the room bot's active one.
   before.roomBot = await newBot("Room bot");
   before.theirs = (await api("POST", `/api/bots/${before.roomBot.id}/tasks`, { token: before.chatOnly, body: { title: "Theirs" } })).body.task.threadId;
+  // It ran there once, in the bot's project folder.
+  expect((await turn(() => api("POST", `/api/bots/${before.roomBot.id}/messages`, { token: before.chatOnly, body: { text: "Hello.", threadId: before.theirs } }))).cwd).toBe(realpathSync(project()));
+  await api("POST", `/api/bots/${before.roomBot.id}/interrupt`, { token: before.device, body: { threadId: before.theirs } });
+  await idle(before.roomBot, before.device);
   expect((await api("GET", "/api/bots", { token: before.device })).body.bots.find((bot: any) => bot.id === before.roomBot.id).threadId).toBe(before.theirs);
   // The device also wrote in a room of two bots.
   before.lead = await newBot("Lead");
@@ -185,15 +194,47 @@ await import(${JSON.stringify(pathToFileURL(join(SERVER_DIR, "testing", "fake-cl
     await api("POST", `/api/bots/${before.bot.id}/interrupt`, { token: before.device, body: { threadId } });
     await idle(before.bot, before.device);
   }
+  before.full = (await api("POST", "/api/bots", { token: before.device, body: { name: "Full bot", modelSelection: { instanceId: "held", model: "claude-sonnet-5" } } })).body.bot;
+  // A routine the bot proposed in the owner's conversation, which the owner allowed on its card.
+  const asking = (await api("POST", `/api/bots/${before.bot.id}/tasks`, { token: before.device, body: { title: "Schedule it" } })).body.task.threadId;
+  await turn(() => api("POST", `/api/bots/${before.bot.id}/messages`, { token: before.device, body: { text: "Check the site monthly.", threadId: asking } }));
+  const proposed = await (await agentTools())("propose_routine", { name: "Monthly check", instructions: "Check the site.",
+    schedule: { type: "cron", expression: "0 9 1 * *", timeZone: "America/New_York" } });
+  expect(JSON.stringify(proposed)).not.toContain("isError\":true");
+  const card = ((await api("GET", `/api/threads/${asking}/messages`, { token: before.device })).body.messages as any[]).findLast((message) => message.card?.routineRequest)?.card;
+  const approved = await api("POST", `/api/bots/${before.bot.id}/respond`, { token: before.device, body: { threadId: asking, requestId: card.requestId, behavior: "allow" } });
+  expect(approved.body.outcome, JSON.stringify(approved.body)).toBe("allowed-once");
+  before.approved = approved.body.resultId;
+  await api("POST", `/api/bots/${before.bot.id}/interrupt`, { token: before.device, body: { threadId: asking } });
+  await idle(before.bot, before.device);
   before.routine = (await api("POST", "/api/routines", { token: before.device, body: { name: "From before", prompt: "Run the build script.", botId: before.bot.id,
     enabled: false, schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } } })).body.routine.id;
   for (const id of [phoneId, friendId]) expect((await api("DELETE", `/api/auth/sessions/${id}`, { token: before.device })).status).toBe(200);
   await shutdown();
+  // A bot at Full access (set where only the desktop app can set it: its record).
+  const bots = JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"));
+  const record = Array.isArray(bots) ? bots : bots.bots;
+  const full = record.find((bot: any) => bot.id === before.full.id);
+  full.approvalMode = "full";
+  delete full.approvalGrant;
+  writeFileSync(join(dataDir, "bots.json"), JSON.stringify(bots));
+  // A v0.1.91 Cloud home recorded who allowed a card by their device's key (a
+  // self-hosted server records no key): write it the way that release did.
+  const db = new DatabaseSync(join(dataDir, "messages.db"));
+  try {
+    const cards = db.prepare("SELECT thread_id, id, json FROM messages WHERE thread_id = ?").all(asking) as Array<{ thread_id: string; id: string; json: string }>;
+    const deviceKey = `p_${createHash("sha256").update(`session:${before.deviceId}`).digest("base64url").slice(0, 22)}`;
+    for (const row of cards) {
+      const message = JSON.parse(row.json);
+      if (!message.card?.routineRequest) continue;
+      message.card.answeredBy = { ...message.card.answeredBy, kind: "session", person: deviceKey };
+      db.prepare("UPDATE messages SET json = ? WHERE thread_id = ? AND id = ?").run(JSON.stringify(message), row.thread_id, row.id);
+    }
+  } finally { db.close(); }
   // Then the same data boots as the person's Cloud home.
   await boot(true);
 }, 120_000);
 
-const proxies: ChildProcess[] = [];
 /** The agents MCP tools of the held turn that just started. */
 async function agentTools() {
   const agents = JSON.parse(readFileSync(held(), "utf8")).mcpConfig.mcpServers.agents;
@@ -218,6 +259,8 @@ afterAll(async () => {
 
 it("boots without anyone else's session: the chat-only device is signed out, and only the owner's devices are listed", async () => {
   expect(log).toContain("cloud home: revoked 1 session that was not the owner's own device");
+  // Once: review what is paired, now that every device there is the owner's.
+  expect(log).toContain("Review Settings → Remote access → Paired devices");
   for (const path of ["/api/auth/session", "/api/bots", `/api/threads/${before.theirs}/messages`]) {
     expect((await api("GET", path, { token: before.chatOnly })).status, path).toBe(401);
   }
@@ -309,8 +352,21 @@ it("a line the owner's old phone wrote in a room, unpaired before the upgrade, i
   }, "the handoff to stop");
 }, 60_000);
 
+/** Stop whatever an earlier test left running on these bots. */
+async function settleAll(token: string) {
+  await until(async () => {
+    const bots = (await api("GET", "/api/bots", { token })).body.bots as any[];
+    for (const bot of bots.filter((candidate) => candidate.busy)) {
+      for (const task of bot.tasks ?? []) await api("POST", `/api/bots/${bot.id}/interrupt`, { token, body: { threadId: task.threadId } });
+    }
+    for (const room of [before.room, before.launch].filter(Boolean)) await api("POST", `/api/groups/${room}/interrupt`, { token, body: {} });
+    return bots.every((bot) => !bot.busy);
+  }, "every bot to settle", 30_000);
+}
+
 it("a friend unpaired before the upgrade: their conversation keeps its level, but their words never reach lending, memory or recall", async () => {
   const owner = await adminPairing();
+  await settleAll(owner);
   // Adopted for who opened it and its level (the owner cannot be told apart from them).
   const theirs = await turn(async () => expect((await api("POST", `/api/bots/${before.bot.id}/messages`, { token: owner, body: { text: "Carry on.", threadId: before.friends } })).status).toBe(202));
   expect(theirs).toMatchObject({ mode: "auto", restricted: false });
@@ -335,6 +391,7 @@ it("a friend unpaired before the upgrade: their conversation keeps its level, bu
 
 it("routines fail closed: one from before with no proof runs confined; one the owner writes here, or one made from their bot template, reports into a conversation that stays theirs", async () => {
   const owner = await adminPairing();
+  await settleAll(owner);
   const routineRun = async (id: string) => {
     const run = await turn(async () => expect((await api("POST", `/api/routines/${id}/run`, { token: owner })).status).toBe(201));
     const routine = (await api("GET", "/api/routines", { token: owner })).body.routines.find((candidate: any) => candidate.id === id);
@@ -351,6 +408,8 @@ it("routines fail closed: one from before with no proof runs confined; one the o
   // From before, with no proof it is the owner's: nobody's, confined.
   const old = await routineRun(before.routine);
   expect(old.run).toMatchObject({ mode: "default", restricted: true });
+  // From before, proposed by the bot and allowed on its card by the owner's device: theirs.
+  expect((await routineRun(before.approved)).run).toMatchObject({ mode: "auto", restricted: false });
   // The owner writes one here: theirs, and so is the conversation it reports into.
   const mine = (await api("POST", "/api/routines", { token: owner, body: { name: "Mine", prompt: "Run the build script.", botId: before.bot.id,
     enabled: false, schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } } })).body.routine.id;
@@ -370,4 +429,54 @@ it("routines fail closed: one from before with no proof runs confined; one the o
   await idle(templated, owner);
   const results = (await api("GET", "/api/routines", { token: owner })).body.routines.find((candidate: any) => candidate.id === routineId).resultsThreadId;
   expect(await followUp(templated, results)).toMatchObject({ restricted: false });
-}, 120_000);
+  // Turning it on (or retiming it) keeps it the owner's.
+  expect((await api("PATCH", `/api/routines/${routineId}`, { token: owner, body: { enabled: true } })).status).toBe(200);
+  expect((await api("PATCH", `/api/routines/${routineId}`, { token: owner, body: { enabled: false } })).status).toBe(200);
+  const toggled = await turn(async () => expect((await api("POST", `/api/routines/${routineId}/run`, { token: owner })).status).toBe(201));
+  expect(toggled).toMatchObject({ mode: "auto", restricted: false });
+  for (const active of (await api("GET", "/api/routines", { token: owner })).body.runs ?? []) await api("POST", `/api/routine-runs/${active.id}/cancel`, { token: owner });
+  await idle(templated, owner);
+  // A bot's proposal the owner allows on its card here: theirs.
+  const asking = (await api("POST", `/api/bots/${before.bot.id}/tasks`, { token: owner, body: { title: "Schedule another" } })).body.task.threadId;
+  await turn(async () => expect((await api("POST", `/api/bots/${before.bot.id}/messages`, { token: owner, body: { text: "Check the docs monthly.", threadId: asking } })).status).toBe(202));
+  const call = await agentTools();
+  const cards: any[] = [];
+  for (const name of ["Docs check", "Links check"]) {
+    const proposed = await call("propose_routine", { name, instructions: `${name}.`, schedule: { type: "cron", expression: "0 9 1 * *", timeZone: "America/New_York" } });
+    expect(JSON.stringify(proposed)).not.toContain("isError\":true");
+    cards.push(((await api("GET", `/api/threads/${asking}/messages`, { token: owner })).body.messages as any[]).findLast((message) => message.card?.routineRequest)?.card);
+  }
+  // Allowed from the bot's card, and from the conversation's.
+  const approved = await api("POST", `/api/bots/${before.bot.id}/respond`, { token: owner, body: { threadId: asking, requestId: cards[0].requestId, behavior: "allow" } });
+  expect(approved.body.outcome, JSON.stringify(approved.body)).toBe("allowed-once");
+  const alsoApproved = await api("POST", `/api/threads/${asking}/respond`, { token: owner, body: { requestId: cards[1].requestId, behavior: "allow" } });
+  expect(alsoApproved.body.outcome, JSON.stringify(alsoApproved.body)).toBe("allowed-once");
+  expect((await api("POST", `/api/bots/${before.bot.id}/interrupt`, { token: owner, body: { threadId: asking } })).status).toBe(200);
+  await idle(before.bot, owner);
+  // Recorded as the owner's as it stands: their key, their fingerprint (so its
+  // reports never count as someone else's words, and it may use the Mac).
+  const ownerKey = `p_${createHash("sha256").update("cloud-owner:3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93").digest("base64url").slice(0, 22)}`;
+  const authors = JSON.parse(readFileSync(join(dataDir, "lending-routines.json"), "utf8"));
+  for (const id of [approved.body.resultId, alsoApproved.body.resultId]) {
+    expect(authors.writers[id]).toBe(ownerKey);
+    expect(authors.routines[id]).toMatch(/^[a-f0-9]{64}$/);
+  }
+  expect((await routineRun(approved.body.resultId)).run).toMatchObject({ mode: "auto", restricted: false });
+}, 150_000);
+
+it("a routine a Full-access bot applies at once in the owner's own conversation is the owner's", async () => {
+  const owner = await adminPairing();
+  await settleAll(owner);
+  const mine = (await api("POST", `/api/bots/${before.full.id}/tasks`, { token: owner, body: { title: "Mine" } })).body.task.threadId;
+  await turn(async () => expect((await api("POST", `/api/bots/${before.full.id}/messages`, { token: owner, body: { text: "Check the site monthly.", threadId: mine } })).status).toBe(202));
+  const proposed = JSON.stringify(await (await agentTools())("propose_routine", { name: "Applied at once", instructions: "Check the site.",
+    schedule: { type: "cron", expression: "0 9 1 * *", timeZone: "America/New_York" } }));
+  expect(proposed).not.toContain("isError\":true");
+  const routine = (await api("GET", "/api/routines", { token: owner })).body.routines.find((candidate: any) => candidate.name === "Applied at once");
+  expect(routine, proposed).toBeTruthy();
+  const ownerKey = `p_${createHash("sha256").update("cloud-owner:3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93").digest("base64url").slice(0, 22)}`;
+  const authors = JSON.parse(readFileSync(join(dataDir, "lending-routines.json"), "utf8"));
+  expect(authors.writers[routine.id]).toBe(ownerKey);
+  expect(authors.routines[routine.id]).toMatch(/^[a-f0-9]{64}$/);
+  expect((await api("POST", `/api/bots/${before.full.id}/interrupt`, { token: owner, body: { threadId: mine } })).status).toBe(200);
+}, 60_000);

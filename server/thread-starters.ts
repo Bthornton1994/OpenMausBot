@@ -55,17 +55,17 @@ export class ThreadStarters {
   }
 
   /** Name `to` for every thread whose person `move` accepts: a one-time
-   * migration (server/cloud-owner.ts), not an ordinary record. How many
-   * threads changed. */
-  reassign(move: (person: string) => boolean, to: string): number {
-    if (!KEY.test(to)) return 0;
-    let moved = 0;
+   * migration (server/cloud-owner.ts), not an ordinary record. The threads
+   * that changed. */
+  reassign(move: (person: string) => boolean, to: string): string[] {
+    if (!KEY.test(to)) return [];
+    const moved: string[] = [];
     for (const [threadId, person] of this.starters) {
       if (person === to || !move(person)) continue;
       this.starters.set(threadId, to);
-      moved += 1;
+      moved.push(threadId);
     }
-    if (moved) writeFileAtomic(this.file, JSON.stringify(Object.fromEntries(this.starters)) + "\n", { mode: 0o600 });
+    if (moved.length) writeFileAtomic(this.file, JSON.stringify(Object.fromEntries(this.starters)) + "\n", { mode: 0o600 });
     return moved;
   }
 

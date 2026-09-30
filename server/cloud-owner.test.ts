@@ -23,6 +23,12 @@ interface World {
   routines: string[];
   senders: string[];
   answerers: string[];
+  /** A routine a bot proposed, and who allowed its card. */
+  approvals: Array<[string, string]>;
+  /** The conversation each routine reports into. */
+  results: Record<string, string>;
+  paused: string[];
+  unpinned: string[];
 }
 function world(): World {
   const dir = folder();
@@ -43,6 +49,10 @@ function world(): World {
     // guest wrote in the owner's conversation; the phone answered a card.
     senders: [key("desktop"), key("phone"), key("former"), key("guest")],
     answerers: [key("phone")],
+    approvals: [],
+    results: {},
+    paused: [],
+    unpinned: [],
   };
 }
 type Hook = (step: string) => void;
@@ -58,13 +68,16 @@ function options(w: World, hook: Hook = () => {}, extra: Partial<CloudOwnershipO
     starters: { people: () => starters.people(), reassign: (move, to) => { hook(`starters→${to === OWNER ? "owner" : "nobody"}`); return starters.reassign(move, to); } },
     writers: {
       people: () => new Set(Object.values(w.writers)),
-      reassign: (move, to) => { hook("writers→nobody"); let n = 0; for (const [id, p] of Object.entries(w.writers)) if (p !== to && move(p)) { w.writers[id] = to; n++; } return n; },
+      reassign: (move, to) => { hook("writers→nobody"); const moved: string[] = []; for (const [id, p] of Object.entries(w.writers)) if (p !== to && move(p)) { w.writers[id] = to; moved.push(id); } return moved; },
     },
     routines: {
       ids: () => w.routines, writer: (id) => w.writers[id], fingerprinted: (id) => w.fingerprinted.includes(id),
+      resultsOpener: (id) => w.results[id] ? starters.get(w.results[id]) : undefined,
       name: (id, person) => { hook("routine"); w.writers[id] = person; },
+      pause: (ids) => { hook("pause"); w.paused.push(...ids); },
     },
-    lines: () => { hook("lines"); return { senders: w.senders, answerers: w.answerers }; },
+    unpin: (threads) => { hook("unpin"); w.unpinned.push(...threads); },
+    lines: () => { hook("lines"); return { senders: w.senders, answerers: w.answerers, approvals: w.approvals }; },
     log: (line) => log.push(line),
     ...extra,
   };
@@ -111,7 +124,7 @@ describe("a Cloud home is personal: settling who its owner was (server/cloud-own
     snapshot("start");
     settleCloudOwnership(options(first, (step) => { steps.push(step); snapshot(`before ${step} #${steps.length}`); }));
     snapshot("end");
-    expect(steps).toEqual(["revoke", "starters→nobody", "writers→nobody", "lines", "starters→owner", "routine", "routine", "routine"]);
+    expect(steps).toEqual(["revoke", "starters→nobody", "unpin", "writers→nobody", "lines", "starters→owner", "routine", "routine", "routine"]);
     for (const { step, state } of snapshots) {
       const settled = settleCloudOwnership(options(state));
       expect(settled.adopted.has(key("guest")), step).toBe(false);
@@ -183,5 +196,63 @@ describe("a Cloud home is personal: settling who its owner was (server/cloud-own
       }
       expect(existsSync(join(w.dir, "cloud-owner.json"))).toBe(true);
     }
+  });
+
+  it("what a revoked session opened loses its folder and its routines stop; the owner is told once to review their devices", () => {
+    const w = world();
+    w.writers = { theirs: key("guest"), mine: key("desktop") };
+    w.routines = ["theirs", "mine"];
+    const log: string[] = [];
+    settleCloudOwnership(options(w, undefined, {}, log));
+    expect(w.unpinned).toEqual(["guest"]);
+    expect(w.paused).toEqual(["theirs"]);
+    expect(log.filter((line) => line.includes("Paired devices"))).toHaveLength(1);
+    const again: string[] = [];
+    settleCloudOwnership(options(w, undefined, {}, again));
+    expect(again.join("\n")).not.toContain("Paired devices");
+    expect(w.paused).toEqual(["theirs"]);
+  });
+
+  it("a routine a bot proposed is the owner's when a proven key allowed its card; an adopted key's approval is not proof", () => {
+    const w = world();
+    w.routines = ["byPhone", "byFormer", "byNobody"];
+    // The phone answered cards (proven); the former guest only wrote lines (adopted).
+    w.approvals = [["byPhone", key("phone")], ["byFormer", key("former")]];
+    settleCloudOwnership(options(w));
+    expect(w.writers).toEqual({ byPhone: OWNER, byFormer: NOBODY, byNobody: NOBODY });
+  });
+
+  it("a restore is proof only for routines reporting into a conversation that names nobody yet or the owner", () => {
+    const w = world();
+    settleCloudOwnership(options(w));
+    // A backup from before: the former guest (adopted, unproven) opened one results conversation.
+    writeFileSync(join(w.dir, "thread-starters.json"), JSON.stringify({ friends: key("former"), desks: key("desktop") }));
+    w.routines = ["unnamed", "desks", "friends"];
+    w.writers = {};
+    w.fingerprinted = [];
+    w.results = { desks: "desks", friends: "friends" };
+    settleCloudOwnership(options(w, undefined, { restoredNow: "restore-1" }));
+    expect(w.writers).toEqual({ unnamed: OWNER, desks: OWNER, friends: NOBODY });
+  });
+
+  it("a restore whose start ended before it was recorded is settled at the next; an old one at the very first start is not", () => {
+    const w = world();
+    settleCloudOwnership(options(w, undefined, { lastRestore: "long-ago" }));
+    // The old restore was the first settlement's data: its routines needed proof.
+    expect(w.writers).toEqual({ owners: OWNER, template: NOBODY, guests: NOBODY });
+    expect(JSON.parse(readFileSync(join(w.dir, "cloud-owner.json"), "utf8")).settledRestore).toBe("long-ago");
+    // A new restore is applied, and that start ends before the settlement
+    // runs: the next start only knows it as the last restore on record.
+    w.routines = ["moved"];
+    w.writers = {};
+    w.fingerprinted = [];
+    const next = options(w, undefined, { lastRestore: "restore-2" });
+    settleCloudOwnership(next);
+    expect(w.writers).toEqual({ moved: OWNER });
+    expect(JSON.parse(readFileSync(join(w.dir, "cloud-owner.json"), "utf8")).settledRestore).toBe("restore-2");
+    // …and only once.
+    w.writers = { moved: NOBODY };
+    settleCloudOwnership(options(w, undefined, { lastRestore: "restore-2" }));
+    expect(w.writers).toEqual({ moved: NOBODY });
   });
 });

@@ -21,8 +21,11 @@
 //   owner unpaired before is indistinguishable from an owner's old device,
 //   so its lines never count as the owner's there.
 // Routines fail closed: a routine's writer is the owner only with proof (the
-// owner's key as its writer, the owner's fingerprint, #2023, or a restore
-// the owner started); every other routine is nobody's, and runs confined.
+// owner's key as its writer, the owner's fingerprint, #2023, a proposal the
+// owner approved on its card, or a restore the owner started whose results
+// conversation is theirs); every other routine is nobody's, and runs
+// confined. What a revoked session opened loses its working folder (its next
+// turn gets a private one), and its routines are paused.
 import { lstatSync, readFileSync } from "node:fs";
 import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
@@ -42,13 +45,17 @@ const recordFile = z.object({
   settled: z.boolean(),
   /** A restore applied here whose data is not settled yet. */
   pendingRestore: z.string().max(128).optional(),
+  /** The last restore whose data is settled (a restore applied at a start
+   * that ended before recording it is found this way at the next). */
+  settledRestore: z.string().max(128).optional(),
 }).strict();
 type OwnershipRecord = z.infer<typeof recordFile>;
 
-/** Something that names people by key: thread openers, routine writers. */
+/** Something that names people by key: thread openers, routine writers.
+ * `reassign` returns the ids (threads, routines) it moved. */
 export interface PeopleRecord {
   people(): Iterable<string>;
-  reassign(move: (person: string) => boolean, to: string): number;
+  reassign(move: (person: string) => boolean, to: string): string[];
 }
 
 export interface CloudOwnershipOptions {
@@ -64,13 +71,22 @@ export interface CloudOwnershipOptions {
   personKey(session: { id: string; email?: string }): string;
   starters: PeopleRecord;
   writers: PeopleRecord;
-  /** Each routine, its recorded writer, and whether the owner's fingerprint
-   * is on it as it stands (#2023); `name` records its writer. */
-  routines: { ids(): Iterable<string>; writer(id: string): string | undefined; fingerprinted(id: string): boolean; name(id: string, person: string): void };
-  /** Everyone who wrote a user line (not a bot's) and who answered a card, anywhere. */
-  lines(): { senders: Iterable<string>; answerers: Iterable<string> };
+  /** Each routine, its recorded writer, whether the owner's fingerprint is
+   * on it as it stands (#2023), and who opened the conversation it reports
+   * into; `name` records its writer, `pause` turns it off. */
+  routines: {
+    ids(): Iterable<string>; writer(id: string): string | undefined; fingerprinted(id: string): boolean; resultsOpener(id: string): string | undefined;
+    name(id: string, person: string): void; pause(ids: readonly string[]): void;
+  };
+  /** A conversation's working folder is no longer pinned: its next turn pins its own. */
+  unpin(threadIds: readonly string[]): void;
+  /** Everyone who wrote a user line (not a bot's) and who answered a card,
+   * anywhere, and who approved each routine a bot proposed (its card). */
+  lines(): { senders: Iterable<string>; answerers: Iterable<string>; approvals: Iterable<[routineId: string, person: string]> };
   /** The id of a restore applied at this boot: what it brought is the owner's. */
   restoredNow?: string;
+  /** The id of the last restore on record here, applied at this boot or before. */
+  lastRestore?: string;
   log(line: string): void;
 }
 
@@ -82,8 +98,8 @@ export interface CloudOwnership {
   proven: ReadonlySet<string>;
 }
 
-function readRecord(options: CloudOwnershipOptions): OwnershipRecord {
-  const fresh: OwnershipRecord = { version: 2, machineId: options.machineId, revokedKeys: [], adoptedKeys: [], provenKeys: [], settled: false };
+function readRecord(options: CloudOwnershipOptions): OwnershipRecord & { fresh?: true } {
+  const fresh: OwnershipRecord & { fresh?: true } = { version: 2, machineId: options.machineId, revokedKeys: [], adoptedKeys: [], provenKeys: [], settled: false, fresh: true };
   let stat;
   try { stat = lstatSync(options.file, { throwIfNoEntry: false }); } catch { stat = null; }
   if (stat === undefined) return fresh;
@@ -136,19 +152,31 @@ function settledSets(record: OwnershipRecord): CloudOwnership {
  * before it is taken, so a crash anywhere, or a failed save, only ever
  * leaves a key less trusted, and the next start carries on. */
 export function settleCloudOwnership(options: CloudOwnershipOptions): CloudOwnership {
-  let record = readRecord(options);
+  const { fresh, ...read } = readRecord(options);
+  let record: OwnershipRecord = read;
   const others = options.sessions.list().filter((session) => !session.scopes.includes("admin"));
   const revoked = new Set([...record.revokedKeys, ...others.map((session) => options.personKey(session))]);
-  record = { ...record, revokedKeys: [...revoked], ...(options.restoredNow ? { pendingRestore: options.restoredNow } : {}) };
+  // A restore to settle: one applied at this start, or a later one than the
+  // last settled (its start ended before it was recorded). At the very first
+  // start, only one applied now: what came before settles the strict way.
+  const restore = options.restoredNow ??
+    (!fresh && options.lastRestore && options.lastRestore !== record.settledRestore && options.lastRestore !== record.pendingRestore ? options.lastRestore : undefined);
+  record = { ...record, revokedKeys: [...revoked], ...(restore ? { pendingRestore: restore } : {}),
+    ...(fresh && !options.restoredNow && options.lastRestore ? { settledRestore: options.lastRestore } : {}) };
   // 1. The keys about to be revoked are recorded first.
   if (!save(options, record)) return settledSets(record);
   // 2. Their sessions go.
   let count = 0;
   for (const session of others) if (attempt(options, "revoke a session", () => options.sessions.revoke(session.id), false)) count += 1;
   options.log(`cloud home: revoked ${count} session${count === 1 ? "" : "s"} that ${count === 1 ? "was" : "were"} not the owner's own device${count === 1 ? "" : "s"}`);
-  // 3. What any revoked key opened or wrote is nobody's.
-  for (const [what, people] of [["mark conversations as nobody's", options.starters], ["mark routines as nobody's", options.writers]] as const) {
-    attempt(options, what, () => people.reassign((person) => revoked.has(person), options.nobodyKey), 0);
+  // 3. What any revoked key opened or wrote is nobody's: its conversations
+  // lose their working folder (the owner's project, often), its routines stop.
+  const orphans = attempt(options, "mark conversations as nobody's", () => options.starters.reassign((person) => revoked.has(person), options.nobodyKey), []);
+  if (orphans.length) attempt(options, "unpin their folders", () => options.unpin(orphans), undefined);
+  const stopped = attempt(options, "mark routines as nobody's", () => options.writers.reassign((person) => revoked.has(person), options.nobodyKey), []);
+  if (stopped.length) attempt(options, "pause their routines", () => options.routines.pause(stopped), undefined);
+  if (fresh) {
+    options.log("cloud home: only your own devices can connect now. Review Settings → Remote access → Paired devices, and sign out any device that isn't yours.");
   }
   const restoring = record.pendingRestore !== undefined;
   if (record.settled && !restoring) return settledSets(record);
@@ -157,7 +185,7 @@ export function settleCloudOwnership(options: CloudOwnershipOptions): CloudOwner
   // Settled only once every step below is done; else the next start does it again.
   let complete = true;
   const incomplete = () => { complete = false; };
-  const lines = attempt(options, "read who wrote in each conversation", () => options.lines(), { senders: [], answerers: [] }, incomplete);
+  const lines = attempt(options, "read who wrote in each conversation", () => options.lines(), { senders: [], answerers: [], approvals: [] }, incomplete);
   const admins = options.sessions.list().filter((session) => session.scopes.includes("admin")).map((session) => options.personKey(session));
   const proven = new Set([...record.provenKeys, ...admins, ...lines.answerers].filter(eligible));
   const adopted = new Set([...record.adoptedKeys, ...proven, ...options.starters.people(), ...lines.senders].filter(eligible));
@@ -165,20 +193,26 @@ export function settleCloudOwnership(options: CloudOwnershipOptions): CloudOwner
   if (!save(options, record)) return settledSets(record);
   // 5. Conversations the owner provably opened name the owner; routines are
   // the owner's only with proof, else nobody's.
-  const moved = attempt(options, "name the owner on their conversations", () => options.starters.reassign((person) => proven.has(person), options.ownerKey), 0, incomplete);
+  const moved = attempt(options, "name the owner on their conversations", () => options.starters.reassign((person) => proven.has(person), options.ownerKey), [], incomplete).length;
+  const approvedBy = new Map(lines.approvals);
+  const ownersKey = (person: string | undefined) => person !== undefined && (person === options.ownerKey || proven.has(person));
   let owners = 0, nobodys = 0;
   attempt(options, "name each routine's writer", () => {
     for (const id of options.routines.ids()) {
       const writer = options.routines.writer(id);
-      const owner = writer === options.ownerKey || options.routines.fingerprinted(id) ||
-        (restoring && writer !== options.nobodyKey && !(writer !== undefined && revoked.has(writer)));
+      // A restore is proof only for a routine reporting into a conversation
+      // that names nobody yet, or the owner (a backup from before can hold a
+      // guest's routine and its conversation).
+      const opener = options.routines.resultsOpener(id);
+      const owner = writer === options.ownerKey || options.routines.fingerprinted(id) || ownersKey(approvedBy.get(id)) ||
+        (restoring && writer !== options.nobodyKey && !(writer !== undefined && revoked.has(writer)) && (opener === undefined || ownersKey(opener)));
       if (writer !== (owner ? options.ownerKey : options.nobodyKey)) options.routines.name(id, owner ? options.ownerKey : options.nobodyKey);
       if (owner) owners += 1; else nobodys += 1;
     }
   }, undefined, incomplete);
   if (!complete) return settledSets(record);
-  const { pendingRestore: _done, ...rest } = record;
-  record = { ...rest, settled: true };
+  const { pendingRestore: done, ...rest } = record;
+  record = { ...rest, settled: true, ...(done ? { settledRestore: done } : {}) };
   save(options, record);
   options.log(`cloud home: settled what came before${restoring ? " (a restore)" : ""}: ${adopted.size} earlier device key${adopted.size === 1 ? "" : "s"} (${proven.size} proven), ${moved} conversation${moved === 1 ? "" : "s"} named the owner's, ${owners} routine${owners === 1 ? "" : "s"} the owner's and ${nobodys} nobody's`);
   return settledSets(record);

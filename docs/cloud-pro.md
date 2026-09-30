@@ -102,9 +102,36 @@ Every other routine is nobody's: it runs confined, like a guest's, and
 reports into a conversation that is nobody's. An owner's routine reports
 into a conversation that is the owner's.
 
+The routines a revoked session wrote are paused at that start, and the
+conversations it opened lose their working folder: their next turn works in
+a folder of their own, never the owner's project.
+
+A routine that ends up nobody's though it is the owner's (for example one a
+v0.1.91 bot template made on the server, which recorded no writer) runs
+confined, and a run that cannot says so: open it and save it once, and it is
+the owner's again, with full access. A routine the owner approved on a bot's
+proposal card is theirs (the card records who allowed it), and so is one
+applied at once in the owner's own Full-access conversation. Resuming, moving
+or retiming a routine that is already the owner's keeps it theirs.
+
+A key that is adopted but not proven still costs something: its lines keep
+that conversation out of lending and memory, and if a turn there changes the
+bot's memory files, the bot as a whole cannot use the Mac until the owner
+reviews the change (the bot's **Memory** panel, **Mark reviewed**). Starting
+new conversations avoids it.
+
+At the first personal start the log also says to review **Settings → Remote
+access → Paired devices**, which now shows only admin devices, and to sign
+out any that isn't the owner's: a device paired with full access before is
+the owner's from then on, and nothing can tell otherwise.
+
 `cloud-owner.json` is this machine's alone: it is never in a backup, and a
-restore leaves it in place and settles what it brought. The guest rules below
-stay, fail-closed, for what a guest left behind.
+restore leaves it in place and settles what it brought (it records the last
+restore it settled, so one applied at a start that ended early is settled at
+the next). A restore is proof only for routines that report into a
+conversation that names nobody yet or the owner: a backup from before can
+hold a guest's routine, which stays nobody's. The guest rules below stay,
+fail-closed, for what a guest left behind.
 
 The card shows one of: **Setting up**, **Ready**, **Stopped**, **Payment
 problem**, **Could not be set up yet**. Only Ready can be connected to.
@@ -433,13 +460,17 @@ On the Cloud home (`server/shared-computers.ts`, `server/index.ts`):
   new conversation of the guest's own on that teammate, never in the owner's
   conversation with it, and is never folded into a turn running there. It
   works in a folder of its own, never the bot's
-  project folder the owner's conversations share (one that already ran in
-  another folder keeps it), and a card it raises never offers "always
-  allow".
+  project folder the owner's conversations share, and a card it raises
+  never offers "always allow". One that already ran in another folder keeps
+  it, except a conversation a revoked session opened: it is unpinned at boot,
+  so its next turn works in a folder of its own.
 - A guest's turn gets no shell and reads nothing outside its own folder, on
   every engine; an engine that cannot run it that way refuses it with one
-  line ("This bot can't take requests from guests on this Cloud. Ask the
-  owner to switch it to Claude."), before anything is recorded:
+  line, before anything is recorded. On a personal Cloud that line speaks to
+  the owner, since only what came before is confined: for a routine, "This
+  routine was made before this update. Open it and save it once to run it
+  with full access."; for a conversation, that it is from before the Cloud
+  was only theirs, and to start a new one:
 
   | Engine | A guest's turn |
   | --- | --- |

@@ -235,6 +235,14 @@ it("moves this computer's bots, chats and rooms to an empty Cloud, which keeps i
   const ownerKey = `p_${createHash("sha256").update("cloud-owner:3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93").digest("base64url").slice(0, 22)}`;
   expect(JSON.parse(readFileSync(join(cloud.dataDir, "lending-routines.json"), "utf8")).writers[movedRoutine]).toBe(ownerKey);
   expect(cloud.log).toContain("settled what came before (a restore)");
+  // A restore pauses every routine; the owner's Resume keeps it theirs (and
+  // their fingerprint goes on it).
+  const resumed = await api(cloud, "PATCH", `/api/routines/${movedRoutine}`, { token: windowToken, body: { enabled: true } });
+  expect(resumed.status, JSON.stringify(resumed.body)).toBe(200);
+  const authors = JSON.parse(readFileSync(join(cloud.dataDir, "lending-routines.json"), "utf8"));
+  expect(authors.writers[movedRoutine]).toBe(ownerKey);
+  expect(authors.routines[movedRoutine]).toMatch(/^[a-f0-9]{64}$/);
+  expect((await api(cloud, "PATCH", `/api/routines/${movedRoutine}`, { token: windowToken, body: { enabled: false } })).status).toBe(200);
   // The move's own session was signed out; the window's is the one left.
   const sessions = (await api(cloud, "GET", "/api/auth/sessions", { token: windowToken })).body.sessions as Array<{ label: string }>;
   expect(sessions.map((entry) => entry.label)).not.toContain("Move to Cloud");

@@ -237,7 +237,7 @@ it("a guest's request to a bot whose engine needs its shell is refused in one pl
   const guests = await guestThread(bot);
   const refused = await say(owner, bot, "Hello.", guests);
   expect(refused.status).toBe(409);
-  expect(refused.body.error).toBe("This bot can't take requests from guests on this Cloud. Ask the owner to switch it to Claude.");
+  expect(refused.body.error).toBe("This conversation is from before your Cloud was only yours, and this bot's engine can't work in it. Start a new conversation.");
   // Nothing was recorded for the guest's words.
   expect(((await api("GET", `/api/threads/${guests}/messages`, { token: owner })).body.messages as any[]).filter((message) => message.role === "user")).toEqual([]);
   expect((await say(owner, bot, "Hello.", await ownThread(bot))).status).toBe(202);
@@ -360,6 +360,17 @@ it("a guest's request never folds into a turn running in the owner's conversatio
   rmSync(join(home, "release"), { force: true });
 }, 60_000);
 
+it("a routine from before this update, on an engine that cannot be confined, tells the owner what to do", async () => {
+  const bot = await newBot("Shelled routine bot", "shelled");
+  const created = await api("POST", "/api/routines", { token: owner, body: { name: "From before", prompt: "Check the site.", botId: bot.id, enabled: false,
+    schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } } });
+  await leftBehind({ routineId: created.body.routine.id });
+  expect((await api("POST", `/api/routines/${created.body.routine.id}/run`, { token: owner })).status).toBe(201);
+  await expect.poll(async () => JSON.stringify(((await api("GET", "/api/routines", { token: owner })).body.runs ?? [])
+    .filter((run: any) => run.routineId === created.body.routine.id)), { timeout: 15_000 })
+    .toContain("This routine was made before this update. Open it and save it once to run it with full access.");
+}, 60_000);
+
 it("a room a guest opened with a bot whose engine needs its shell refuses the turn in one plain line", async () => {
   const bot = await newBot("Shelled room bot", "shelled");
   const room = await api("POST", "/api/groups", { token: owner, body: { memberIds: [bot.id], name: "Guest's room", setup: { bulletin: "", defaultResponder: { kind: "everyone" } } } });
@@ -367,5 +378,5 @@ it("a room a guest opened with a bot whose engine needs its shell refuses the tu
   await leftBehind({ threadId: room.body.group.threadId });
   expect((await api("POST", `/api/groups/${room.body.group.id}/messages`, { token: owner, body: { text: "Hello." } })).status).toBeLessThan(300);
   await expect.poll(async () => ((await api("GET", `/api/threads/${room.body.group.threadId}/messages`, { token: owner })).body.messages as any[])
-    .some((message) => String(message.tool?.name ?? "").includes("This bot can't take requests from guests on this Cloud")), { timeout: 15_000 }).toBe(true);
+    .some((message) => String(message.tool?.name ?? "").includes("this bot's engine can't work in it")), { timeout: 15_000 }).toBe(true);
 }, 60_000);

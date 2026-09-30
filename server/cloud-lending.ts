@@ -168,12 +168,12 @@ export function createCloudRoutineAuthors(file: string) {
     /** Everyone named as a writer (server/cloud-owner.ts). */
     people(): Set<string> { return new Set(Object.values(writers)); },
     /** Name `to` as the writer wherever `move` accepts the writer: a one-time
-     * migration (server/cloud-owner.ts). How many changed. */
-    reassign(move: (person: string) => boolean, to: string): number {
-      let moved = 0;
+     * migration (server/cloud-owner.ts). The routines that changed. */
+    reassign(move: (person: string) => boolean, to: string): string[] {
+      const moved: string[] = [];
       const next = { ...writers };
-      for (const [id, person] of Object.entries(writers)) if (person !== to && move(person)) { next[id] = to; moved += 1; }
-      if (moved) { writers = next; save(); }
+      for (const [id, person] of Object.entries(writers)) if (person !== to && move(person)) { next[id] = to; moved.push(id); }
+      if (moved.length) { writers = next; save(); }
       return moved;
     },
   };

@@ -2248,6 +2248,19 @@ export class Store {
    * current folder — unless the task already has a session (a thread from
    * before folders existed), which pins to the default so the folder can't
    * move under it. Returns the pinned value: a path, or null for default. */
+  /** Forget where a conversation works: its next turn pins it again
+   * (pinTaskCwd). For a Cloud home's conversation a revoked session opened,
+   * whose next turn must work in its own folder (server/cloud-owner.ts). */
+  unpinTaskCwd(threadId: string): boolean {
+    const bot = this.botByThread(threadId);
+    const task = bot ? this.taskByThread(bot.id, threadId) : undefined;
+    if (!bot || !task || task.cwd === undefined) return false;
+    delete task.cwd;
+    this.saveBots();
+    this.emit({ type: "bot", botId: bot.id });
+    return true;
+  }
+
   pinTaskCwd(botId: string, threadId: string, fallbackCwd?: string, opts: { none?: boolean; privateOnly?: boolean } = {}): string | null {
     const bot = this.bot(botId);
     const task = bot ? this.taskByThread(botId, threadId) : undefined;
