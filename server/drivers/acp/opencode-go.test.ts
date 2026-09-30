@@ -7,12 +7,22 @@ import { fileURLToPath } from "node:url";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import {
+  canRunOpenCode,
+  catalogFromOpenCodeSession,
   classifyOpenCodeError,
-  canListOpenCodeModels,
   createOpenCodeDriver,
-  normalizeLegacyOpenCodeModel,
+  discoverOpenCodeModels,
+  openCodeOwnedDirectories,
+  OPENCODE_PROVIDER_ENV,
   parseOpenCodeModelsOutput,
+  preferredOpenCodeModel,
+  resetOpenCodeModelCache,
+  setOpenCodeProviderKeyPolicy,
 } from "./opencode-go.ts";
+import { ATTACHMENTS_DIR } from "../../attachments.ts";
+import { cloudHomeConfigured } from "../../cloud-home.ts";
+import { hostedWorkspaceConfigured } from "../../enterprise.ts";
+import { TASK_WORKSPACES_DIR, workspaceDir } from "../../workspace.ts";
 import type { ModelCatalog, ProviderInstance, SendTurnInput } from "../../contracts.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
@@ -40,8 +50,8 @@ describe("OpenCode catalog", () => {
     const models = parseOpenCodeModelsOutput([
       "openrouter/vendor/model-v2",
       JSON.stringify({ name: "Vendor Model", status: "active" }, null, 2),
-      "opencode/x-preview-f-free",
-      JSON.stringify({ name: "Ox Alpha Free", status: "active", limit: { context: 1_000_000 } }, null, 2),
+      "opencode/big-pickle",
+      JSON.stringify({ name: "Big Pickle", status: "active", limit: { context: 1_000_000 }, cost: { input: 0, output: 0 } }, null, 2),
       "opencode-go/minimax-m3",
       JSON.stringify({ name: "MiniMax M3", status: "active" }, null, 2),
       "ollama/qwen3",
@@ -52,12 +62,13 @@ describe("OpenCode catalog", () => {
       JSON.stringify({ name: "Retired", status: "deprecated" }, null, 2),
     ].join("\n"));
 
-    expect(models?.default).toBe("opencode/x-preview-f-free");
+    // Zen's own price marks Big Pickle free; nothing is invented.
+    expect(models?.default).toBe("opencode/big-pickle");
     expect(models?.options).toEqual([
       expect.objectContaining({ id: "openrouter/vendor/model-v2", label: "OpenRouter · Vendor Model" }),
       expect.objectContaining({
-        id: "opencode/x-preview-f-free",
-        label: "Zen · Ox Alpha Free",
+        id: "opencode/big-pickle",
+        label: "Zen · Big Pickle",
         contextWindow: 1_000_000,
       }),
       expect.objectContaining({ id: "opencode-go/minimax-m3", label: "Go · MiniMax M3" }),
@@ -66,25 +77,26 @@ describe("OpenCode catalog", () => {
     ]);
   });
 
-  it("caches the anonymous model probe across authentication checks", async () => {
-    const runModels = vi.fn(async () => "opencode/x-preview-f-free\n");
+  it("caches the setup check's catalog probe across snapshots", async () => {
+    resetOpenCodeModelCache();
+    const discover = vi.fn(async () => catalog("opencode/big-pickle"));
 
-    await expect(canListOpenCodeModels({}, "counting-opencode", runModels)).resolves.toBe(true);
-    await expect(canListOpenCodeModels({}, "counting-opencode", runModels)).resolves.toBe(true);
+    await expect(canRunOpenCode({}, "counting-opencode", discover)).resolves.toBe(true);
+    await expect(canRunOpenCode({}, "counting-opencode", discover)).resolves.toBe(true);
 
-    expect(runModels).toHaveBeenCalledOnce();
+    expect(discover).toHaveBeenCalledOnce();
   });
 
   it("accepts header-only output from older CLIs and rejects malformed lines", () => {
     const models = parseOpenCodeModelsOutput([
       "Available models",
-      "opencode/x-preview-f-free",
+      "opencode/big-pickle",
       "bad model/with space",
       "openrouter/anthropic/claude-sonnet-5",
     ].join("\n"));
 
     expect(models?.options.map((option) => option.id)).toEqual([
-      "opencode/x-preview-f-free",
+      "opencode/big-pickle",
       "openrouter/anthropic/claude-sonnet-5",
     ]);
   });
@@ -94,7 +106,7 @@ describe("OpenCode catalog", () => {
     const driver = createOpenCodeDriver(async () => {
       calls += 1;
       const id = calls === 1
-        ? "opencode/x-preview-f-free"
+        ? "opencode/big-pickle"
         : calls === 2
           ? "opencode-go/extra-two"
           : "openrouter/vendor/extra-three";
@@ -108,7 +120,7 @@ describe("OpenCode catalog", () => {
       config: driver.defaultConfig(),
     });
 
-    expect(instance.models.default).toBe("opencode/x-preview-f-free");
+    expect(instance.models.default).toBe("opencode/big-pickle");
     expect(instance.models.options.some((option) => option.custom)).toBe(false);
     await instance.refreshModels?.();
     expect(instance.models.options.some((option) => option.id === "opencode-go/extra-two" && !option.custom)).toBe(true);
@@ -118,7 +130,7 @@ describe("OpenCode catalog", () => {
   });
 
   it("keeps the driver optional and declares the OpenCode CLI setup", () => {
-    const driver = createOpenCodeDriver(async () => catalog("opencode/x-preview-f-free"));
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
     expect(driver.driverKind).toBe("opencodeGo");
     expect(driver.metadata.displayName).toBe("OpenCode");
     expect(driver.decodeConfig(undefined)).toEqual({ cli: "opencode", fullAuto: false, workspace: undefined });
@@ -126,14 +138,9 @@ describe("OpenCode catalog", () => {
     expect(driver.install?.signInCommand).toBe("opencode auth login");
   });
 
-  it("migrates the retired Ox preview id without changing current ids", () => {
-    expect(normalizeLegacyOpenCodeModel("opencode-go/ox-alpha-free", {})).toBe(
-      "opencode/x-preview-f-free",
-    );
-    expect(normalizeLegacyOpenCodeModel("opencode-go/ox-alpha-free", { OPENCODE_API_KEY: "configured" })).toBe(
-      "opencode-go/x-preview-f-free",
-    );
-    expect(normalizeLegacyOpenCodeModel("opencode/gpt-5.6-sol", {})).toBe("opencode/gpt-5.6-sol");
+  it("offers no invented model before OpenCode answers", () => {
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
+    expect(driver.models).toEqual({ default: "", options: [] });
   });
 
   it("recognizes an OpenCode Go login stored by the CLI", async () => {
@@ -193,7 +200,7 @@ describe("OpenCode catalog", () => {
     writeFileSync(join(authDir, "auth.json"), JSON.stringify({
       opencode: { type: "oauth", access: "acc-token", refresh: "ref-token" },
     }));
-    const driver = createOpenCodeDriver(async () => catalog("opencode/x-preview-f-free"));
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
     const instance = await driver.create({
       instanceId: "opencode-oauth-auth",
       displayName: "OpenCode",
@@ -211,7 +218,7 @@ describe("OpenCode catalog", () => {
 
   it("treats OpenCode's anonymous free catalog as runnable without a saved key", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-free-"));
-    const driver = createOpenCodeDriver(async () => catalog("opencode/x-preview-f-free"));
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
     const instance = await driver.create({
       instanceId: "opencode-free",
       displayName: "OpenCode",
@@ -219,7 +226,7 @@ describe("OpenCode catalog", () => {
         HOME: scratch,
         USERPROFILE: scratch,
         XDG_DATA_HOME: join(scratch, "data"),
-        FAKE_ACP_MODELS: "opencode/x-preview-f-free",
+        FAKE_ACP_MODELS: "opencode/big-pickle",
       },
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: false },
@@ -239,14 +246,14 @@ describe("OpenCode catalog", () => {
     writeFileSync(join(authDir, "auth.json"), JSON.stringify({
       opencode: { type: "api", key: "zen-only-secret" },
     }));
-    const driver = createOpenCodeDriver(async () => catalog("opencode/x-preview-f-free"));
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
     const instance = await driver.create({
       instanceId: "opencode-zen-only",
       displayName: "OpenCode",
       environment: {
         XDG_DATA_HOME: scratch,
         OPENCODE_API_KEY: "",
-        FAKE_ACP_MODELS: "opencode/x-preview-f-free",
+        FAKE_ACP_MODELS: "opencode/big-pickle",
       },
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: false },
@@ -256,12 +263,12 @@ describe("OpenCode catalog", () => {
       await instance.adapter.sendTurn({
         threadId: "t-opencode-zen-only",
         text: "hello",
-        model: "opencode/x-preview-f-free",
+        model: "opencode/big-pickle",
       });
       const done = await recorder.until((event) => event.type === "turn.completed");
       expect(done).toMatchObject({ ok: true });
       expect(recorder.events).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "session.started", model: "opencode/x-preview-f-free" }),
+        expect.objectContaining({ type: "session.started", model: "opencode/big-pickle" }),
       ]));
     } finally {
       recorder.stop();
@@ -274,7 +281,33 @@ describe("OpenCode catalog", () => {
     expect(classifyOpenCodeError({ code: -32000 })).toBe("invalid_credentials");
   });
 
-  it("keeps the OpenCode key in the child environment only", async () => {
+  // The shapes the real CLI sends. Invalid key: recorded from opencode 1.18.27
+  // (ACP, temp home, OPENCODE_API_KEY set to a bogus value, free big-pickle)
+  // and 2.0.20 (paid default, same key). The funds text is the diagnosis run's
+  // "Insufficient account funds" on a paid Zen model; the subscription text
+  // is Zen Go's HTTP refusal. OpenCode wraps provider text the same way.
+  const apiError = (message: string) => Object.assign(new Error(`${message} (session/prompt, service: session, APIError)`), {
+    code: -32603, data: { service: "session", errorName: "APIError" },
+  });
+  it.each([
+    ["Internal error: Invalid API key.", "invalid_credentials"],
+    ["Internal error: Insufficient account funds.", "insufficient_funds"],
+    ["Internal error: An active OpenCode Go subscription is required", "inactive_subscription"],
+    ["Internal error: Monthly usage limit reached for this key", "quota_or_region_restriction"],
+  ] as const)("classifies the real APIError %s", (message, expected) => {
+    expect(classifyOpenCodeError(apiError(message))).toBe(expected);
+  });
+
+  it("classifies OpenCode 2's authentication refusal and leaves real internal errors alone", () => {
+    expect(classifyOpenCodeError({ code: -32000, message: "Authentication required: provider authentication required", data: {} }))
+      .toBe("invalid_credentials");
+    expect(classifyOpenCodeError(Object.assign(new Error("Internal error: OpenCode service failure"), {
+      code: -32603, data: { details: "OpenCode service failure" },
+    }))).toBeUndefined();
+    expect(classifyOpenCodeError(apiError("Internal error: socket hang up"))).toBeUndefined();
+  });
+
+  it("passes the person's provider keys through, as the CLI would see them", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-go-"));
     try {
       const dump = join(scratch, "env.json");
@@ -284,8 +317,45 @@ describe("OpenCode catalog", () => {
         displayName: "OpenCode",
         environment: {
           OPENCODE_API_KEY: "secret-value",
-          OPENAI_API_KEY: "wrong-provider-secret",
-          ANTHROPIC_API_KEY: "wrong-provider-secret",
+          OPENAI_API_KEY: "openai-shell-key",
+          ANTHROPIC_API_KEY: "anthropic-shell-key",
+          GEMINI_API_KEY: "gemini-shell-key",
+          // OpenMaus's own saved keys for other engines never ride along.
+          XAI_API_KEY: "saved-for-grok",
+          MISTRAL_API_KEY: "saved-for-mistral",
+          OMB_ANTHROPIC_API_KEY: "workspace-anthropic",
+          FAKE_ACP_DUMP: dump,
+        },
+        enabled: true,
+        config: { cli: FAKE_CLI, fullAuto: false },
+      });
+      await instance.snapshot();
+      const child = JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> };
+      expect(child.env.OPENCODE_API_KEY).toBe("secret-value");
+      expect(child.env.OPENAI_API_KEY).toBe("openai-shell-key");
+      expect(child.env.ANTHROPIC_API_KEY).toBe("anthropic-shell-key");
+      expect(child.env.GEMINI_API_KEY).toBe("gemini-shell-key");
+      expect(child.env.XAI_API_KEY).toBeUndefined();
+      expect(child.env.MISTRAL_API_KEY).toBeUndefined();
+      expect(child.env.OMB_ANTHROPIC_API_KEY).toBeUndefined();
+      await instance.dispose();
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("keeps provider keys out on a Cloud home or a managed desktop", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-managed-"));
+    setOpenCodeProviderKeyPolicy(() => false);
+    try {
+      const dump = join(scratch, "env.json");
+      const driver = createOpenCodeDriver(async () => catalog("opencode-go/minimax-m3"));
+      const instance = await driver.create({
+        instanceId: "opencode-managed",
+        displayName: "OpenCode",
+        environment: {
+          OPENCODE_API_KEY: "secret-value",
+          ...Object.fromEntries(OPENCODE_PROVIDER_ENV.map((key) => [key, `operator-${key}`])),
           FAKE_ACP_DUMP: dump,
         },
         enabled: true,
@@ -296,8 +366,223 @@ describe("OpenCode catalog", () => {
       expect(child.env.OPENCODE_API_KEY).toBe("secret-value");
       expect(child.env.OPENAI_API_KEY).toBeUndefined();
       expect(child.env.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(child.env.GEMINI_API_KEY).toBeUndefined();
       await instance.dispose();
     } finally {
+      setOpenCodeProviderKeyPolicy(() => !cloudHomeConfigured() && !hostedWorkspaceConfigured());
+      await removeTempDir(scratch);
+    }
+  });
+});
+
+describe("OpenCode catalog discovery from the ACP session", () => {
+  afterEach(() => {
+    resetOpenCodeModelCache();
+    vi.unstubAllEnvs();
+  });
+
+  // Recorded from `opencode acp` session/new in empty temporary homes
+  // (no key). V1 1.18.27 names models "OpenCode Zen/…", V2 2.0.20 "opencode/…".
+  const V1_SESSION = { sessionId: "ses_v1", configOptions: [
+    { id: "model", name: "Model", category: "model", type: "select", currentValue: "opencode/big-pickle", options: [
+      { value: "opencode/big-pickle", name: "OpenCode Zen/Big Pickle" },
+      { value: "opencode/mimo-v2.5-free", name: "OpenCode Zen/MiMo V2.5 Free" },
+      { value: "opencode/nemotron-3.5-lightning-free", name: "OpenCode Zen/Nemotron 3.5 Lightning Free" },
+    ] },
+    { id: "mode", name: "Session Mode", category: "mode", type: "select", currentValue: "build", options: [{ value: "build", name: "build" }] },
+  ] };
+  const V2_SESSION = { sessionId: "ses_v2", configOptions: [
+    { id: "model", name: "Model", category: "model", type: "select", currentValue: "opencode/longcat-2.5-preview-free", options: [
+      { value: "opencode/big-pickle", name: "opencode/Big Pickle" },
+      { value: "opencode/longcat-2.5-preview-free", name: "opencode/LongCat 2.5 Preview Free" },
+    ] },
+  ] };
+
+  it("reads the session's own catalog on OpenCode 1 and 2", () => {
+    expect(catalogFromOpenCodeSession(V1_SESSION)).toEqual({
+      current: "opencode/big-pickle",
+      options: [
+        { id: "opencode/big-pickle", label: "Zen · Big Pickle" },
+        { id: "opencode/mimo-v2.5-free", label: "Zen · MiMo V2.5 Free" },
+        { id: "opencode/nemotron-3.5-lightning-free", label: "Zen · Nemotron 3.5 Lightning Free" },
+      ],
+    });
+    expect(catalogFromOpenCodeSession(V2_SESSION)?.options[1]).toEqual({
+      id: "opencode/longcat-2.5-preview-free", label: "Zen · LongCat 2.5 Preview Free",
+    });
+    expect(catalogFromOpenCodeSession({ configOptions: [] })).toBeNull();
+  });
+
+  it("prefers OpenCode's own pick when it is free, and a free model when it is not", () => {
+    const offered = ["opencode/claude-sonnet-5-5", "opencode/big-pickle", "opencode/longcat-2.5-preview-free"];
+    expect(preferredOpenCodeModel(offered, "opencode/longcat-2.5-preview-free")).toBe("opencode/longcat-2.5-preview-free");
+    expect(preferredOpenCodeModel(offered, "opencode/claude-sonnet-5-5")).toBe("opencode/longcat-2.5-preview-free");
+    // Zen's price (models --verbose) outranks the name.
+    parseOpenCodeModelsOutput(["opencode/big-pickle", JSON.stringify({ cost: { input: 0, output: 0 } })].join("\n"));
+    expect(preferredOpenCodeModel(offered, "opencode/big-pickle")).toBe("opencode/big-pickle");
+    // Only the person's own paid providers: their pick stands.
+    expect(preferredOpenCodeModel(["anthropic/claude-sonnet-5", "openai/gpt-6"], "openai/gpt-6")).toBe("openai/gpt-6");
+    expect(preferredOpenCodeModel([], null)).toBe("");
+  });
+
+  it("builds the catalog from ACP and adds OpenCode 1's metadata", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-discover-"));
+    try {
+      const found = await discoverOpenCodeModels({
+        ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle,opencode-go/minimax-m3",
+      }, FAKE_CLI);
+      expect(found.options.map((option) => option.id)).toEqual(["opencode/big-pickle", "opencode-go/minimax-m3"]);
+      // context windows come from `models --verbose`
+      expect(found.options[0]).toMatchObject({ contextWindow: 200_000 });
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("reads OpenCode 1's metadata again when a first run in a new home loses the database race", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-discover-race-"));
+    try {
+      const found = await discoverOpenCodeModels({
+        ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle",
+        FAKE_ACP_VERBOSE_FAIL_ONCE: join(scratch, "failed-once"),
+      }, FAKE_CLI);
+      expect(existsSync(join(scratch, "failed-once"))).toBe(true);
+      expect(found.options[0]).toMatchObject({ id: "opencode/big-pickle", contextWindow: 200_000 });
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+
+  // OpenCode 2 rejects `models --verbose`; before, that left the picker on
+  // the invented, dead x-preview-f-free.
+  it("still lists every model on OpenCode 2, where models --verbose fails", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-discover-v2-"));
+    try {
+      const found = await discoverOpenCodeModels({
+        ...process.env, HOME: scratch, FAKE_ACP_MODELS_LIST: "v2",
+        FAKE_ACP_MODELS: "opencode/claude-sonnet-5-5,opencode/longcat-2.5-preview-free",
+      }, FAKE_CLI);
+      expect(found.options.map((option) => option.id)).toEqual(["opencode/claude-sonnet-5-5", "opencode/longcat-2.5-preview-free"]);
+      expect(found.default).toBe("opencode/longcat-2.5-preview-free");
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("offers nothing rather than an invented id when OpenCode cannot answer", async () => {
+    await expect(discoverOpenCodeModels({ ...process.env }, join(tmpdir(), "no-such-opencode-binary"))).resolves.toEqual({
+      default: "", options: [],
+    });
+  });
+});
+
+describe("OpenCode turns without a sign-in gate", () => {
+  const fixtures: Array<{ scratch: string; instance: ProviderInstance; recorder: EventRecorder }> = [];
+  afterEach(async () => {
+    for (const entry of fixtures.splice(0)) {
+      entry.recorder.stop();
+      await entry.instance.dispose();
+      await removeTempDir(entry.scratch);
+    }
+    resetOpenCodeModelCache();
+  });
+  const open = async (instanceId: string, environmentFor: (scratch: string) => Record<string, string>) => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-gate-"));
+    const environment = environmentFor(scratch);
+    const driver = createOpenCodeDriver(async () => ({ default: "", options: [] }));
+    const instance = await driver.create({
+      instanceId, displayName: "OpenCode", enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false, workspace: scratch },
+      environment: {
+        HOME: scratch, USERPROFILE: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: join(scratch, "data"),
+        FAKE_ACP_LAUNCH_COUNT_FILE: join(scratch, "launches"), ...environment,
+      },
+    });
+    const recorder = recordEvents(instance.adapter);
+    fixtures.push({ scratch, instance, recorder });
+    const launches = () => Number(readFileSync(join(scratch, "launches"), "utf8"));
+    const run = async (threadId: string, model?: string) => {
+      const { turnId } = await instance.adapter.sendTurn({ threadId, text: "hello", ...(model ? { model } : {}) });
+      const done = await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+      return { done, events: recorder.events.filter((event) => event.turnId === turnId) };
+    };
+    return { scratch, run, launches };
+  };
+
+  // OpenCode 2's plain `models` answers an empty list right after its
+  // background service starts. The old pre-spawn check read that as "no
+  // usable models" and refused every anonymous turn for 30 s.
+  it("runs an anonymous free-model turn even when `opencode models` answers nothing", async () => {
+    const f = await open("opencode-anonymous", () => ({
+      FAKE_ACP_MODELS_LIST: "v2", FAKE_ACP_MODELS: "opencode/longcat-2.5-preview-free",
+    }));
+    const { done, events } = await f.run("t-anonymous", "opencode/longcat-2.5-preview-free");
+    expect(done).toMatchObject({ ok: true });
+    expect(events.some((event) => event.type === "runtime.error")).toBe(false);
+  });
+
+  it("shows a fix-your-key card for a rejected key and keeps the process for the retry", async () => {
+    const f = await open("opencode-bad-key", (scratch) => ({
+      OPENCODE_API_KEY: "sk-bogus", FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_RPC_FAILURE_FILE: join(scratch, "failure.json"),
+    }));
+    // recorded from opencode 1.18.27 with a bogus OPENCODE_API_KEY
+    writeFileSync(join(f.scratch, "failure.json"), JSON.stringify({
+      code: -32603, message: "Internal error: Invalid API key.", data: { service: "session", errorName: "APIError" },
+    }));
+    for (const attempt of [1, 2]) {
+      const { done, events } = await f.run("t-bad-key", "opencode/big-pickle");
+      expect(done, `attempt ${attempt}`).toMatchObject({ ok: false, stopReason: "auth_required" });
+      const error = events.find((event) => event.type === "runtime.error");
+      expect(error).toMatchObject({ setup: true, message: expect.stringContaining("Settings → Connections") });
+      expect(error).not.toMatchObject({ message: expect.stringContaining("Internal error") });
+    }
+    // the retry reused the warm process instead of cold-starting OpenCode
+    expect(f.launches()).toBe(1);
+  });
+});
+
+describe("OpenCode access to folders OpenMaus owns", () => {
+  it("names the attachments folder and only this bot's folders", () => {
+    expect(openCodeOwnedDirectories("bot-7")).toEqual([
+      ATTACHMENTS_DIR, workspaceDir("bot-7"), join(TASK_WORKSPACES_DIR, "bot-7"),
+    ]);
+    expect(openCodeOwnedDirectories("..")).toEqual([ATTACHMENTS_DIR]);
+    expect(openCodeOwnedDirectories("../other")).toEqual([ATTACHMENTS_DIR]);
+    expect(openCodeOwnedDirectories()).toEqual([ATTACHMENTS_DIR]);
+  });
+
+  it.each([["ask", false], ["full", true]] as const)("sets OpenCode's folder policy for %s turns", async (approvalMode, full) => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-permission-"));
+    const dump = join(scratch, "env.json");
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
+    const instance = await driver.create({
+      instanceId: `opencode-permission-${approvalMode}`, displayName: "OpenCode", enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false, workspace: scratch },
+      environment: {
+        HOME: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: scratch,
+        FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_DUMP: dump,
+        OPENCODE_PERMISSION: JSON.stringify({ bash: "ask", external_directory: { "/srv/shared/*": "deny" } }),
+      },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-permission", botId: "bot-7", text: "read the attachment", model: "opencode/big-pickle", approvalMode });
+      expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: true });
+      const policy = JSON.parse((JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> }).env.OPENCODE_PERMISSION);
+      if (full) {
+        expect(policy).toMatchObject({ "*": "allow", external_directory: "allow" });
+        return;
+      }
+      // the person's own rules stay, first; OpenMaus's folders are allowed
+      // after them; nothing else is widened
+      expect(policy.bash).toBe("ask");
+      expect(Object.entries(policy.external_directory)).toEqual([
+        ["/srv/shared/*", "deny"],
+        ...openCodeOwnedDirectories("bot-7").flatMap((directory) => [[directory, "allow"], [join(directory, "*"), "allow"]]),
+      ]);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
       await removeTempDir(scratch);
     }
   });
@@ -318,13 +603,13 @@ describe("OpenCode session variants", () => {
   const fixture = async (variants: Record<string, unknown>, environment: Record<string, string> = {}) => {
     const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-variants-"));
     const dump = join(scratch, "rpc");
-    const driver = createOpenCodeDriver(async () => catalog(model, secondModel, plainModel, "opencode-go/x-preview-f-free"));
+    const driver = createOpenCodeDriver(async () => catalog(model, secondModel, plainModel));
     const instance = await driver.create({
       instanceId: "opencode-variant-test", displayName: "OpenCode", enabled: true,
       config: { cli: FAKE_CLI, fullAuto: false, workspace: scratch },
       environment: {
         HOME: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: scratch,
-        OPENCODE_API_KEY: "fixture-key", FAKE_ACP_MODELS: [model, secondModel, plainModel, "opencode-go/x-preview-f-free"].join(","),
+        OPENCODE_API_KEY: "fixture-key", FAKE_ACP_MODELS: [model, secondModel, plainModel].join(","),
         FAKE_ACP_VARIANTS: JSON.stringify(variants), FAKE_ACP_DUMP: dump,
         FAKE_ACP_RPC_DUMP: `${dump}.methods.json`, ...environment,
       },
@@ -475,12 +760,74 @@ describe("OpenCode session variants", () => {
     expect(f.prompted()).toBe(false);
   });
 
-  it("reports the picker alias while configuring the native OpenCode model", async () => {
-    const native = "opencode-go/x-preview-f-free";
-    const f = await fixture({ [native]: variantConfig(["low", "high"]) });
-    const { done, events } = await f.run({ model: "opencode-go/ox-alpha-free", variant: "high" });
-    expect(done).toMatchObject({ ok: true });
-    expect(events.filter((event) => event.type === "session.model-variants").at(-1)).toMatchObject({ model: "opencode-go/ox-alpha-free" });
-    expect(f.calls()[0].params.value).toBe(native);
+  // Zen retired x-preview-f-free (and the Ox Alpha preview before it);
+  // OpenCode answers -32602 "model not found", so a bot that saved it failed
+  // every turn in about half a second.
+  it.each(["opencode/x-preview-f-free", "opencode-go/ox-alpha-free"])(
+    "runs a retired saved model %s on the catalog default and says so once",
+    async (retired) => {
+      const f = await fixture({ [model]: variantConfig(["low", "high"]) });
+      const first = await f.run({ model: retired, variant: "high" });
+      expect(first.done).toMatchObject({ ok: true });
+      const notices = first.events.filter((event) => event.type === "runtime.notice");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({ message: expect.stringContaining(retired) });
+      expect(notices[0]).toMatchObject({ message: expect.stringContaining(model) });
+      expect(first.events.find((event) => event.type === "session.started")).toMatchObject({ model });
+      expect(first.events.filter((event) => event.type === "session.model-variants").at(-1)).toMatchObject({ model });
+      // Already on the default and the saved variant belonged to the retired
+      // model: neither the model nor the effort is touched.
+      expect(f.calls()).toEqual([]);
+
+      const second = await f.run({ model: retired });
+      expect(second.done).toMatchObject({ ok: true });
+      expect(second.events.some((event) => event.type === "runtime.notice")).toBe(false);
+    },
+  );
+
+  it("still switches to a model the session offers", async () => {
+    const f = await fixture({});
+    expect((await f.run({ model: secondModel })).done).toMatchObject({ ok: true });
+    expect(f.calls().map((entry) => entry.params)).toEqual([{ sessionId: "fake-acp-session", configId: "model", value: secondModel }]);
+  });
+});
+
+describe("OpenCode model choice without a saved model", () => {
+  const fixtures: Array<{ scratch: string; instance: ProviderInstance; recorder: EventRecorder }> = [];
+  afterEach(async () => {
+    for (const entry of fixtures.splice(0)) {
+      entry.recorder.stop();
+      await entry.instance.dispose();
+      await removeTempDir(entry.scratch);
+    }
+    resetOpenCodeModelCache();
+  });
+
+  // OpenCode 2 with a key starts every session on a paid model (measured:
+  // opencode/claude-sonnet-5-5 on 2.0.20). An empty pick must not bill.
+  it("runs a free model, not OpenCode's own paid default", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-paid-default-"));
+    const dump = join(scratch, "rpc");
+    const driver = createOpenCodeDriver(async () => ({ default: "", options: [] }));
+    const instance = await driver.create({
+      instanceId: "opencode-paid-default", displayName: "OpenCode", enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false, workspace: scratch },
+      environment: {
+        HOME: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: scratch, OPENCODE_API_KEY: "fixture-key",
+        FAKE_ACP_MODELS: "opencode/claude-sonnet-5-5,opencode/longcat-2.5-preview-free", FAKE_ACP_DUMP: dump,
+      },
+    });
+    const recorder = recordEvents(instance.adapter);
+    fixtures.push({ scratch, instance, recorder });
+    await instance.adapter.sendTurn({ threadId: "t-no-model", text: "hello" });
+    expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: true });
+    expect(recorder.events.find((event) => event.type === "session.started")).toMatchObject({
+      model: "opencode/longcat-2.5-preview-free",
+    });
+    expect(recorder.events.some((event) => event.type === "runtime.notice")).toBe(false);
+    expect(JSON.parse(readFileSync(`${dump}.config.json`, "utf8"))).toEqual([{
+      method: "session/set_config_option",
+      params: { sessionId: "fake-acp-session", configId: "model", value: "opencode/longcat-2.5-preview-free" },
+    }]);
   });
 });

@@ -236,6 +236,7 @@ import {
 import type { GroupGoalRunCardData, GroupGoalRunStatus } from "../shared/group-goal-run.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
+import { setOpenCodeProviderKeyPolicy } from "./drivers/acp/opencode-go.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { readMessageText, recallMessages, recentMessages, searchMessagesAsync, closeMessageSearch, closeMessageDb, chatFollowups, cancelledChatFollowup, settleChatFollowups, threadsReferencing } from "./message-db.ts";
 import { briefCrossingLabel, claimRecallCrossings, recallCrossingLabel } from "./recall-disclosure.ts";
@@ -1846,6 +1847,12 @@ const managedDesktop = new ManagedDesktopProviders({
     broadcast({ kind: "config", ...configStatus() });
   },
 });
+// OpenCode reads provider keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, …) from
+// its environment, as it does in a terminal. On a Cloud home, a hosted team
+// workspace or an organisation-managed desktop that environment is not the
+// person's own shell, so those keys stay out of OpenCode.
+setOpenCodeProviderKeyPolicy(() =>
+  !CLOUD_HOME && !HOSTED_WORKSPACE && managedPolicy.current() === null && !managedDesktop.enrolled());
 utilityParentPort?.on("message", event => {
   const message = event.data as { type?: unknown; requestId?: unknown; identity?: unknown } | undefined;
   if (message?.type !== "openmausbot:managed-desktop-identity") return;
@@ -7129,6 +7136,10 @@ bus.subscribe((event: RuntimeEvent) => {
         kind: "activity",
         tool: { name: `retrying — attempt ${event.attempt + 1}/${RETRY_MAX_ATTEMPTS} in ${Math.round(event.delayMs / 1000)}s — ${event.reason}`, ok: true },
       });
+      break;
+    case "runtime.notice":
+      // informational: the turn carries on, so the chip is not a failure
+      pushMessage({ role: "bot", kind: "activity", tool: { name: event.message.slice(0, 240), ok: true } });
       break;
     case "runtime.error":
       pushMessage({

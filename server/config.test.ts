@@ -701,6 +701,22 @@ describe("default fleet", () => {
     expect(parseConfigPatch({ anthropic: { key: "sk-ant-new" } })).toEqual({ anthropic: { key: "sk-ant-new" } });
   });
 
+  it("never hands the workspace Anthropic key to a Claude instance with its own endpoint or credential", () => {
+    const map = instanceConfigs({
+      anthropic: { key: "sk-ant-workspace", url: "https://anthropic-proxy.example.test" },
+      instances: {
+        claude: { driver: "claudeAgent" },
+        router: { driver: "claudeAgent", environment: { ANTHROPIC_BASE_URL: "https://router.example.test", ANTHROPIC_AUTH_TOKEN: "router-token" } },
+        keyed: { driver: "claudeAgent", environment: { ANTHROPIC_API_KEY: "sk-ant-own" } },
+        bedrock: { driver: "claudeAgent", environment: { CLAUDE_CODE_USE_BEDROCK: "1" } },
+      },
+    });
+    expect(map.claude.environment).toEqual({ ANTHROPIC_API_KEY: "sk-ant-workspace", ANTHROPIC_BASE_URL: "https://anthropic-proxy.example.test" });
+    expect(map.router.environment).toEqual({ ANTHROPIC_BASE_URL: "https://router.example.test", ANTHROPIC_AUTH_TOKEN: "router-token" });
+    expect(map.keyed.environment).toEqual({ ANTHROPIC_API_KEY: "sk-ant-own" });
+    expect(map.bedrock.environment).toEqual({ CLAUDE_CODE_USE_BEDROCK: "1" });
+  });
+
   it("preserves a per-instance OpenAI-compatible URL override", () => {
     const map = instanceConfigs({
       openaiCompat: { url: "https://workspace.example.test/v1" },

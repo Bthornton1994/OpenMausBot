@@ -74,6 +74,16 @@ import { recoveryPromptFor } from "../../resume-recovery.ts";
 import { sessionIdlePolicy } from "../session-idle.ts";
 import { classifyError } from "../retry.ts";
 
+/** Failures the person fixes on their provider account, not by retrying:
+ * the process that reported one is healthy and stays pooled. */
+export type AccountErrorCode = Extract<ProviderErrorCode,
+  "invalid_credentials" | "inactive_subscription" | "insufficient_funds" | "quota_or_region_restriction">;
+const ACCOUNT_ERROR_CODES: ReadonlySet<ProviderErrorCode> = new Set<AccountErrorCode>([
+  "invalid_credentials", "inactive_subscription", "insufficient_funds", "quota_or_region_restriction",
+]);
+const isAccountError = (code: ProviderErrorCode | undefined): code is AccountErrorCode =>
+  code !== undefined && ACCOUNT_ERROR_CODES.has(code);
+
 /** ACP vendors put the actionable cause in error.data while keeping the
  * JSON-RPC message generic. Only surface known text fields, never a response
  * body/config dump, and redact before bounding the displayed diagnostic. */
@@ -192,6 +202,9 @@ interface AcpSession {
   stderr: string;
   /** the running turn, or null between turns */
   current: AcpTurn | null;
+  /** the last model fallback reported on this process ("wanted\nused"), so
+   * a pooled conversation says it once rather than on every turn */
+  fallbackNotice?: string;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -243,6 +256,21 @@ export interface AcpSupport {
    *  CONFIRM the requested model before we prompt: silently running a model
    *  other than the one the picker shows is the failure this guards. */
   selectModel?: { configId: string };
+  /** With `selectModel`: the model a turn runs when it asked for none, or for
+   * one this live session does not offer (a retired id saved on an old bot).
+   * Receives the session's config snapshot and the instance catalog default;
+   * returns an offered model, or null to keep today's strict behaviour. A
+   * replaced, non-empty request is reported to the person as a notice. */
+  fallbackModel?(sessionConfig: unknown, catalogDefault: string): string | null;
+  /** The environment variable this runtime reads its new-session default
+   * model from. Set at spawn to the turn's model so session/new already runs
+   * it and the separate model switch is skipped. It is not part of the spawn
+   * contract: a later model change still goes over the wire. */
+  sessionModelEnv?: string;
+  /** The approval mode is applied to the session on every turn (in
+   * configureSession) and nothing about the process depends on it, so an
+   * approval change must not respawn the process. */
+  sessionScopedApproval?: boolean;
   /** Mutate the child env in place: strip a key, inject a policy. Receives the
    *  instance config so a support can vary with fullAuto. */
   transformEnv?(env: Record<string, string | undefined>, config: AcpConfig, instanceId: string): void;
@@ -272,7 +300,7 @@ export interface AcpSupport {
    *  snapshot share `transformEnv` and must not see a per-turn overlay. */
   applyTurnEnv?(
     env: Record<string, string | undefined>,
-    ctx: { model?: string; requestedModel?: string; fullAuto: boolean },
+    ctx: { model?: string; requestedModel?: string; fullAuto: boolean; botId?: string; cwd: string },
   ): void;
   /** Pick the ACP authenticate methodId from initialize's advertised
    * authMethods; return null to skip the authenticate step. */
@@ -292,6 +320,9 @@ export interface AcpSupport {
   requireAuthenticationBeforeSpawn?: boolean;
   /** Classify provider-native failures without coupling the core to messages. */
   classifyError?(error: unknown): ProviderErrorCode | undefined;
+  /** Plain words for an account failure (bad key, no credit, a used-up
+   * quota, no subscription) in place of the provider's raw RPC text. */
+  describeAccountError?(code: AccountErrorCode): string;
   /** Compose the session/prompt text. Default prepends the persona. */
   buildPromptText?(turn: SendTurnInput): string;
   /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
@@ -378,6 +409,24 @@ function acpVariantOption(result: any): { configId: string; options: ModelVarian
   };
 }
 const TOOL_LOG_TEXT_LIMIT = 64_000;
+
+/** Every model id a session config snapshot offers under `configId`,
+ * flattening grouped options. Empty when the agent listed none. */
+export function offeredModels(result: any, configId: string): string[] {
+  const option = (Array.isArray(result?.configOptions) ? result.configOptions : []).find(
+    (entry: any) => entry?.id === configId,
+  );
+  const ids: string[] = [];
+  const visit = (entries: unknown) => {
+    if (!Array.isArray(entries)) return;
+    for (const entry of entries) {
+      if (typeof entry?.value === "string") ids.push(entry.value);
+      else if (Array.isArray(entry?.options)) visit(entry.options);
+    }
+  };
+  visit(option?.options);
+  return ids;
+}
 
 async function readAcpImageBlocks(images: readonly TurnImageInput[]) {
   return Promise.all(images.map(async (image) => ({
@@ -1287,8 +1336,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           return { turnId };
         }
         const resolvedModel = support.resolveTurnModel?.(turn.model, env);
-        support.applyTurnEnv?.(env, { model: resolvedModel, requestedModel: turn.model, fullAuto: turnConfig.fullAuto === true });
-        const cliTurn =
+        support.applyTurnEnv?.(env, {
+          model: resolvedModel, requestedModel: turn.model, fullAuto: turnConfig.fullAuto === true, botId: turn.botId, cwd,
+        });
+        // Rebound once, before the prompt, when a fallbackModel support swaps
+        // a model this session does not offer for one it does.
+        let cliTurn =
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
             : turn;
@@ -1329,7 +1382,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // riding a child spawned under the old env. Hash it so secrets
         // never sit in the key itself.
         const envFingerprint = createHash("sha256").update(JSON.stringify(spawnEnv)).digest("hex").slice(0, 16);
-        const contractKey = JSON.stringify([launch.command, launch.args ?? [], spawnArgs, cwd, turnConfig.fullAuto === true, envFingerprint]);
+        // A support that applies the approval mode to the session on every
+        // turn gets the same process whatever the mode: an approval change
+        // is one RPC, not a cold start.
+        const contractKey = JSON.stringify([
+          launch.command, launch.args ?? [], spawnArgs, cwd,
+          support.sessionScopedApproval ? null : turnConfig.fullAuto === true, envFingerprint,
+        ]);
+        // The new-session default model rides the spawn env but stays out of
+        // the fingerprint above: only session/new reads it, and a pooled
+        // process switches later models over the wire as before.
+        const launchEnv = support.sessionModelEnv && cliTurn.model && /^[\w.:/-]{1,200}$/u.test(cliTurn.model)
+          ? { ...spawnEnv, [support.sessionModelEnv]: cliTurn.model }
+          : spawnEnv;
         const sessionKey = JSON.stringify(mcpServers);
 
         if (turn.sessionReset) {
@@ -1351,7 +1416,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             if (pooled.dead) sessions.delete(threadId);
             else closeSession(threadId, "contract");
           }
-          session = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], spawnEnv, cwd, contractKey);
+          session = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], launchEnv, cwd, contractKey);
           sessions.set(threadId, session);
         }
         // `session` rebinds mid-turn: when the establishment retry below
@@ -1375,6 +1440,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           rejectStartup = reject;
         }) : null;
         const asks = new Map<string, AcpAskFinish>();
+        // What this turn reports and applies. A model fallback (below)
+        // replaces both: a saved variant belongs to the model it replaced.
+        let reportedModel = turn.model;
+        let variant = turn.variant;
         const modelOf = (result: any): string | null => {
           const option = (Array.isArray(result?.configOptions) ? result.configOptions : []).find(
             (entry: any) => entry?.id === (support.selectModel?.configId ?? "model"),
@@ -1390,7 +1459,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           emit({
             ...base(threadId, turnId),
             type: "session.model-variants",
-            model: nativeModel === cliTurn.model ? (turn.model ?? nativeModel) : nativeModel,
+            model: nativeModel === cliTurn.model ? (reportedModel ?? nativeModel) : nativeModel,
             variants: {
               options: option?.options ?? [],
               ...(option?.currentValue !== undefined ? { currentValue: option.currentValue } : {}),
@@ -1400,8 +1469,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const requestedVariantOption = () => {
           if (!support.modelVariants) throw new Error(`${support.displayName} does not support model variants`);
           const option = acpVariantOption(session.sessionConfigResult);
-          if (!option || !option.options.some((entry) => entry.id === turn.variant)) {
-            throw new Error(`${support.displayName} does not advertise variant ${turn.variant} for this model`);
+          if (!option || !option.options.some((entry) => entry.id === variant)) {
+            throw new Error(`${support.displayName} does not advertise variant ${variant} for this model`);
           }
           return option;
         };
@@ -1576,7 +1645,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 // session/new on the replacement child.
                 session.current = null;
                 closeSession(threadId, "reestablish");
-                session = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], spawnEnv, cwd, contractKey);
+                session = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], launchEnv, cwd, contractKey);
                 sessions.set(threadId, session);
                 session.current = current;
                 runtimeAcceptsImages = await handshake();
@@ -1623,6 +1692,30 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (support.selectModel) {
                 const { configId } = support.selectModel;
                 selectedModel = modelOf(session.sessionConfigResult);
+                const wanted = cliTurn.model;
+                const offered = offeredModels(session.sessionConfigResult, configId);
+                // A local inject writes its provider for this turn, so a
+                // process started earlier may not list it yet: never replace it.
+                if (support.fallbackModel && offered.length && !skipSubscriptionAuthForLocalInject(turn.model)
+                    && (!wanted || !offered.includes(wanted))) {
+                  const fallback = support.fallbackModel(session.sessionConfigResult, models.default);
+                  if (fallback && fallback !== wanted && offered.includes(fallback)) {
+                    const notice = wanted ? `${wanted}\n${fallback}` : null;
+                    if (notice && session.fallbackNotice !== notice) {
+                      session.fallbackNotice = notice;
+                      emit({
+                        ...base(threadId, turnId),
+                        type: "runtime.notice",
+                        message: `${support.displayName} no longer offers ${wanted}, so this conversation uses ${fallback}. ` +
+                          "Choose another model for this bot to stop seeing this.",
+                      });
+                    }
+                    cliTurn = { ...cliTurn, model: fallback };
+                    current.turn = cliTurn;
+                    reportedModel = fallback;
+                    variant = undefined;
+                  }
+                }
                 if (cliTurn.model && cliTurn.model !== selectedModel) {
                   sessionResult = await request(
                     "session/set_config_option",
@@ -1657,16 +1750,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 // report the slug we set so the UI does not claim otherwise.
                 if (!selectedModel && cliTurn.model) selectedModel = cliTurn.model;
               }
-              if (turn.variant !== undefined) {
+              if (variant !== undefined) {
                 const option = requestedVariantOption();
                 await request(
                   "session/set_config_option",
-                  { sessionId, configId: option.configId, value: turn.variant },
+                  { sessionId, configId: option.configId, value: variant },
                   SESSION_CONFIG_TIMEOUT,
                   receiveModelVariants,
                 );
-                if (requestedVariantOption().currentValue !== turn.variant) {
-                  throw new Error(`${support.displayName} did not apply variant ${turn.variant}`);
+                if (requestedVariantOption().currentValue !== variant) {
+                  throw new Error(`${support.displayName} did not apply variant ${variant}`);
                 }
               }
             } catch (error) {
@@ -1712,7 +1805,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             if (support.modelVariants && cliTurn.model && modelOf(session.sessionConfigResult) !== cliTurn.model) {
               throw new Error(`${support.displayName} changed model before the prompt`);
             }
-            if (turn.variant !== undefined && requestedVariantOption().currentValue !== turn.variant) {
+            if (variant !== undefined && requestedVariantOption().currentValue !== variant) {
               throw new Error(`${support.displayName} changed variant before the prompt`);
             }
             if (state.settled || state.stopped || session.closing) throw new Error("turn stopped");
@@ -1789,11 +1882,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // classifier is preferred; loginNote remains a compatibility
               // fallback for existing ACP supports.
               const needsAuth = code === "invalid_credentials" || code === "inactive_subscription"
-                || message === support.loginNote;
+                || code === "insufficient_funds" || message === support.loginNote;
+              // A key, credit, quota or subscription problem is the account's,
+              // not the process's: the child that reported it is healthy, so it
+              // stays pooled and the retry after a fix starts warm.
+              const accountError = isAccountError(code);
               const failure = classifyError({ text: message });
               const transientStartup = failure.transient || (failure.reason === "unknown" && code === "upstream_outage");
               const denied = /\b(?:(?:permission|access) denied|(?:approval|permission) (?:required|denied|rejected)|requires? (?:approval|permission)|policy (?:restriction|violation)|(?:blocked|denied|restricted) by (?:the )?policy)\b/i.test(message);
-              if (turn.startupRecovery && transientStartup && !needsAuth && !denied && (!code || code === "upstream_outage")
+              if (turn.startupRecovery && transientStartup && !needsAuth && !accountError && !denied && (!code || code === "upstream_outage")
                   && ![-32700, -32600, -32601, -32602].includes((e as any)?.code)
                   && !state.promptSent && !state.startupActivity && !state.producedItem && !state.text
                   && !state.stopped && !session.closing && !asks.size && !current.runningTools.size) {
@@ -1819,7 +1916,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               emit({
                 ...base(threadId, turnId),
                 type: "runtime.error",
-                message,
+                message: accountError ? support.describeAccountError?.(code) ?? message : message,
                 ...(needsAuth ? { setup: true } : {}),
               });
               // Internal RPC failures can leave a live child poisoned just
@@ -1827,7 +1924,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // start the next turn. Never replay this accepted prompt: it
               // may already have executed tools. The next explicit turn can
               // resume the recorded session on a fresh process.
-              if (!needsAuth && ((e as any)?.acpPromptStall === true || (e as any)?.acpSessionFailure === true
+              if (!needsAuth && !accountError && ((e as any)?.acpPromptStall === true || (e as any)?.acpSessionFailure === true
                   || code === "upstream_outage") && session.child.exitCode === null && !session.closing) {
                 closeSession(threadId, (e as any)?.acpPromptStall === true ? "prompt-stall" : "rpc-failure");
               }

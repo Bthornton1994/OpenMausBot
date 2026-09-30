@@ -67,6 +67,22 @@ describe("OpenAICompatDriver", () => {
     await inst.dispose();
   });
 
+  // The setup card used to show a config.json sentence as an "Open install
+  // in Terminal" command. The key is saved in the app.
+  it("sends setup to Settings → Connections instead of a terminal", async () => {
+    expect(OpenAICompatDriver.install?.command).toBeUndefined();
+    expect(OpenAICompatDriver.install?.settings).toBe("connections");
+    expect(OpenAICompatDriver.install?.signInCommand).toContain("Settings → Connections");
+    const inst = await OpenAICompatDriver.create({
+      instanceId: "test-setup", displayName: "Router", enabled: true,
+      config: { url: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY" }, environment: {},
+    });
+    const snap = await inst.snapshot();
+    expect(snap).toMatchObject({ state: "unavailable", reason: expect.stringContaining("Settings → Connections") });
+    expect(JSON.stringify(snap)).not.toContain("config.json");
+    await inst.dispose();
+  });
+
   it("rejects remote HTTP computer use before starting tools or a completion request", async () => {
     const request = vi.fn(async (_url: string | URL | Request) => new Response('{"data":[]}', { headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", request);

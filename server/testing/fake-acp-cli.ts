@@ -78,6 +78,17 @@
 //                        surface: session/new and session/load return
 //                        configOptions, and session/set_config_option switches
 //                        the model (rejecting an unadvertised one with -32602).
+//                        A new session starts on AGY_ACP_DEFAULT_MODEL when it
+//                        names one of them (Google Antigravity's own default
+//                        variable), else on the first.
+//   FAKE_ACP_MODELS_LIST=v2  OpenCode 2's `models` surface: plain `models`
+//                        answers an empty list with exit 0 (its first answer
+//                        after the background service starts), and `models
+//                        --verbose` is rejected with exit 1
+//   FAKE_ACP_VERBOSE_FAIL_ONCE  path of a marker file: the first `models
+//                        --verbose` creates it and fails, the way a first run
+//                        in a new OpenCode home loses the race to create its
+//                        database; later runs answer normally
 //   FAKE_ACP_MODEL_STICKS  session/set_config_option succeeds but leaves the
 //                        model where it was, so the confirmation guard in
 //                        core.ts has something to catch
@@ -112,7 +123,9 @@ const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42
 // no -m. Off unless FAKE_ACP_MODELS is set, so every existing mode is byte-
 // identical to before.
 const models = (process.env.FAKE_ACP_MODELS ?? "").split(",").filter(Boolean);
-let currentModel: string | null = models[0] ?? null;
+let currentModel: string | null = process.env.AGY_ACP_DEFAULT_MODEL && models.includes(process.env.AGY_ACP_DEFAULT_MODEL)
+  ? process.env.AGY_ACP_DEFAULT_MODEL
+  : models[0] ?? null;
 const variantConfigs: Record<string, { id?: string; currentValue?: string; options: any[] }> =
   JSON.parse(process.env.FAKE_ACP_VARIANTS ?? "{}");
 let currentVariant = variantConfigs[currentModel ?? ""]?.currentValue;
@@ -236,6 +249,10 @@ const dumpEnv = Object.fromEntries(
     "GEMINI_HOME",
     "AGY_ACP_FORCE_FILE_STORAGE",
     "ANTIGRAVITY_HARNESS_PATH",
+    "AGY_ACP_DEFAULT_MODEL",
+    "GEMINI_API_KEY",
+    "MISTRAL_API_KEY",
+    "OMB_ANTHROPIC_API_KEY",
   ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 // pid rides along so a test can tell a respawned process (new pid, fresh
@@ -268,6 +285,19 @@ if (argv[0] === "status" || argv[0] === "whoami") {
   process.exit(0);
 }
 if (argv[0] === "models" || argv.includes("--list-models")) {
+  const failOnce = process.env.FAKE_ACP_VERBOSE_FAIL_ONCE;
+  if (failOnce && argv.includes("--verbose") && !existsSync(failOnce)) {
+    writeFileSync(failOnce, "failed once\n");
+    console.error("Failed to run the query 'CREATE TABLE `workspace` (…)'");
+    process.exit(1);
+  }
+  if (process.env.FAKE_ACP_MODELS_LIST === "v2") {
+    if (argv.includes("--verbose")) {
+      console.error("Unrecognized flag: --verbose");
+      process.exit(1);
+    }
+    process.exit(0);
+  }
   if (models.length) {
     const verbose = argv.includes("--verbose");
     console.log(

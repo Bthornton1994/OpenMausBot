@@ -666,13 +666,61 @@ describe("Antigravity driver over shared ACP", () => {
     expect(dumpState.env.GEMINI_HOME).toBe(antigravityProfileDirectory(instanceId));
     expect(dumpState.env.GEMINI_API_KEY).toBeUndefined();
     expect(dumpState.env.GOOGLE_API_KEY).toBeUndefined();
+    // The session starts on the chosen model, so only the mode is set.
+    expect(dumpState.env.AGY_ACP_DEFAULT_MODEL).toBe("gemini-3.8-flash-low");
     const calls = JSON.parse(readFileSync(`${dump}.config.json`, "utf8"));
     expect(calls).toEqual([
-      { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: "gemini-3.8-flash-low" } },
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "mode", value: approvalMode === "full" ? "yolo" : approvalMode === "edits" ? "auto_edit" : "default" } },
     ]);
     const mcp = JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8"));
     expect(mcp).toEqual([{ name: "docs", command: "docs-mcp", args: ["serve"], env: [{ name: "TOKEN", value: "scoped" }] }]);
+  });
+
+  // Google's server reads AGY_ACP_DEFAULT_MODEL for a new session (checked
+  // against agy_acp_server 1.1.1). Without it every new conversation paid a
+  // model switch that re-fetches the account's models: 1.3-1.8 s measured.
+  // An approval change used to respawn the process: 7-10 s on a Mac.
+  it("keeps one process across approval and model changes, starting on OMB's model", async () => {
+    ensureDirs();
+    const fake = fakeRuntime();
+    const dump = join(fake.directory, "dump.json");
+    const launches = join(fake.directory, "launches");
+    const instanceId = "antigravity-pooled";
+    const tokenDirectory = join(antigravityProfileDirectory(instanceId), "antigravity-acp");
+    mkdirSync(tokenDirectory, { recursive: true });
+    writeFileSync(join(tokenDirectory, "acp_token.json"), "{}", { mode: 0o600 });
+    instance = await AntigravityDriver.create({
+      instanceId,
+      displayName: "Antigravity",
+      environment: {
+        AGY_ACP_DEFAULT_MODEL: "ambient-must-not-win",
+        FAKE_ACP_AUTH_METHOD: "oauth-personal",
+        FAKE_ACP_MODELS: "gemini-3.7-flash-high,gemini-3.8-flash-high,gemini-3.8-flash-low",
+        FAKE_ACP_MODES: "default,yolo,auto_edit",
+        FAKE_ACP_DUMP: dump,
+        FAKE_ACP_LAUNCH_COUNT_FILE: launches,
+      },
+      enabled: true,
+      config: { cli: fake.executable, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+    const run = async (approvalMode: "ask" | "full" | "edits", model: string) => {
+      const { turnId } = await instance!.adapter.sendTurn({
+        threadId: "thread-pooled", text: "hello", approvalMode, model, cwd: fake.directory,
+      });
+      expect(await recorder!.until((event) => event.type === "turn.completed" && event.turnId === turnId)).toMatchObject({ ok: true });
+    };
+    await run("ask", "gemini-3.8-flash-high");
+    await run("full", "gemini-3.8-flash-high");
+    await run("edits", "gemini-3.8-flash-low");
+    expect(Number(readFileSync(launches, "utf8"))).toBe(1);
+    expect(JSON.parse(readFileSync(dump, "utf8")).env.AGY_ACP_DEFAULT_MODEL).toBe("gemini-3.8-flash-high");
+    expect(JSON.parse(readFileSync(`${dump}.config.json`, "utf8")).map((call: any) => [call.params.configId, call.params.value])).toEqual([
+      ["mode", "default"],
+      ["mode", "yolo"],
+      ["model", "gemini-3.8-flash-low"],
+      ["mode", "auto_edit"],
+    ]);
   });
 
   it("fails closed when Antigravity does not confirm its permission mode", async () => {
