@@ -35,6 +35,33 @@ New rooms start on Auto while the decider and its room job are on. Existing
 rooms keep their mode. With Jev off, an Auto room shows a one-line hint and
 answers like lead mode.
 
+**Which memories come back** (on by default). Before a turn, automatic recall
+finds passages from the bot's memory files and, in a 1:1 chat, its other
+conversations by keyword. With this job on, Jev reads the message and every
+candidate (up to 24, in one request) and says, for each, how likely it is to
+help answer the message.
+
+- The likeliest passages come first, and any below 0.15 are left out: an
+  unrelated note in front of a message is noise. The usual caps (four notes,
+  four conversation passages) then apply as before.
+- A memory topic the message names directly is always kept and never asked
+  about.
+- When the bot calls `session_search` itself, Jev only reorders the results;
+  nothing is dropped, because the bot asked.
+- No answer within 1.2 seconds, or any failure: the keyword order, exactly as
+  without Jev.
+
+**Which skills fit** (off by default). With this job on, the system prompt
+lists the bot's enabled skills by name only, the same text every turn so the
+engine's prompt cache keeps working. Jev reads the message and each skill's
+name and description and says which could help. The full entries (description
+and `SKILL.md` path) of the skills at 0.3 or above, at most eight, likeliest
+first, go in front of the message, where recalled passages go. The bot can
+still use any listed skill by name. If Jev does not answer within 1.2 seconds
+or fails, the full skills index goes in front of the message instead, so the
+bot never has less than it had before. With the job off, the system prompt
+carries the full index exactly as before.
+
 Browser clicks, tool selection and where work runs are listed as "Coming
 soon" and have no switch yet.
 

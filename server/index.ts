@@ -115,7 +115,7 @@ import {
 import * as composio from "./composio.ts";
 import { connectorCallFromFrame, connectorRefusalText, connectorUnrecognizedText, evaluateConnectorTools } from "./connector-verdict.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
-import { buildRecall } from "./recall.ts";
+import { buildRecall, buildRecallJudged, plainSnippet } from "./recall.ts";
 import { createMemoryUpkeep, upkeepEnabled } from "./memory-upkeep.ts";
 import { appendAboutMe, commitLearned, planLearned } from "./profile-learned.ts";
 import { canAccessTeam, canReachPeer, coordinatorSupervises, livePeerRoster, livePeerRosterBlock, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, resolveTeammate, roomPeerRosterSystemPrompt, roomRosterLine, PEER_ACCESS_HELP } from "./peer-roster.ts";
@@ -237,7 +237,7 @@ import type { GroupGoalRunCardData, GroupGoalRunStatus } from "../shared/group-g
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
-import { readMessageText, recallMessages, recentMessages, searchMessagesAsync, closeMessageSearch, closeMessageDb, chatFollowups, cancelledChatFollowup, settleChatFollowups, threadsReferencing } from "./message-db.ts";
+import { readMessageText, recallMessages, recentMessages, type RecallHit, searchMessagesAsync, closeMessageSearch, closeMessageDb, chatFollowups, cancelledChatFollowup, settleChatFollowups, threadsReferencing } from "./message-db.ts";
 import { briefCrossingLabel, claimRecallCrossings, recallCrossingLabel } from "./recall-disclosure.ts";
 import { parseSince, parseUntil, recentWork, recentWorkPrompt, turnOutcomeLine } from "./recent-work.ts";
 import { chiefForBot, INCIDENTS_THREAD_TITLE, IncidentLedger, incidentChip, incidentText, type Incident, type IncidentKind } from "./incidents.ts";
@@ -322,6 +322,8 @@ import {
 import * as tts from "./tts/index.ts";
 import { createDecider, deciderIncludedHere, deciderReady, deciderSavePatch, describeDecider } from "./decider/index.ts";
 import { decideRoomResponder, type RoomRoutingInput } from "./decider/room-routing.ts";
+import { judgeRecallCandidates, MEMORY_RECALL_MIN_PROBABILITY, reorderSearchResults } from "./decider/memory-recall.ts";
+import { pickSkills } from "./decider/skill-pick.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh, NATIVELY_REPLAYING_DRIVER_KINDS, peerMessageText } from "./turn-context.ts";
 import { Handoffs, handedStateUsable, recordHanded, renderUnseen, sessionStart, unseenMessages, withUnseenMessages, type ContextMessage } from "./delta-context.ts";
@@ -378,6 +380,12 @@ import {
   setSkillEnabled,
   skillPackageStamps,
   skillsSystemPrompt,
+  skillIndexEntries,
+  namesIndexEntries,
+  renderSkillNamesIndex,
+  renderSkillsIndex,
+  skillsTurnNote,
+  type SkillIndexEntry,
   stageSkillWrite,
 } from "./skills.ts";
 import { fetchSkillFromSource } from "./skill-fetch.ts";
@@ -1362,7 +1370,7 @@ function recentWorkSources(bot: BotRecord) {
  * turn the person started — because a message from another bot, a webhook
  * or a room must not be able to pull a private chat into its reply. The
  * conversations are the ones session_search would search, minus this one. */
-function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opts: { conversations: boolean; userName: string }): string {
+async function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opts: { conversations: boolean; userName: string }): Promise<string> {
   if (!autoRecallEnabled(cfg)) return "";
   const roomByThread = new Map<string, GroupRecord>();
   if (opts.conversations) {
@@ -1379,7 +1387,7 @@ function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opt
       .filter((id) => id !== threadId && (!CLOUD_HOME || cloudOwnerOnlyThread(id)))
     : [];
   try {
-    const recalled = buildRecall({
+    const input: Parameters<typeof buildRecall>[0] = {
       botId: bot.id,
       message,
       threadIds,
@@ -1391,7 +1399,13 @@ function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opt
         return id === bot.threadId ? "your main chat" : "an earlier chat";
       },
       author: (hit) => (hit.role === "user" ? hit.peer ?? opts.userName : hit.from ?? bot.name),
-    });
+    };
+    // The decision model's memory recall job: one question over every
+    // candidate, the likeliest first and the unrelated left out. Off, or no
+    // answer: the keyword selection, exactly as without it.
+    const recalled = deciderReady(cfg, "memoryRecall")
+      ? await buildRecallJudged(input, (query, candidates) => judgeRecallCandidates(decider, query, candidates), MEMORY_RECALL_MIN_PROBABILITY)
+      : buildRecall(input);
     if (recalled) console.log(`auto-recall: ${bot.name} (${bot.id}) got ${recalled.notes} note and ${recalled.conversations} conversation passage(s) in ${threadId}`);
     return recalled?.text ?? "";
   } catch (err) {
@@ -1400,9 +1414,35 @@ function autoRecallPrompt(bot: BotRecord, threadId: string, message: string, opt
   }
 }
 
+/** The notes in front of a turn's message, the recalled block last (its
+ * closing line says the message follows). */
+function turnNotes(...notes: string[]): string {
+  return notes.filter(Boolean).join("\n\n");
+}
+
 /** The recalled block in front of a turn's message, or the message alone. */
 function withRecalled(recalled: string, text: string): string {
   return recalled ? `${recalled}\n\n${text}` : text;
+}
+
+/** The skills section of a bot's system prompt. With the decision model's
+ * skill pick job ready it lists names only, the same every turn so the
+ * prompt cache holds, and `pick` carries what a turn asks about; otherwise
+ * today's full index. */
+function skillsIndexPlan(botId: string): { system: string; pick?: { entries: SkillIndexEntry[]; listed: SkillIndexEntry[] } } {
+  if (!deciderReady(cfg, "skillPick")) return { system: skillsSystemPrompt(botId) };
+  const entries = skillIndexEntries(botId);
+  const listed = namesIndexEntries(botId, entries);
+  if (!listed.length) return { system: renderSkillsIndex(entries) };
+  return { system: renderSkillNamesIndex(botId, listed), pick: { entries, listed } };
+}
+
+/** The skills note in front of this turn's message: the full entries of the
+ * skills that fit it or, with no answer, the full index; "" while skills
+ * are not picked. */
+async function skillsTurnPrompt(plan: ReturnType<typeof skillsIndexPlan>, message: string): Promise<string> {
+  if (!plan.pick) return "";
+  return skillsTurnNote(plan.pick.entries, await pickSkills(decider, message, plan.pick.listed));
 }
 
 /** Bots in one room must be visible to the same people: a room is one
@@ -3486,7 +3526,7 @@ function previewSystemPrompt(bot: BotRecord) {
     { id: "profile", label: "Profile changes", text: agentsMounted ? PROFILE_PROMPT : "" },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "memory", label: "Memory", text: memorySystemPrompt(bot.id, { managedWrites: agentsMounted, fileTools: Boolean(privateWorkspace) }) },
-    { id: "skills", label: "Skills index", text: privateWorkspace ? skillsSystemPrompt(bot.id) : "" },
+    { id: "skills", label: "Skills index", text: privateWorkspace ? skillsIndexPlan(bot.id).system : "" },
   ]);
   const totalBytes = built.sections.reduce((n, s) => n + s.bytes, 0);
   return {
@@ -9523,6 +9563,22 @@ async function startTurn(
       }
       const computerSelection = computerSelectionTurns.get(threadId);
       if (computerSelection) computerSelection.mounted = mountedComputer ?? (integrations.browser ? "browser" : undefined);
+      // Recall and the skills note are settled first: with the decision model
+      // they wait up to its short budget, and a Stop in that wait must still
+      // stop the turn at the check below.
+      const skillsPlan = privateWorkspace ? skillsIndexPlan(bot.id) : { system: "" };
+      // Automatic recall rides in front of THIS turn's message, never in the
+      // system prompt: the volatile half is re-sent whole whenever any part of
+      // it changes, and recall changes nearly every turn.
+      const [recalled, skillsNote] = await Promise.all([
+        autoRecallPrompt(bot, threadId, resolvedImages.text, {
+          // a routine run starts fresh by design, and a webhook is untrusted:
+          // neither pulls earlier conversations in
+          conversations: commsDepth === 0 && !opts?.coordination && !opts?.automationSource && !opts?.unattended,
+          userName: cfg.profile?.name?.trim() || "User",
+        }),
+        skillsTurnPrompt(skillsPlan, resolvedImages.text),
+      ]);
       // A cancelled adapter can be between accepting sendTurn and revealing
       // its provider turn id. Never overlap a replacement with that ambiguous
       // pre-id window: wait for the old handshake to settle or for its bounded
@@ -9572,22 +9628,13 @@ async function startTurn(
         // never redoes — or forgets — what another one already did
         { id: "recent", label: "Recent work", text: recentWorkPrompt(recentWork(recentWorkSources(bot), bot, { userName: cfg.profile?.name?.trim() || "User", currentThreadId: threadId, ...recentWorkFilter() })) },
         { id: "memory", label: "Memory", text: memorySystemPrompt(bot.id, { managedWrites: Boolean(integrations.agents), fileTools: worksInWorkspace }) },
-        { id: "skills", label: "Skills index", text: privateWorkspace ? skillsSystemPrompt(bot.id) : "" },
+        { id: "skills", label: "Skills index", text: skillsPlan.system },
         { id: "skill-instructions", label: "Skill instructions", text: skillInstructions },
         { id: "playbooks", label: "Playbooks", text: packagePlaybooks },
         { id: "webhook", label: "Webhook provenance", text: opts?.automationSource === "webhook" ? WEBHOOK_PROMPT : "" },
         { id: "mentions", label: "Mentions", text: boundedCoordination && tagged.length ? `The user named these existing teammates: ${tagged.map(b => `${peerName(b.name)} (${b.id})`).join(", ")}. Use coordinate_bots when their contribution is needed; do not substitute native helper agents for these bots.` : mentionPrompt(tagged) },
       ]);
       turnPromptBytes.set(threadId, { stable: Buffer.byteLength(prompt.stable), volatile: Buffer.byteLength(prompt.volatile) });
-      // Automatic recall rides in front of THIS turn's message, never in the
-      // system prompt: the volatile half is re-sent whole whenever any part of
-      // it changes, and recall changes nearly every turn.
-      const recalled = autoRecallPrompt(bot, threadId, resolvedImages.text, {
-        // a routine run starts fresh by design, and a webhook is untrusted:
-        // neither pulls earlier conversations in
-        conversations: commsDepth === 0 && !coordinationNode && !opts?.automationSource && !opts?.unattended,
-        userName: cfg.profile?.name?.trim() || "User",
-      });
       runningTurnEngines.set(threadId, instance);
       // The prompt carries the soul as saved now. If it changed during setup,
       // decide again from what is actually sent — except on a continuation
@@ -9611,7 +9658,7 @@ async function startTurn(
         threadId,
         botId: bot.id,
         startupRecovery: cfg.automaticRecovery?.enabled === true && !opts?.automaticRecoveryAttempted,
-        text: withRecalled(recalled, dispatchContext.turnText),
+        text: withRecalled(turnNotes(skillsNote, recalled), dispatchContext.turnText),
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: approvalModeForTurn(bot, commsDepth > 0),
@@ -11669,6 +11716,7 @@ async function runGroupMemberTurn(
       });
     }
   }
+  const roomSkillsPlan = workspace ? skillsIndexPlan(bot.id) : { system: "" };
   const roomSystem = buildSystemPrompt(system, store.bot(bot.id)?.soul ?? bot.soul ?? "", [
     { id: "user-profile", label: "About the user", text: userProfileSystemPrompt(cfg.profile) },
     { id: "files", label: "File locations", text: workspace ? workspaceLocationsPrompt(bot.id, cwd, readyBot.cwd) : "" },
@@ -11687,7 +11735,7 @@ async function runGroupMemberTurn(
     // mounted, exactly as the 1:1 path decides it: memory_update is on the
     // agents server, so a room turn with it must be told to use it too.
     { id: "memory", label: "Memory", text: roomMemory ? `\n${roomMemory.trim()}` : "" },
-    { id: "skills", label: "Skills index", text: workspace ? skillsSystemPrompt(bot.id) : "" },
+    { id: "skills", label: "Skills index", text: roomSkillsPlan.system },
     { id: "skill-instructions", label: "Skill instructions", text: renderSkillInstructions(selectedSkills, { includeRoot: Boolean(workspace) }) },
     { id: "playbooks", label: "Playbooks", text: installedPlaybookInstructions(text, bot.playbooks) },
   ]);
@@ -11698,6 +11746,15 @@ async function runGroupMemberTurn(
   // connector-failed first responder must not silently consume /learn for the
   // next eligible room member.
   if (skillAuthoring) skillAuthoringClaim.claimed = true;
+  // Recall and the skills note are settled before the checks below: with the
+  // decision model they wait up to its short budget, and a Stop in that wait
+  // must still stop the turn there. Notes only in a room: a private chat
+  // reaches a room through the explicit, disclosed session_search, never
+  // automatically.
+  const [roomRecalled, roomSkillsNote] = await Promise.all([
+    cardContinuation ? "" : autoRecallPrompt(bot, threadId, resolvedLatestImages.text, { conversations: false, userName }),
+    skillsTurnPrompt(roomSkillsPlan, resolvedLatestImages.text),
+  ]);
   // A stopped room handshake may not have revealed its provider turn id yet.
   // Do not launch a replacement into that ambiguous window; once the old id
   // is known it is retired and this bounded gate clears immediately.
@@ -11795,13 +11852,10 @@ async function runGroupMemberTurn(
     providerDispatched = true;
     turnPromptBytes.set(threadId, { stable: Buffer.byteLength(roomSystem.stable), volatile: Buffer.byteLength(roomSystem.volatile) });
     runningTurnEngines.set(threadId, instance);
-    // notes only in a room: a private chat reaches a room through the
-    // explicit, disclosed session_search, never automatically
-    const roomRecalled = cardContinuation ? "" : autoRecallPrompt(bot, threadId, resolvedLatestImages.text, { conversations: false, userName });
     guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: readyBot.id,
-        text: withRecalled(roomRecalled, text),
+        text: withRecalled(turnNotes(roomSkillsNote, roomRecalled), text),
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: roomTurnApprovalMode(readyBot, threadId, orchestration),
@@ -15506,8 +15560,16 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (scope !== "all" && scope !== "conversations" && scope !== "memory") {
           return json(res, 400, { error: "scope must be all, conversations, or memory" });
         }
-        const memoryHits = scope === "conversations" || !q ? [] : searchMemoryFiles(from.id, q, limit);
-        if (scope === "memory") return json(res, 200, { hits: [], memoryHits });
+        const keywordMemoryHits = scope === "conversations" || !q ? [] : searchMemoryFiles(from.id, q, limit);
+        // The decision model's memory recall job only reorders what the
+        // search found, by meaning, and drops nothing: the bot asked. Off,
+        // or no answer: the keyword order.
+        const judged = (found: RecallHit[]) => q && deciderReady(cfg, "memoryRecall")
+          ? reorderSearchResults(decider, q,
+            { items: keywordMemoryHits, text: (hit) => `${hit.file}: ${plainSnippet(hit.snippet)}` },
+            { items: found, text: (hit) => plainSnippet(hit.snippet) })
+          : Promise.resolve({ memory: keywordMemoryHits, conversations: found });
+        if (scope === "memory") return json(res, 200, { hits: [], memoryHits: (await judged([])).memory });
         // Own threads: the bot's main chat and tasks, and the rooms it is a
         // member of with their tasks — conversations it already saw in full.
         // Still own-bot: another bot's threads never enter this list.
@@ -15527,7 +15589,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // private chat is one: in a 1:1 the user already owns every thread
         // the bot can reach, and a room's lines were said in the open.
         const inRoom = Boolean(store.groupByThread(fromThreadId));
-        const found = q ? recallMessages(q, ownThreads, limit, range) : recentMessages(ownThreads, range ?? {}, limit);
+        const { memory: memoryHits, conversations: found } = await judged(q ? recallMessages(q, ownThreads, limit, range) : recentMessages(ownThreads, range ?? {}, limit));
         const hits = found.map((hit) => {
           const room = roomByThread.get(hit.threadId);
           return {
