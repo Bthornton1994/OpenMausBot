@@ -110,9 +110,17 @@ A routine that ends up nobody's though it is the owner's (for example one a
 v0.1.91 bot template made on the server, which recorded no writer) runs
 confined, and a run that cannot says so: open it and save it once, and it is
 the owner's again, with full access. A routine the owner approved on a bot's
-proposal card is theirs (the card records who allowed it), and so is one
-applied at once in the owner's own Full-access conversation. Resuming, moving
-or retiming a routine that is already the owner's keeps it theirs.
+proposal card is theirs (the card records who allowed it, and what it
+showed: a routine from before counts only while it still runs those
+instructions), and so is one applied at once in the owner's own Full-access
+conversation. One a bot creates or changes at once from any other
+conversation is nobody's, like anyone else's edit. Resuming, moving or
+retiming a routine keeps it the owner's when they are its writer and no
+fingerprint of theirs is on it yet (a template, a restore); a fingerprint
+that no longer matches what it runs is renewed only by the owner rewriting
+its instructions. Each run of a routine works in a conversation opened like
+its results conversation, so a nobody's routine's run is confined to a
+folder of its own.
 
 A key that is adopted but not proven still costs something: its lines keep
 that conversation out of lending and memory, and if a turn there changes the

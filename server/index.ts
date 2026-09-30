@@ -10113,8 +10113,12 @@ routines = new RoutineManager({
     }
     return groupIsWorking(group) || coordinator.busy ? "busy" : "ready";
   },
-  createTask: (botId, title, activate = false) => {
+  createTask: (botId, title, activate = false, routineId) => {
     const task = store.createTask(botId, title, activate);
+    // On a Cloud home a run's conversation is opened, like its results
+    // conversation, by whoever wrote the routine: a run of one that is
+    // nobody's is confined to a folder of its own, never the bot's project.
+    if (task && CLOUD_HOME && routineId) threadStarters.set(task.threadId, routineOpener(routineId));
     const bot = store.bot(botId);
     if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
     return task;
@@ -10222,13 +10226,14 @@ if (CLOUD_HOME && CLOUD_OWNER_KEY && cloudRoutineAuthors) {
       writer: (id) => authors.writer(id),
       fingerprinted: (id) => { const routine = routineById(id); return Boolean(routine) && authors.authored(id, routine!); },
       resultsOpener: (id) => { const results = routineById(id)?.resultsThreadId; return results ? threadStarters.get(results) : undefined; },
+      prompt: (id) => routineById(id)?.prompt,
       name: (id, person) => authors.wrote(id, person),
       pause: (ids) => { for (const id of ids) routines?.update(id, { enabled: false }); },
     },
     unpin: (threadIds) => { for (const threadId of threadIds) store.unpinTaskCwd(threadId); },
     lines: () => {
       const senders = new Set<string>(), answerers = new Set<string>();
-      const approvals: Array<[string, string]> = [];
+      const approvals: Array<[string, string, string]> = [];
       const threads = new Set([...store.bots.flatMap((bot) => store.tasks(bot.id).map((task) => task.threadId)), ...store.groups.map((group) => group.threadId)]);
       for (const threadId of threads) {
         for (const line of store.messagesFor(threadId)) {
@@ -10238,7 +10243,9 @@ if (CLOUD_HOME && CLOUD_OWNER_KEY && cloudRoutineAuthors) {
           if (answerer) answerers.add(answerer);
           // A routine a bot proposed, created when this person allowed its card.
           const request = line.card?.routineRequest;
-          if (answerer && line.card?.answered === "allow" && request?.operation.action === "create" && request.resultId) approvals.push([request.resultId, answerer]);
+          if (answerer && line.card?.answered === "allow" && request?.operation.action === "create" && request.resultId) {
+            approvals.push([request.resultId, answerer, request.operation.routine.instructions]);
+          }
         }
       }
       return { senders, answerers, approvals };
@@ -15420,9 +15427,16 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           canCommit: () => internalCapabilityIsActive(internalCapability),
         });
         const proposedCard = store.messagesFor(fromThreadId).find((message) => message.id === proposed.messageId)?.card;
-        // Applied at once in the owner's own Full-access conversation (one only
-        // they provably wrote in): theirs, as if they had approved the card.
-        if (CLOUD_HOME && proposed.state === "applied" && "result" in proposed && cloudOwnerOnlyThread(fromThreadId)) cloudOwnersRoutine(proposed.result?.resultId);
+        // Applied at once in a Full-access conversation. In the owner's own (one
+        // only they provably wrote in) it is theirs, as if they had approved
+        // the card. From anywhere else, a routine it created or changed is no
+        // longer the owner's, like anyone else's edit (the routine PATCH).
+        const applied = CLOUD_HOME && proposed.state === "applied" && "result" in proposed ? proposed.result : undefined;
+        if (applied?.resultId && cloudOwnerOnlyThread(fromThreadId)) cloudOwnersRoutine(applied.resultId);
+        else if (applied?.resultId && (applied.action === "create" || applied.action === "update")) {
+          cloudRoutineAuthors?.forget(applied.resultId);
+          cloudRoutineAuthors?.wrote(applied.resultId, CLOUD_NOBODY_KEY);
+        }
         appendDecision(DATA_DIR, {
           threadId: fromThreadId,
           requestId: proposed.requestId,
@@ -17279,7 +17293,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // routine stays (or becomes) theirs (their fingerprint, or already
       // theirs as its writer: a template, a restore), a guest when a guest
       // edits it, else whoever wrote it before.
-      const ownerAuthors = cloudOwnerSession(auth) && (wasOwners || (CLOUD_OWNER_KEY !== null && previous === CLOUD_OWNER_KEY) ||
+      // An owner writer is proof only for a routine that never had the
+      // owner's fingerprint (a template, a restore, one the settlement named):
+      // a fingerprint that no longer matches means someone else changed what
+      // it runs, and only the owner rewriting its instructions renews it.
+      const ownerWriterOnly = CLOUD_OWNER_KEY !== null && previous === CLOUD_OWNER_KEY && !cloudRoutineAuthors?.recorded(routineMatch[1]);
+      const ownerAuthors = cloudOwnerSession(auth) && (wasOwners || ownerWriterOnly ||
         (body && typeof body === "object" && "prompt" in body));
       const writer = ownerAuthors && CLOUD_OWNER_KEY ? CLOUD_OWNER_KEY
         : auth.kind === "session" && !cloudOwnerSession(auth) ? actorKey(auth)

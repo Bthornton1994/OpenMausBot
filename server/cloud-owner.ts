@@ -76,13 +76,16 @@ export interface CloudOwnershipOptions {
    * into; `name` records its writer, `pause` turns it off. */
   routines: {
     ids(): Iterable<string>; writer(id: string): string | undefined; fingerprinted(id: string): boolean; resultsOpener(id: string): string | undefined;
+    /** Its instructions as they stand. */
+    prompt(id: string): string | undefined;
     name(id: string, person: string): void; pause(ids: readonly string[]): void;
   };
   /** A conversation's working folder is no longer pinned: its next turn pins its own. */
   unpin(threadIds: readonly string[]): void;
   /** Everyone who wrote a user line (not a bot's) and who answered a card,
-   * anywhere, and who approved each routine a bot proposed (its card). */
-  lines(): { senders: Iterable<string>; answerers: Iterable<string>; approvals: Iterable<[routineId: string, person: string]> };
+   * anywhere, and who approved each routine a bot proposed (its card), with
+   * the instructions they approved. */
+  lines(): { senders: Iterable<string>; answerers: Iterable<string>; approvals: Iterable<[routineId: string, person: string, instructions: string]> };
   /** The id of a restore applied at this boot: what it brought is the owner's. */
   restoredNow?: string;
   /** The id of the last restore on record here, applied at this boot or before. */
@@ -194,8 +197,14 @@ export function settleCloudOwnership(options: CloudOwnershipOptions): CloudOwner
   // 5. Conversations the owner provably opened name the owner; routines are
   // the owner's only with proof, else nobody's.
   const moved = attempt(options, "name the owner on their conversations", () => options.starters.reassign((person) => proven.has(person), options.ownerKey), [], incomplete).length;
-  const approvedBy = new Map(lines.approvals);
   const ownersKey = (person: string | undefined) => person !== undefined && (person === options.ownerKey || proven.has(person));
+  // A card the owner allowed is proof of what it showed them: only while the
+  // routine still runs those instructions (anyone could rewrite a routine on
+  // v0.1.91 without being recorded).
+  const approved = new Set<string>();
+  for (const [id, person, instructions] of lines.approvals) {
+    if (ownersKey(person) && options.routines.prompt(id) === instructions) approved.add(id);
+  }
   let owners = 0, nobodys = 0;
   attempt(options, "name each routine's writer", () => {
     for (const id of options.routines.ids()) {
@@ -204,7 +213,7 @@ export function settleCloudOwnership(options: CloudOwnershipOptions): CloudOwner
       // that names nobody yet, or the owner (a backup from before can hold a
       // guest's routine and its conversation).
       const opener = options.routines.resultsOpener(id);
-      const owner = writer === options.ownerKey || options.routines.fingerprinted(id) || ownersKey(approvedBy.get(id)) ||
+      const owner = writer === options.ownerKey || options.routines.fingerprinted(id) || approved.has(id) ||
         (restoring && writer !== options.nobodyKey && !(writer !== undefined && revoked.has(writer)) && (opener === undefined || ownersKey(opener)));
       if (writer !== (owner ? options.ownerKey : options.nobodyKey)) options.routines.name(id, owner ? options.ownerKey : options.nobodyKey);
       if (owner) owners += 1; else nobodys += 1;

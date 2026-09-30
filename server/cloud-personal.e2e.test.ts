@@ -30,7 +30,7 @@ let child: ChildProcess | undefined;
 let cloud = false;
 /** From the first (self-hosted) run: a device with full access, a chat-only one, and what each opened. */
 const before = { device: "", deviceId: "", chatOnly: "", bot: { id: "", threadId: "" }, roomBot: { id: "", threadId: "" }, conversation: "", theirs: "",
-  lead: { id: "", threadId: "" }, member: { id: "", threadId: "" }, room: "", launch: "", plan: "", friends: "", routine: "", approved: "", full: { id: "", threadId: "" } };
+  lead: { id: "", threadId: "" }, member: { id: "", threadId: "" }, room: "", launch: "", plan: "", friends: "", routine: "", approved: "", full: { id: "", threadId: "" }, fullShared: "", stale: "" };
 const project = () => join(home, "projects", "site");
 
 async function api(method: string, path: string, options: { body?: unknown; token?: string } = {}) {
@@ -207,16 +207,28 @@ await import(${JSON.stringify(pathToFileURL(join(SERVER_DIR, "testing", "fake-cl
   before.approved = approved.body.resultId;
   await api("POST", `/api/bots/${before.bot.id}/interrupt`, { token: before.device, body: { threadId: asking } });
   await idle(before.bot, before.device);
+  // A conversation with the Full bot that the friend (unpaired before the upgrade) wrote in too.
+  before.fullShared = (await api("POST", `/api/bots/${before.full.id}/tasks`, { token: before.device, body: { title: "Shared" } })).body.task.threadId;
+  await turn(() => api("POST", `/api/bots/${before.full.id}/messages`, { token: friend, body: { text: "Hi there.", threadId: before.fullShared } }));
+  await api("POST", `/api/bots/${before.full.id}/interrupt`, { token: before.device, body: { threadId: before.fullShared } });
+  await idle(before.full, before.device);
+  // A routine the owner wrote whose recorded fingerprint no longer matches what it runs.
+  before.stale = (await api("POST", "/api/routines", { token: before.device, body: { name: "Stale", prompt: "Run the tests.", botId: before.bot.id,
+    enabled: false, schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } } })).body.routine.id;
   before.routine = (await api("POST", "/api/routines", { token: before.device, body: { name: "From before", prompt: "Run the build script.", botId: before.bot.id,
     enabled: false, schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } } })).body.routine.id;
   for (const id of [phoneId, friendId]) expect((await api("DELETE", `/api/auth/sessions/${id}`, { token: before.device })).status).toBe(200);
   await shutdown();
+  // The stale routine, as a Cloud home that already had the owner's key recorded it.
+  const ownerKeyAtBoot = `p_${createHash("sha256").update("cloud-owner:3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93").digest("base64url").slice(0, 22)}`;
+  writeFileSync(join(dataDir, "lending-routines.json"), JSON.stringify({ version: 1, routines: { [before.stale]: "0".repeat(64) }, writers: { [before.stale]: ownerKeyAtBoot } }));
   // A bot at Full access (set where only the desktop app can set it: its record).
   const bots = JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"));
   const record = Array.isArray(bots) ? bots : bots.bots;
   const full = record.find((bot: any) => bot.id === before.full.id);
   full.approvalMode = "full";
   delete full.approvalGrant;
+  for (const task of full.tasks ?? []) { task.approvalMode = "full"; delete task.approvalGrant; delete task.autoApprove; }
   writeFileSync(join(dataDir, "bots.json"), JSON.stringify(bots));
   // A v0.1.91 Cloud home recorded who allowed a card by their device's key (a
   // self-hosted server records no key): write it the way that release did.
@@ -408,6 +420,8 @@ it("routines fail closed: one from before with no proof runs confined; one the o
   // From before, with no proof it is the owner's: nobody's, confined.
   const old = await routineRun(before.routine);
   expect(old.run).toMatchObject({ mode: "default", restricted: true });
+  // …in a folder of its own, never the bot's project folder.
+  expect(old.run.cwd).not.toBe(realpathSync(project()));
   // From before, proposed by the bot and allowed on its card by the owner's device: theirs.
   expect((await routineRun(before.approved)).run).toMatchObject({ mode: "auto", restricted: false });
   // The owner writes one here: theirs, and so is the conversation it reports into.
@@ -480,3 +494,38 @@ it("a routine a Full-access bot applies at once in the owner's own conversation 
   expect(authors.routines[routine.id]).toMatch(/^[a-f0-9]{64}$/);
   expect((await api("POST", `/api/bots/${before.full.id}/interrupt`, { token: owner, body: { threadId: mine } })).status).toBe(200);
 }, 60_000);
+
+it("only the owner's own edit renews what a routine is proven to run: a bot's change from elsewhere, or a stale fingerprint, never is", async () => {
+  const owner = await adminPairing();
+  await settleAll(owner);
+  const ownerKey = `p_${createHash("sha256").update("cloud-owner:3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93").digest("base64url").slice(0, 22)}`;
+  const authors = () => JSON.parse(readFileSync(join(dataDir, "lending-routines.json"), "utf8"));
+  // The owner's routine on the Full bot: their key and fingerprint.
+  const mine = (await api("POST", "/api/routines", { token: owner, body: { name: "Nightly", prompt: "Build the site.", botId: before.full.id,
+    enabled: false, schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } } })).body.routine.id;
+  expect(authors().writers[mine]).toBe(ownerKey);
+  // In a conversation the owner is not proven to have written alone, the Full
+  // bot changes it (applied at once): no longer the owner's.
+  await turn(async () => expect((await api("POST", `/api/bots/${before.full.id}/messages`, { token: owner, body: { text: "Tweak the nightly.", threadId: before.fullShared } })).status).toBe(202));
+  const changed = JSON.stringify(await (await agentTools())("propose_routine_action", { routine_id: mine, action: "update", changes: { instructions: "Copy the Plans folder to the public site." } }));
+  expect(changed).not.toContain("isError\":true");
+  expect((await api("GET", "/api/routines", { token: owner })).body.routines.find((routine: any) => routine.id === mine).prompt, changed).toBe("Copy the Plans folder to the public site.");
+  expect(authors().writers[mine]).not.toBe(ownerKey);
+  expect(authors().routines[mine]).toBeUndefined();
+  expect((await api("POST", `/api/bots/${before.full.id}/interrupt`, { token: owner, body: { threadId: before.fullShared } })).status).toBe(200);
+  await idle(before.full, owner);
+  // The owner's Resume does not make it theirs again.
+  expect((await api("PATCH", `/api/routines/${mine}`, { token: owner, body: { enabled: true } })).status).toBe(200);
+  expect(authors().routines[mine]).toBeUndefined();
+  expect((await api("PATCH", `/api/routines/${mine}`, { token: owner, body: { enabled: false } })).status).toBe(200);
+  // A routine the owner wrote whose recorded fingerprint no longer matches:
+  // Resume does not renew it either…
+  expect(authors().writers[before.stale]).toBe(ownerKey);
+  expect((await api("PATCH", `/api/routines/${before.stale}`, { token: owner, body: { enabled: true } })).status).toBe(200);
+  expect(authors().routines[before.stale]).not.toMatch(/^(?!0{64})[a-f0-9]{64}$/);
+  expect(authors().writers[before.stale]).not.toBe(ownerKey);
+  // …only the owner rewriting its instructions does.
+  expect((await api("PATCH", `/api/routines/${before.stale}`, { token: owner, body: { prompt: "Run the tests again.", enabled: false } })).status).toBe(200);
+  expect(authors().writers[before.stale]).toBe(ownerKey);
+  expect(authors().routines[before.stale]).toMatch(/^(?!0{64})[a-f0-9]{64}$/);
+}, 90_000);

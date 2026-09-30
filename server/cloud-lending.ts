@@ -165,6 +165,9 @@ export function createCloudRoutineAuthors(file: string) {
     /** Whether this routine, as it stands (or as a run snapshotted it), is
      * exactly what the owner wrote. */
     authored(id: string, routine: RoutineShape) { return Object.hasOwn(routines, id) && routines[id] === routineFingerprint(routine); },
+    /** Whether the owner's fingerprint is on record for this routine at all,
+     * matching what it runs now or not. */
+    recorded(id: string): boolean { return Object.hasOwn(routines, id); },
     /** Everyone named as a writer (server/cloud-owner.ts). */
     people(): Set<string> { return new Set(Object.values(writers)); },
     /** Name `to` as the writer wherever `move` accepts the writer: a one-time
