@@ -312,6 +312,8 @@ import {
   sectionKey,
   Store,
   titleFromLlm,
+  UNTITLED_TASK,
+  UNTITLED_THREAD,
   type BotRecord,
   type GroupDefaultResponder,
   type GroupRecord,
@@ -324,6 +326,8 @@ import { createDecider, deciderIncludedHere, deciderReady, deciderSavePatch, des
 import { decideRoomResponder, type RoomRoutingInput } from "./decider/room-routing.ts";
 import { judgeRecallCandidates, MEMORY_RECALL_MIN_PROBABILITY, reorderSearchResults } from "./decider/memory-recall.ts";
 import { pickSkills } from "./decider/skill-pick.ts";
+import { decideTaskOutcome } from "./decider/task-outcome.ts";
+import { SteerSplitLane, decideSteerSplit, type SteerSplitInput } from "./decider/steer-split.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh, NATIVELY_REPLAYING_DRIVER_KINDS, peerMessageText } from "./turn-context.ts";
 import { Handoffs, handedStateUsable, recordHanded, renderUnseen, sessionStart, unseenMessages, withUnseenMessages, type ContextMessage } from "./delta-context.ts";
@@ -3393,6 +3397,27 @@ const store = new Store(
 const teamComputers = new TeamComputers(join(DATA_DIR, "team-computers.json"), ENVIRONMENT_ID);
 let followupsReady = false;
 const sendSequencer = new SendSequencer();
+// Busy sends to one thread go through here one at a time while the decision
+// model sorts them into "same task" and "separate request"
+// (server/decider/steer-split.ts). Without a thread id, nothing waits.
+const steerSplitLane = new SteerSplitLane();
+function inSteerSplitLane<T>(threadId: string | undefined, work: () => Promise<T>): () => Promise<T> {
+  return () => threadId ? steerSplitLane.run(threadId, work) : work();
+}
+
+/** What the running turn of a thread was asked: the thread's title (when it
+ * is not the placeholder) and the newest person's line that started a turn,
+ * as opposed to one steered into it. */
+function steerSplitInputFor(botId: string, threadId: string, message: string): SteerSplitInput {
+  const title = store.taskByThread(botId, threadId)?.title;
+  const request = store.activePath(threadId)
+    .findLast((line) => line.role === "user" && line.kind === "text" && !line.steered && Boolean(line.text?.trim()));
+  return {
+    ...(title && title !== UNTITLED_TASK && title !== UNTITLED_THREAD ? { title } : {}),
+    ...(request?.text ? { request: request.text } : {}),
+    message,
+  };
+}
 bootSelection = await defaultSelection();
 store.seedIfEmpty();
 hostedModels?.reconcile(store);
@@ -7401,7 +7426,25 @@ bus.subscribe((event: RuntimeEvent) => {
             ? reply || routineRun.output || routineRun.routineName
             : reply;
           const notificationBot = (routineRun && routineSourceOwner(routineRun)?.bot) || bot;
-          notify(buildNotification("done", notificationBot, routineReportThread ?? event.threadId, completionDetail, { avatarUrl: notificationBot.avatarUrl }));
+          const notifyThreadId = routineReportThread ?? event.threadId;
+          const notifyDone = () => notify(buildNotification("done", notificationBot, notifyThreadId, completionDetail, { avatarUrl: notificationBot.avatarUrl }));
+          const finalReply = routineRun ? reply || routineRun.output || "" : "";
+          if (routineRun && finalReply.trim() && deciderReady(cfg, "taskOutcome")) {
+            // An ok turn is not always a done task: ask the decision model
+            // whether the reply says it was carried out, holding the
+            // "finished" notification for at most its budget. Only a clear
+            // "blocked" changes anything; every other answer is today's.
+            const completedRun = routineRun;
+            void decideTaskOutcome(decider, { name: completedRun.routineName, prompt: completedRun.prompt, reply: finalReply })
+              .then((outcome) => {
+                if (outcome.kind !== "blocked") return notifyDone();
+                routines?.markRunOutcome(completedRun.id, { kind: "blocked", probability: outcome.probability });
+                notify(buildNotification("routine-blocked", notificationBot, notifyThreadId, completionDetail, { avatarUrl: notificationBot.avatarUrl }));
+              })
+              .catch((error) => console.warn("task outcome: could not notify", error));
+          } else {
+            notifyDone();
+          }
         }
         if (screenPollers.has(event.threadId)) {
           // the last live frame becomes a settled inline screen message —
@@ -9917,6 +9960,7 @@ function routineRunCard(run: RoutineRun): NonNullable<Message["routineRun"]> {
     status: run.status,
   };
   if (run.goalStatus) card.goalStatus = run.goalStatus;
+  if (run.outcome?.kind === "blocked" && run.status === "completed") card.outcome = "blocked";
   if (run.deferredAt != null && run.status === "queued") card.deferredAt = run.deferredAt;
   if (run.threadId) card.executionThreadId = run.threadId;
   if (summary) card.summary = summary;
@@ -9936,7 +9980,7 @@ function routineRunFallbackText(card: NonNullable<Message["routineRun"]>): strin
           : card.goalStatus === "failed"
             ? "failed"
             : undefined;
-  const state = goalState ?? (
+  const state = goalState ?? (card.outcome === "blocked" ? "needs your attention" : undefined) ?? (
     card.status === "waiting"
       ? "needs your attention"
       : card.status === "completed"
@@ -20283,10 +20327,16 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const sendId = parseSendId(body.sendId);
       const replyTo = resolveReplyTarget(threadId, body.replyToId);
+      // While a busy thread's sends are being sorted into "same task" and
+      // "separate request", they go one at a time, so a slow answer never
+      // lets a later message overtake an earlier one. With the job off,
+      // nothing waits here.
+      const splitLane = !guarded && deciderReady(cfg, "steerSplit") &&
+        (steerSplitLane.pending(threadId) || store.projectBotForTask(bot.id, threadId)?.busy === true);
       const receipt = await sendSequencer.run(
         sendId ? `bot:${bot.id}:${threadId}:${sendId}` : undefined,
         sendFingerprint(text, replyTo?.id),
-        async () => {
+        inSteerSplitLane(splitLane ? threadId : undefined, async () => {
           if (sendId) {
             if (cancelledChatFollowup("bot", bot.id, threadId, sendId)) {
               throw Object.assign(new Error("this queued sendId was cancelled; send a new message to try again"), { status: 409 });
@@ -20350,6 +20400,34 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // loses a race with turn settlement, or the engine cannot steer, the
           // existing server-side queue records it atomically for the next turn.
           if (currentAtStart.busy) {
+            // Ask whether these words belong to the running task at all. A
+            // clear "separate request" is not steered in: it waits as its
+            // own queue item and runs as its own turn afterwards. Any other
+            // answer, or none within 800 ms, is today's steer-or-queue.
+            if (deciderReady(cfg, "steerSplit")) {
+              const split = await decideSteerSplit(decider, steerSplitInputFor(bot.id, threadId, text));
+              if (split.kind === "separate") {
+                // The wait was async: the turn may have settled, the task
+                // gone, or the bot been deleted meanwhile.
+                const current = store.projectBotForTask(bot.id, threadId);
+                if (!current) throw Object.assign(new Error("no such bot"), { status: 404 });
+                if (!store.taskByThread(bot.id, threadId)) {
+                  throw Object.assign(new Error("the target task no longer exists"), { status: 409 });
+                }
+                if (!current.busy) {
+                  return startOrQueueDirectMessage(bot.id, threadId, text, replyTo, sendId, messageSender(auth), trigger);
+                }
+                const queued = queueSteeredMessage(current.id, threadId, text, {
+                  replyToId: replyTo?.id,
+                  sendId,
+                  prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
+                  reason: "separate",
+                  sender: messageSender(auth),
+                  trigger,
+                });
+                return { ok: true as const, queued: true as const, queueId: queued.id, threadId, reason: "separate" as const };
+              }
+            }
             const instance = runningTurnInstance(currentAtStart, threadId);
             let steered: SteerOutcome = "refused";
             // A live text steer has no image side channel. Keep an attachment
@@ -20427,7 +20505,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             return { ok: true as const, queued: true as const, queueId: queued.id, threadId };
           }
           return startOrQueueDirectMessage(bot.id, threadId, text, replyTo, sendId, messageSender(auth), trigger);
-        },
+        }),
       );
       return json(res, 202, receipt);
     }

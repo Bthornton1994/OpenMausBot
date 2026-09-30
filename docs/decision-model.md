@@ -62,6 +62,38 @@ or fails, the full skills index goes in front of the message instead, so the
 bot never has less than it had before. With the job off, the system prompt
 carries the full index exactly as before.
 
+**Did a routine really finish.** On by default. When a routine's turn ends
+without an error, Jev reads the routine's name and instructions (clipped to
+about 1,500 characters) and the bot's final reply (the last 6,000
+characters, where the conclusion is) and says whether the reply reports the
+task done, not done, or nothing to do. The "finished" notification waits for
+the answer, at most 5 seconds.
+
+- If "not done" comes back with a probability of at least 0.75, the
+  notification says the routine **needs attention** instead of "finished",
+  and the run shows **Needs attention** in the routine's history and on its
+  card in the results thread.
+- The run still counts as completed: it is not retried, not marked failed and
+  does not add to the routine's failure streak.
+- Anything else, a lower probability or no answer in time sends the usual
+  "finished" notification.
+
+**Correction or new request.** Off until switched on. When you send a
+message while a bot is busy, Jev reads the thread's title with the message
+that started the running turn (about 1,500 characters) and your new message
+(about 2,000 characters) and says whether the new message is about the
+running task or a separate request. It has 800 ms, because you are waiting
+on the send.
+
+- If "separate" comes back with a probability of at least 0.8, the message
+  is not steered into the running turn. It waits above the composer as
+  *Queued as a separate request* and runs as its own turn when the current
+  one finishes. It never merges with the messages queued before or after it.
+- Anything else, and any failure, steers or queues the message exactly as
+  before.
+- Messages to one busy thread are decided one at a time, so they keep the
+  order you sent them in.
+
 Browser clicks, tool selection and where work runs are listed as "Coming
 soon" and have no switch yet.
 
