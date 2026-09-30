@@ -452,9 +452,11 @@ export interface WireMessage {
   /** Set on a room message a bot pushed in with post_to_room. */
   peerPost?: { unattended?: boolean };
   /** A room reply whose speaker the decision model picked (an Auto room),
-   * with how sure it was. Absent on every other message; clients that do
-   * not know it ignore it. */
-  routedBy?: { provider: "jev"; probability: number };
+   * with how sure it was. With `model`: a direct reply the decision model
+   * sent to the engine's lighter model because the message looked easy
+   * (how sure it was that the message is light). Absent on every other
+   * message; clients that do not know it ignore it. */
+  routedBy?: { provider: "jev"; probability: number; model?: string };
   /** Set on the user-role line another bot delivered into this bot's own
    * conversation (ask_bot, start_thread). */
   peerAsk?: { botId: string; name: string; unattended?: boolean };

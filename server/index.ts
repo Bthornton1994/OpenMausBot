@@ -298,7 +298,7 @@ import {
 } from "./cloud-home.ts";
 import { createCloudMoveRoutes } from "./cloud-move-http.ts";
 import { holdIncludedServices } from "./included-services.ts";
-import type { ProviderInstance } from "./contracts.ts";
+import type { ProviderInstance, SendTurnInput } from "./contracts.ts";
 import { selectDefaultModelSelection, withNewBotEffort } from "./default-model-selection.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, peerApprovalFailure, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import { peerDeliveryReceipt, type PeerDeliveryReceipt } from "./peer-delivery.ts";
@@ -331,6 +331,9 @@ import { SteerSplitLane, decideSteerSplit, type SteerSplitInput } from "./decide
 import { decideRiskHold, riskCheckSkips } from "./decider/risk-check.ts";
 import { decideStuck, lastUserText, recentToolSteps, stuckChip } from "./decider/stuck-check.ts";
 import { decideNotificationQuiet, notificationQuietable } from "./decider/notify-urgency.ts";
+import { decideToolPick } from "./decider/tool-pick.ts";
+import { decideWorkPlace, type WorkPlace } from "./decider/work-place.ts";
+import { decideModelRoute, lighterModelFor } from "./decider/model-routing.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh, NATIVELY_REPLAYING_DRIVER_KINDS, peerMessageText } from "./turn-context.ts";
 import { Handoffs, handedStateUsable, recordHanded, renderUnseen, sessionStart, unseenMessages, withUnseenMessages, type ContextMessage } from "./delta-context.ts";
@@ -5504,6 +5507,11 @@ type RoutedBy = NonNullable<Message["routedBy"]>;
  * speaker's next reply line carries `routedBy` (stamped in the runtime fold
  * below), so the room can say "Picked by Jev". Only a routed round sets it. */
 const routedRoomReplies = new Map<string, { botId: string; routedBy: RoutedBy }>();
+/** Direct turns the decision model moved to the engine's lighter model, by
+ * thread: that turn's first reply line carries `routedBy` with the model, so
+ * the chat can say "Light model · easy message". Keyed to the turn's
+ * dispatch generation, so a later turn's reply is never stamped. */
+const lightModelReplies = new Map<string, { generation: string; routedBy: RoutedBy }>();
 
 // The latest running token totals for the turn in flight on each thread.
 // Providers report cumulative-within-turn numbers; the final value is folded
@@ -6447,6 +6455,90 @@ function turnSurfacePlan(bot: BotRecord, runOn?: RoutineRunOn, threadId?: string
   });
 }
 
+/** The places an Auto turn could reach without creating or starting
+ * anything, for the decision model's work-place question. Mirrors the Auto
+ * branches of startTurn's dispatch; whether a place really attaches is still
+ * decided there, and one that does not falls through to the rest of the
+ * usual order. Synchronous and local: no status probe, no network. */
+function autoWorkPlaces(bot: BotRecord, instance: NonNullable<ReturnType<typeof registry.get>>, threadId: string): WorkPlace[] {
+  const caps = instance.adapter.capabilities;
+  const places: WorkPlace[] = [];
+  const cloud = bot.cloudBackend === "vps"
+    ? managedPolicy.computerAllowed("vps") && !computerPlaceRefusal("vps") && !vps.vpsDriverError(instance.driverKind, caps.computerMcp === true)
+    : caps.usesCloudComputer === true && boat.boatConfigured(cfg) && !computerPlaceRefusal("box");
+  if (cloud) places.push("cloud_computer");
+  if (caps.computerMcp === true && caps.remoteAgent !== true && !computerPlaceRefusal("localVm")) {
+    // The same seat attachLocalVm's Auto path would look at, without
+    // recording any pool affinity.
+    const target = localVmMode(cfg) === "pool"
+      ? poolLocalVmTarget(localVmSeatPool.candidate(threadId, localVmPoolSeatHolder))
+      : localVmTargetForBot(bot.id);
+    if (localVmSeen.has(target.key)) places.push("local_vm");
+  }
+  if (!computerPlaceRefusal("thisComputer") && shouldMountLocalComputer({ requested: undefined, hostPlatform: process.platform,
+    providerSupportsLocal: caps.localComputerMcp === true }) && readCuaConnection()) places.push("this_computer");
+  return places;
+}
+
+const WORK_PLACE_SURFACE: Record<WorkPlace, Surface> = { this_computer: "local", local_vm: "vm", cloud_computer: "cloud" };
+
+/** The place the decision model says an Auto turn should try first
+ * (server/decider/work-place.ts), or null for today's order. Only for a
+ * person's own message on an unpinned Auto turn with two or more places to
+ * choose between; never for a pin, an explicit Works on, a team computer or
+ * an automation. Resolves, never rejects. */
+function workPlaceFirst(
+  bot: BotRecord,
+  instance: NonNullable<ReturnType<typeof registry.get>>,
+  plan: ReturnType<typeof turnSurfacePlan>,
+  threadId: string,
+  message: string,
+): Promise<Surface | null> | null {
+  if (!deciderReady(cfg, "workPlace") || plan.computer !== undefined || plan.pinned || inheritedTeamComputer(bot)) return null;
+  const places = autoWorkPlaces(bot, instance, threadId);
+  if (places.length < 2) return null;
+  return decideWorkPlace(decider, { message, bot: { name: bot.name, description: bot.description }, places })
+    .then((choice) => choice.kind === "place" ? WORK_PLACE_SURFACE[choice.place] : null, () => null);
+}
+
+/** The lighter model this direct turn runs on when the decision model finds
+ * the message easy (server/decider/model-routing.ts), or null for the bot's
+ * own model. Resolves, never rejects. */
+function lightModelTurn(input: {
+  instance: NonNullable<ReturnType<typeof registry.get>>;
+  model: string | undefined;
+  threadId: string;
+  botName: string;
+  message: string;
+  excludedIds: ReadonlySet<string>;
+  contextTokens: number | undefined;
+}): Promise<{ model: string; probability: number } | null> | null {
+  if (!deciderReady(cfg, "modelRouting")) return null;
+  const history = store.activePath(input.threadId).filter((m) => m.kind === "text" && !input.excludedIds.has(m.id) && m.text?.trim());
+  const light = lighterModelFor({
+    driverKind: input.instance.driverKind,
+    model: input.model,
+    catalog: input.instance.models,
+    capabilities: input.instance.adapter.capabilities,
+    contextTokens: input.contextTokens ?? Math.ceil(history.reduce((n, m) => n + Buffer.byteLength(m.text ?? ""), 0) / 4),
+  });
+  if (!light) return null;
+  const userName = cfg.profile?.name?.trim() || "User";
+  const recent = history.slice(-4).map((m) => ({ from: m.role === "user" ? userName : input.botName, text: m.text ?? "" }));
+  return decideModelRoute(decider, { message: input.message, recent })
+    .then((route) => route.kind === "light" ? { model: light, probability: route.probability } : null, () => null);
+}
+
+/** The tool-pick callback a turn hands its driver (SendTurnInput.pickTools),
+ * or nothing while the job is off. */
+function toolPickFor(message: string): SendTurnInput["pickTools"] {
+  if (!deciderReady(cfg, "toolPick") || !message.trim()) return undefined;
+  return async (tools, signal) => {
+    const pick = await decideToolPick(decider, { message, tools }, { signal });
+    return pick.kind === "keep" ? pick.names : null;
+  };
+}
+
 function turnProvider(bot: BotRecord, runOn?: RoutineRunOn, threadId?: string): RemoteComputerProvider | null {
   if (runOn === "cloud" || inheritedTeamComputer(bot)) return "box";
   const wants = turnSurfacePlan(bot, runOn, threadId).computer;
@@ -6899,8 +6991,12 @@ bus.subscribe((event: RuntimeEvent) => {
     const routed = group && m.role === "bot" && m.kind === "text" ? routedRoomReplies.get(event.threadId) : undefined;
     const routedBy = routed && speaker && routed.botId === speaker.botId ? routed.routedBy : undefined;
     if (routedBy) routedRoomReplies.delete(event.threadId);
+    const light = bot && m.role === "bot" && m.kind === "text" ? lightModelReplies.get(event.threadId) : undefined;
+    const lightBy = light && light.generation === directTurnGenerationByThread.get(event.threadId) ? light.routedBy : undefined;
+    if (light) lightModelReplies.delete(event.threadId);
+    const direct = lightBy ? { ...m, routedBy: lightBy } : m;
     const message = store.appendMessage(event.threadId, group && m.role === "bot" ? { ...m, from: speaker, ...(routedBy ? { routedBy } : {}) }
-      : proven ? { ...m, requestMessageId: owner.messageId } : m);
+      : proven ? { ...direct, requestMessageId: owner.messageId } : direct);
     return message;
   };
 
@@ -8916,6 +9012,21 @@ async function startTurn(
   turnUsage.delete(threadId);
   turnContext.delete(threadId);
 
+  // The decision model's turn-start questions (server/decider): where an
+  // Auto turn looks first, and whether an easy message runs on the engine's
+  // lighter model. Both start now, side by side with the setup below, and
+  // each is awaited only where its answer is used, so together they add at
+  // most one short budget. Each is null while its job is off.
+  const personAsked = commsDepth === 0 && !userMessage.peerAsk && !opts?.automationSource && !opts?.unattended;
+  const continuation = Boolean(opts?.cardContinuation || opts?.computerSelectionContinuation || opts?.compactOnly);
+  const placeFirst = personAsked && !continuation && !opts?.coordination && opts?.runOn !== "cloud"
+    ? workPlaceFirst(bot, instance, plan, threadId, resolvedImages.text) : null;
+  const lightModel = !useInstanceDefaults && !continuation && !opts?.automationSource && !opts?.unattended
+    ? lightModelTurn({ instance, model, threadId, botName: bot.name, message: resolvedImages.text,
+      excludedIds: new Set([userMessage.id, ...(opts?.excludeMessageIds ?? [])]), contextTokens: task.usage?.context?.tokens })
+    : null;
+  lightModelReplies.delete(threadId);
+
   void (async () => {
     try {
       // Readiness can wait on the network. Admit the task first so its busy
@@ -9425,10 +9536,61 @@ async function startTurn(
         computerKind = "local";
       }
 
+      // An unattended run on a bot with a VPS configured never lands on the
+      // host's own desktop instead: a scheduled job clicking on someone's
+      // laptop is worse than a scheduled job that fails and says why.
+      const unattendedVps = cloudBackend === "vps" && Boolean(opts?.automationSource);
+      // Auto-only host fallback. Electron owns cua-driver/TCC attribution;
+      // the harness only reads its already-running connection descriptor.
+      const mountAutoHost = () => {
+        if (
+          integrations.computer ||
+          integrations.localComputer ||
+          wants !== undefined ||
+          unattendedVps ||
+          computerPlaceRefusal("thisComputer") ||
+          !shouldMountLocalComputer({
+            requested: undefined,
+            hostPlatform: process.platform,
+            providerSupportsLocal: mountsLocalComputer,
+          })
+        ) return;
+        const cua = readCuaConnection();
+        if (!cua) return;
+        // Lazy host claim (issue #1650): the gated integration mounts
+        // now, but the exclusive computer:host seat is taken only by the
+        // first screen tools/call, through the computer-control gate —
+        // the same seam as the Local VM (#1361) and the VPS. An Auto
+        // turn that never touches the screen holds no desktop seat and
+        // records no pin; a claim that finds the seat held waits behind
+        // the holder like every other seat instead of failing on the
+        // spot.
+        autoVmClaims.set(threadId, {
+          owner: resourceOwner,
+          lazy: true,
+          label: "this computer",
+          onRejected: surfaceLazyClaimRejection("this computer"),
+          claim: async () => {
+            await bindTurnComputer(resourceOwner, "computer:host", true);
+            pinAutoSurface("local");
+          },
+        });
+        integrations.localComputer = gatedLocalComputer(cua, controlIntegration(bot.id, threadId, dispatchClaimId));
+        computerKind = "local";
+      };
+      // The decision model may have named the place this message fits best
+      // among those Auto can reach (workPlaceFirst). It is tried first,
+      // through its usual Auto mount; a place that does not attach leaves
+      // today's order to run as always. Cloud is already tried first.
+      const preferred = wants === undefined && placeFirst ? await placeFirst : null;
+      if (preferred === "vm" && !computerPlaceRefusal("localVm") && await attachLocalVm(false)) computerKind = "vm";
+      else if (preferred === "local") mountAutoHost();
+      const autoPlaced = computerKind !== null;
+
       // A VPS is a local-agent computer mount, never a remote agent runner.
       // Explicit Cloud may prepare/start it. Auto remains read-only unless
       // the person explicitly opted this bot into remote lifecycle actions.
-      if ((wants === "cloud" || (wants === undefined && managedPolicy.computerAllowed("vps"))) && cloudBackend === "vps") {
+      if ((wants === "cloud" || (wants === undefined && !autoPlaced && managedPolicy.computerAllowed("vps"))) && cloudBackend === "vps") {
         const unsupported = vps.vpsDriverError(instance.driverKind, mountsComputerMcp);
         if (unsupported && wants === "cloud") throw new Error(unsupported);
         if (unsupported && wants === undefined) autoVpsProblem = unsupported;
@@ -9485,7 +9647,7 @@ async function startTurn(
         previewCapture = attached.capture;
         computerKind = "box";
       }
-      if (!teamComputer && instance.adapter.capabilities.usesCloudComputer === true && (wants === "cloud" || wants === undefined) && cloudBackend === "box" && boat.boatConfigured(cfg)) {
+      if (!teamComputer && instance.adapter.capabilities.usesCloudComputer === true && (wants === "cloud" || (wants === undefined && !autoPlaced)) && cloudBackend === "box" && boat.boatConfigured(cfg)) {
         const attached = await attachBotBoat(bot, resourceOwner, {
           explicitCloud: wants === "cloud",
           canMount: instance.adapter.capabilities.usesCloudComputer === true,
@@ -9506,52 +9668,11 @@ async function startTurn(
         throw new Error("the cloud computer could not be created or reached");
       }
 
-      // Auto-only host fallback. Electron owns cua-driver/TCC attribution;
-      // the harness only reads its already-running connection descriptor.
       // Auto reaches a Local VM this bot already has before it ever touches the
       // host's own desktop: on a headless server that VM is the only desktop
       // there is, and a person who prepared one meant it to be used.
       if (wants === undefined && !integrations.computer && !integrations.localComputer && !computerPlaceRefusal("localVm") && await attachLocalVm(false)) computerKind = "vm";
-      // An unattended run on a bot with a VPS configured never lands on the
-      // host's own desktop instead: a scheduled job clicking on someone's
-      // laptop is worse than a scheduled job that fails and says why.
-      const unattendedVps = cloudBackend === "vps" && Boolean(opts?.automationSource);
-      if (
-        !integrations.computer &&
-        !integrations.localComputer &&
-        wants === undefined &&
-        !unattendedVps &&
-        !computerPlaceRefusal("thisComputer") &&
-        shouldMountLocalComputer({
-          requested: undefined,
-          hostPlatform: process.platform,
-          providerSupportsLocal: mountsLocalComputer,
-        })
-      ) {
-        const cua = readCuaConnection();
-        if (cua) {
-          // Lazy host claim (issue #1650): the gated integration mounts
-          // now, but the exclusive computer:host seat is taken only by the
-          // first screen tools/call, through the computer-control gate —
-          // the same seam as the Local VM (#1361) and the VPS. An Auto
-          // turn that never touches the screen holds no desktop seat and
-          // records no pin; a claim that finds the seat held waits behind
-          // the holder like every other seat instead of failing on the
-          // spot.
-          autoVmClaims.set(threadId, {
-            owner: resourceOwner,
-            lazy: true,
-            label: "this computer",
-            onRejected: surfaceLazyClaimRejection("this computer"),
-            claim: async () => {
-              await bindTurnComputer(resourceOwner, "computer:host", true);
-              pinAutoSurface("local");
-            },
-          });
-          integrations.localComputer = gatedLocalComputer(cua, controlIntegration(bot.id, threadId, dispatchClaimId));
-          computerKind = "local";
-        }
-      }
+      mountAutoHost();
       if (
         wants === undefined &&
         cloudBackend === "vps" &&
@@ -9792,6 +9913,14 @@ async function startTurn(
       // the one the person watches.
       const dispatchedConfig = sessionConfig(liveBot?.soul ?? bot.soul);
       if (strictResume && !(opts?.cardContinuation && continuingRoutine) && dispatchedConfig !== plannedConfig) dispatchContext = decideContext(dispatchedConfig);
+      // An easy message runs this one turn on the engine's lighter model
+      // (lightModelTurn), with the engine's default effort; the bot's saved
+      // selection is untouched. Its first reply line says so.
+      const light = lightModel ? await lightModel : null;
+      if (!directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId)) throw new DirectTurnSetupCancelled("turn stopped during setup");
+      if (light) lightModelReplies.set(threadId, { generation: dispatchClaimId,
+        routedBy: { provider: "jev", probability: Math.round(light.probability * 100) / 100, model: light.model } });
+      const pickTools = opts?.cardContinuation ? undefined : toolPickFor(resolvedImages.text);
       // Before sendTurn: an adapter may emit the whole turn before it resolves.
       handoffs.dispatching(threadId, dispatchClaimId, dispatchContext.handoff);
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
@@ -9803,9 +9932,10 @@ async function startTurn(
         images: turnImages,
         approvalMode: approvalModeForTurn(bot, commsDepth > 0),
         ...(guestConfined ? { guestConfined: true } : {}),
-        model,
-        effort,
-        variant,
+        model: light?.model ?? model,
+        effort: light ? undefined : effort,
+        variant: light ? undefined : variant,
+        ...(pickTools ? { pickTools } : {}),
         // a rewound thread never resumes the abandoned branch's session
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
@@ -11993,6 +12123,7 @@ async function runGroupMemberTurn(
     providerDispatched = true;
     turnPromptBytes.set(threadId, { stable: Buffer.byteLength(roomSystem.stable), volatile: Buffer.byteLength(roomSystem.volatile) });
     runningTurnEngines.set(threadId, instance);
+    const roomPickTools = cardContinuation ? undefined : toolPickFor(resolvedLatestImages.text);
     guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: readyBot.id,
@@ -12007,6 +12138,7 @@ async function runGroupMemberTurn(
         cwd,
         integrations,
         mcpFromUserConfig: claudeUserMcpEnabled(cfg) && !managedPolicy.restrictsMcp(),
+        ...(roomPickTools ? { pickTools: roomPickTools } : {}),
         ...(instance.instanceId === readyBot.modelSelection.instanceId
           ? memberTurnSelection(readyBot.modelSelection)
           : { model: instance.models.default }),

@@ -146,6 +146,80 @@ silent.
 Browser clicks, tool selection and where work runs are listed as "Coming
 soon" and have no switch yet.
 
+The three jobs below change what a bot sees or does, so each starts off
+until someone switches it on in **Settings → Decision model**. With the
+switch off they cost nothing: no request is built.
+
+**Fewer connected-app tools.** On the API engines that list their own tools
+(Grok, Mistral, MiniMax and OpenAI-compatible), a turn whose connected-app
+and custom MCP tools number more than 20 asks Jev, once per tool, whether
+the message might need it. Each tool is described as "name: description"
+(about 200 characters) beside the message (about 1,500).
+
+- A tool is kept at a probability of at least 0.2, and the 5 most likely
+  are always kept. The rest are not offered this turn, and a call to one is
+  refused like any unknown tool.
+- OpenMausBot's own tools (teammates, the computer, the browser, questions
+  to you) and Composio's search, execute and connection tools are never
+  asked about and never withheld.
+- Past 120 tools (the most one request may carry), the first 120 are asked
+  about and the rest are kept.
+- Claude, Codex, ACP and Pi engines are not trimmed: they reach connected
+  apps through Composio's search-and-execute tools rather than one tool per
+  action, and listing the per-app tools there would cost a network round
+  trip before every turn.
+
+The question waits for the tool list, so it runs when the engine has
+started its tool servers, within 1.5 seconds. Any failure keeps every tool.
+
+**Where work runs.** For a bot whose Works on is Auto, in a conversation
+that is not pinned to a place, a message you send asks Jev which place
+fits it, choosing only among the places Auto could reach right now: this
+computer, a Local VM this bot already has, and the cloud computer (a Boat
+or VPS that is set up). It is asked only when at least two of them are
+there. The state is the message (about 1,500 characters) and the bot's
+name and description (about 400).
+
+- At a probability of at least 0.7, that place is tried first this turn,
+  through the same Auto mount as always, so its first screen use pins the
+  conversation just as an Auto turn does today. A place that does not
+  attach leaves the usual order to run.
+- Anything less sure keeps the usual Auto order.
+- A pin (yours or an earlier Auto turn's), a bot's own Works on, a team
+  computer, rooms, routines, webhooks and messages from other bots never
+  ask.
+
+The question starts with the turn and is awaited just before the computer
+is mounted, within 1.2 seconds.
+
+**Lighter model for easy messages.** In a bot's own conversation, a message
+asks Jev how much work it needs: Light, Moderate or Heavy. The state is the
+message (about 2,000 characters) and the last four lines before it (about
+300 each). It is asked only where the engine has a lighter model and can
+switch models within a conversation:
+
+| Engine | Lighter model | Moved off |
+| --- | --- | --- |
+| Claude | Claude Haiku 4.5 | Fable, Opus and Sonnet models |
+| Grok (API) | Grok 4 Fast | Grok 4.7, Grok 4 |
+| Mistral | Mistral Small | Mistral Large |
+
+The lighter model must be in that engine's model list, the bot must be on
+one of the listed models (a custom, local or managed model is never
+swapped), and the conversation must fill at most half the lighter model's
+window.
+
+- If Light comes back at 0.8 or above, that one turn runs on the lighter
+  model with the engine's default effort. The bot's saved model does not
+  change, and the conversation carries on (Claude resumes the same
+  session). The reply shows *Light model · easy message*.
+- Anything less sure, and any failure, runs the bot's own model.
+- Codex and ACP engines cannot switch models inside a conversation and are
+  never asked. Rooms, routines and webhooks are not asked either.
+
+The question starts with the turn and is awaited just before the engine is
+called, within a second, so it overlaps the rest of the turn's setup.
+
 **Click by description.** With **Click by description** switched on (it
 starts off), bots using the built-in browser get one more tool,
 `agent_browser_click_text`. A bot names what to click in words ("the blue
