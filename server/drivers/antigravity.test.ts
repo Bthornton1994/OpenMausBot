@@ -752,8 +752,6 @@ describe("Antigravity driver over shared ACP", () => {
     expect(dumpState.env.GEMINI_HOME).toBe(antigravityProfileDirectory(instanceId));
     expect(dumpState.env.GEMINI_API_KEY).toBeUndefined();
     expect(dumpState.env.GOOGLE_API_KEY).toBeUndefined();
-    // The real launch path on Windows unpacks into OMB's own folder.
-    if (process.platform === "win32") expect(dumpState.env.TEMP).toBe(antigravityTempDir(DATA_DIR, instanceId));
     const calls = JSON.parse(readFileSync(`${dump}.config.json`, "utf8"));
     expect(calls).toEqual([
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: "gemini-3.8-flash-low" } },
@@ -761,6 +759,8 @@ describe("Antigravity driver over shared ACP", () => {
     ]);
     const mcp = JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8"));
     expect(mcp).toEqual([{ name: "docs", command: "docs-mcp", args: ["serve"], env: [{ name: "TOKEN", value: "scoped" }] }]);
+    // The real launch path on Windows unpacks into OMB's own folder.
+    if (process.platform === "win32") expect(dumpState.env.TEMP).toBe(antigravityTempDir(DATA_DIR, instanceId));
   });
 
   it("fails closed when Antigravity does not confirm its permission mode", async () => {
