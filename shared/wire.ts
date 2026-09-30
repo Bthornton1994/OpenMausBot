@@ -626,9 +626,11 @@ export interface WireGroup {
 // the app consumes, payload typed by the shape that actually goes over the
 // wire. Transport-owned frames (hello, ping) stay in src/lib/live-events.
 
-/** Why a steer-queue entry waits: a shared thread slot, or the bot's room
- * turn (which runs one at a time per bot). */
-export type SteerQueueReason = "capacity" | "group-turn";
+/** Why a steer-queue entry waits: a shared thread slot, the bot's room
+ * turn (which runs one at a time per bot), or `separate`: the decision
+ * model read it as a request unrelated to the running task, so it runs as
+ * its own follow-up turn instead of being steered or merged. */
+export type SteerQueueReason = "capacity" | "group-turn" | "separate";
 
 /** Pending steer-queue chips, as `queuedSteerSnapshot` emits them and the
  * `bot.queued` frame carries them: threadId → queued items. */

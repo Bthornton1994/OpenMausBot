@@ -103,6 +103,8 @@ export function buildNotification(
             ? `${who}'s routine failed`
             : kind === "routine-deferred"
               ? `${who}'s routine is waiting`
+            : kind === "routine-blocked"
+              ? `${who}'s routine needs attention`
             : kind === "turn-failed"
               ? `${who} couldn't start`
               : kind === "incident"

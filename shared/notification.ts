@@ -8,6 +8,9 @@ export type NotifyKind =
   | "done"
   | "routine-failed"
   | "routine-deferred"
+  /** A routine finished its turn, but its reply says the task was not done
+   * (a sign-in failed, access was missing). The run is not a failure. */
+  | "routine-blocked"
   | "turn-failed"
   /** A run failed, stalled or could not start and no Chief of Staff was
    * there to take it: the person is the one who has to look. */

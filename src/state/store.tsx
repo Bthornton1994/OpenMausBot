@@ -3109,7 +3109,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                   threadId: body.threadId,
                   queueId: body.queueId,
                   text: action.text,
-                  reason: body.reason === "capacity" || body.reason === "group-turn" ? body.reason : undefined,
+                  reason: body.reason === "capacity" || body.reason === "group-turn" || body.reason === "separate" ? body.reason : undefined,
                 });
               }
             })
