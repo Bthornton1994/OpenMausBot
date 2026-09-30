@@ -95,6 +95,10 @@ describeAutoHost("the decision model picks where an Auto turn works", { timeout:
         const question = body.questions?.answer;
         if (req.url !== "/v1/systemone" || body.model !== "jev-latest" || !question) return send(422, { detail: "bad request shape" });
         if (question.type === "noul") return send(200, { answers: { answer: { type: "noul", noul: 0.96 } } });
+        // Other jobs that are on by default (quiet notifications when the
+        // turn finishes) ask too: they get a failure, so they keep today's
+        // behaviour and only this job's requests are counted.
+        if (question.instructions !== WORK_PLACE.instructions) return send(503, { detail: "not this test's job" });
         choiceRequests.push({ auth: req.headers.authorization, body });
         if (script.status && script.status !== 200) return send(script.status, { detail: "overloaded" });
         const keys = Object.keys(question.criteria);
