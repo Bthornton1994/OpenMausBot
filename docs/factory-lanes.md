@@ -29,6 +29,7 @@ it changes no model routing, approvals, or engine behavior.
 | `id`, `title` | `id` defaults to a UUID |
 | `ownerBotId` | the single writer; not reassigned by upsert |
 | `reviewerBotId?` | independent QA; must differ from `ownerBotId` |
+| `role?` | `"qa"` marks review work the implementer claim APIs refuse; absent = implementer; set at creation only |
 | `repo`, `branch`, `worktreePath`, `pathClaims?` | what the lane writes |
 | `ownershipKey` | derived: `repo#branch#normalized worktreePath` (lower-cased) |
 | `fullSha?` | full 40-hex tip SHA; short SHAs are rejected |
@@ -103,14 +104,92 @@ without waiting. Pass `reload: true` when another process writes the file.
   accepts the lane's assigned reviewer, never its owner, and logs `qa`
   evidence.
 
+## Protect gate (`server/factory-protect-gate.ts`)
+
+Every writer claim — `claimWorktree`, `claimNextEligible`, and
+`transition(id, "running")` — also passes a protect gate. On DENY it throws
+`FactoryLaneError` with `code: "ineligible"` (ownership overlap inside this
+store stays `"conflict"`), and the denial is persisted as `protect` evidence on
+the lane even though the claim itself is not written.
+
+### Configuration
+
+The CoS protect directory holds `PROTECTED_SESSIONS.json` and
+`FROZEN_TIPS.json`. It is resolved per call, first match wins:
+
+1. a `protectDir` option on the call (`claimWorktree({ …, protectDir })`,
+   `claimNextEligible({ protectDir })`, `transition(id, phase, patch, { protectDir })`);
+2. env `COS_FACTORY_PROTECT_DIR`;
+3. env `COS_FACTORY_ROOT` + `/protect`.
+
+**None set → ownership-only mode.** The SoT is not consulted; only the QA rules
+below apply. This keeps the lane store usable without a CoS box, and it means
+an unconfigured process does **not** know about protected sessions. Anything
+that dispatches real factory work must set `COS_FACTORY_PROTECT_DIR`.
+
+The files are re-read on every claim (the box edits them live); a UTF-8 BOM is
+tolerated. Accepted shapes — a bare array or an object wrapping one:
+
+```jsonc
+// PROTECTED_SESSIONS.json — { "sessions": [...] } (or "protected"), or [...]
+{ "sessionId": "session_…", "repo?": "owner/name", "branch?": "…", "worktreePath?": "…", "reason?": "…" }
+// a bare string entry is a session id
+// FROZEN_TIPS.json — { "tips": [...] } (or "frozen" / "frozenTips"), or [...]
+{ "repo": "owner/name", "branch": "…", "tipSha": "<40 hex>", "worktreePath?": "…", "reason?": "…" }
+```
+
+(`id`/`session`/`writerTarget`, `sha`/`fullSha` and `worktree`/`cwd` are read
+as aliases.) Fixtures: `server/fixtures/t1734u-protect/`.
+
+### Fail closed
+
+With a protect directory configured, the gate DENIES (`rule: "config"`) when:
+the directory or either file is missing or unreadable; a file is not JSON; a
+file has no recognizable list; or **any** entry is invalid (session without an
+id, tip without repo+branch, tip SHA not full 40-hex). A broken protect list is
+never read as "nothing is protected". `claimNextEligible` throws `ineligible`
+before choosing any lane in that case.
+
+### Rules (mirrors CoS `eligibility.mjs` `decide()`)
+
+Evaluated in order against the ownership being claimed; first DENY wins:
+
+| Rule | DENY when |
+| --- | --- |
+| `qa_role` | the lane has `role: "qa"` — review work is never claimed through implementer claim APIs (also via `transition → running`) |
+| `qa_phase` | `claimWorktree` on a lane in `qa_wait` — its tip belongs to QA until it moves on |
+| `frozen_tip` | same repo+branch as a frozen tip, nested worktree with the tip's `worktreePath`, or the lane's `fullSha` equals the tip SHA |
+| `protected_session` | the lane's `agentSession` (writer target) is a protected session id, or same repo+branch / nested worktree as a protected session |
+| `allow` | none of the above — e.g. disjoint scratch while other lanes sit in `ci_wait`/`qa_wait` |
+
+`qa_role` and `qa_phase` need no SoT, so they apply in ownership-only mode too.
+A QA reviewer records verdicts with `recordQaDisposition`, which never claims
+or moves the lane.
+
+In `claimNextEligible`, gate-denied candidates are skipped (with `protect`
+evidence) and the next safe candidate is tried; an ALLOW is noted on the
+chosen lane's `claim` evidence. Identical consecutive `protect` entries are
+not repeated, so a loop re-asking every tick does not flood the trail. Only a
+`ready` lane is ever dispatched, so a claimed/running lane is never started
+twice, including after a reload.
+
+### Relationship to CoS harvest
+
+On the CoS box, `harvest-dispatch.mjs` applies the same SoT through
+`eligibility.mjs`. This module enforces that SoT for the in-repo lane store
+when `COS_FACTORY_PROTECT_DIR` (or `COS_FACTORY_ROOT`) is set. The TypeScript
+port was written from the brief's description of `decide()`; the box script
+itself was not available when it was written, so recheck that the file shapes
+and rule order match before relying on both together.
+
 ## What this does not do
 
 - It does not bypass any owner or product gate. `owner_gate` is a frozen phase;
   nothing in this module moves a lane out of it — only an explicit
   `transition` call by whoever holds that authority.
 - It does not create git worktrees, run CI, message bots, merge, or push.
-- It does not know about protected sessions; callers must still honour the
-  factory's protect list before dispatching.
+- It does not write the protect list. With no protect directory configured it
+  does not know about protected sessions (see *Protect gate*).
 
 ## Calling it later (not wired yet)
 
@@ -124,4 +203,4 @@ The intended next steps, each a separate, reviewable change:
    `claimNextEligible` → hand the returned lane's `worktreePath` to the owner
    bot as its task `cwd`.
 3. Until then, server-side code can import the module directly; tests do so in
-   `server/factory-lanes.test.ts`.
+   `server/factory-lanes.test.ts` and `server/factory-lanes.harvest.test.ts`.

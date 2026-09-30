@@ -13,6 +13,9 @@
 //
 // Ownership is fail-closed: paths and branch names compare case-insensitively
 // and nested worktree paths overlap, so a doubtful pair counts as a conflict.
+// Writer claims also pass the protect gate (factory-protect-gate.ts): QA work
+// is never claimed as implementation, and when a CoS protect directory is
+// configured, protected sessions and frozen tips are refused, fail-closed.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { posix, join } from "node:path";
@@ -20,6 +23,14 @@ import { posix, join } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
+import {
+  evaluateProtectGate,
+  loadProtectSoT,
+  resolveProtectDir,
+  type ProtectDecision,
+  type ProtectGateVia,
+  type ProtectLoadResult,
+} from "./factory-protect-gate.ts";
 
 export const FACTORY_LANE_PHASES = [
   "ready",
@@ -58,6 +69,9 @@ export interface FactoryLane {
   ownerBotId: string;
   /** Independent QA. Never equal to ownerBotId. */
   reviewerBotId?: string;
+  /** "qa" marks review work: the implementer claim APIs refuse it. Absent
+   * means implementer. Set at creation only. */
+  role?: FactoryLaneRole;
   repo: string;
   branch: string;
   worktreePath: string;
@@ -83,7 +97,13 @@ export interface FactoryLane {
   updatedAt: number;
 }
 
-export type FactoryLaneErrorCode = "not_found" | "invalid" | "terminal" | "conflict" | "qa_independence";
+export const FACTORY_LANE_ROLES = ["implementer", "qa"] as const;
+export type FactoryLaneRole = (typeof FACTORY_LANE_ROLES)[number];
+
+/** `ineligible` = the protect gate said DENY (QA work, frozen tip, protected
+ * session, or an unavailable protect SoT). `conflict` stays for overlap with
+ * another lane's ownership in this store. */
+export type FactoryLaneErrorCode = "not_found" | "invalid" | "terminal" | "conflict" | "qa_independence" | "ineligible";
 
 export class FactoryLaneError extends Error {
   readonly code: FactoryLaneErrorCode;
@@ -230,6 +250,7 @@ function parseLane(value: unknown): FactoryLane | null {
   // A stored lane whose reviewer is its own owner is not independent QA; keep
   // the lane, drop the reviewer, so a person has to assign a real one.
   if (reviewerBotId && reviewerBotId !== ownerBotId) lane.reviewerBotId = reviewerBotId;
+  if (raw.role === "qa") lane.role = "qa";
   const pathClaims = stringList(raw.pathClaims);
   if (pathClaims) lane.pathClaims = pathClaims;
   const fullSha = text(raw.fullSha);
@@ -316,6 +337,57 @@ function pushEvidence(lane: FactoryLane, evidence: Omit<FactoryLaneEvidence, "at
   if (lane.evidence.length > MAX_EVIDENCE) lane.evidence.splice(0, lane.evidence.length - MAX_EVIDENCE);
 }
 
+// ── protect gate ──────────────────────────────────────────────────────
+
+export interface ProtectGateOptions {
+  /** CoS protect directory holding PROTECTED_SESSIONS.json + FROZEN_TIPS.json.
+   * Falls back to env COS_FACTORY_PROTECT_DIR, then COS_FACTORY_ROOT/protect;
+   * none set → QA-role rules only (ownership-only dispatch). */
+  protectDir?: string;
+}
+
+/** Gate one lane's writer claim on the ownership it would hold. */
+function gateLane(lane: FactoryLane, wanted: LaneOwnership, via: ProtectGateVia, protectDir?: string, sot?: ProtectLoadResult): ProtectDecision | null {
+  return evaluateProtectGate(
+    {
+      laneId: lane.id,
+      ...(lane.role ? { role: lane.role } : {}),
+      phase: lane.phase,
+      repo: wanted.repo,
+      branch: wanted.branch,
+      worktreePath: wanted.worktreePath,
+      ...(lane.agentSession ? { writerTarget: lane.agentSession } : {}),
+      ...(lane.fullSha ? { fullSha: lane.fullSha } : {}),
+    },
+    { via, ...(protectDir !== undefined ? { protectDir } : {}), ...(sot ? { sot } : {}) },
+  );
+}
+
+const gateNote = (decision: ProtectDecision): string => `${decision.decision} ${decision.rule}: ${decision.reason}`;
+
+/** Protect evidence, skipped when it repeats the lane's last entry so a
+ * manager loop re-asking every tick does not flood the audit trail. */
+function pushGateEvidence(lane: FactoryLane, decision: ProtectDecision, now: number): void {
+  const ref = decision.dir ?? "qa-rules";
+  const note = gateNote(decision);
+  const last = lane.evidence.at(-1);
+  if (last?.kind === "protect" && last.ref === ref && last.note === note) return;
+  pushEvidence(lane, { kind: "protect", ref, note }, now);
+}
+
+/** Persist the denial on the lane, then refuse. The denial is its own commit
+ * because the refused change itself is never written. */
+function refuse(laneId: string, decision: ProtectDecision): never {
+  commit((draft) => {
+    const lane = draft.find((candidate) => candidate.id === laneId);
+    if (!lane) return;
+    const now = Date.now();
+    pushGateEvidence(lane, decision, now);
+    lane.updatedAt = now;
+  });
+  throw new FactoryLaneError("ineligible", `lane ${laneId} refused by protect gate — ${decision.reason}`);
+}
+
 // ── public API ────────────────────────────────────────────────────────
 
 /** Fields a caller may set through upsert or a transition patch. Phase,
@@ -340,6 +412,9 @@ export interface FactoryLaneInput extends FactoryLanePatch {
   branch: string;
   worktreePath: string;
   pathClaims?: string[];
+  /** "qa" for review work the implementer claim APIs must never take.
+   * Ignored on update: a lane does not change sides. */
+  role?: FactoryLaneRole;
   /** Initial phase for a new lane; only ready/owner_gate/qa_wait/ci_wait are
    * accepted — `running` goes through claimWorktree/claimNextEligible so it
    * always carries an ownership check. Ignored on update. */
@@ -409,6 +484,9 @@ export function upsertLane(input: FactoryLaneInput): FactoryLane {
     if (phase === "running" || TERMINAL_PHASES.includes(phase)) {
       throw new FactoryLaneError("invalid", `a new lane cannot start ${phase}; claim it instead`);
     }
+    if (input.role !== undefined && !(FACTORY_LANE_ROLES as readonly string[]).includes(input.role)) {
+      throw new FactoryLaneError("invalid", `unknown lane role ${String(input.role)}`);
+    }
     const lane: FactoryLane = {
       id: input.id ?? newId(),
       title: input.title.trim(),
@@ -423,6 +501,7 @@ export function upsertLane(input: FactoryLaneInput): FactoryLane {
       updatedAt: now,
     };
     if (input.pathClaims?.length) lane.pathClaims = [...input.pathClaims];
+    if (input.role === "qa") lane.role = "qa";
     applyPatch(lane, input);
     // A lane created straight into a frozen phase blocks writers at once, so
     // it must not land on top of someone else's ownership either.
@@ -461,10 +540,30 @@ export function listLanes(filter: FactoryLaneFilter = {}): FactoryLane[] {
 }
 
 /** Move a lane to a new phase. Terminal lanes never move again. Entering
- * `running` requires ownership that does not overlap another holder;
- * entering a terminal phase releases the lane's claim. */
-export function transition(id: string, phase: FactoryLanePhase, patch: FactoryLanePatch = {}): FactoryLane {
+ * `running` requires ownership that does not overlap another holder and a
+ * protect-gate ALLOW (`ineligible` otherwise); entering a terminal phase
+ * releases the lane's claim. */
+export function transition(
+  id: string,
+  phase: FactoryLanePhase,
+  patch: FactoryLanePatch = {},
+  options: ProtectGateOptions = {},
+): FactoryLane {
   if (!isPhase(phase)) throw new FactoryLaneError("invalid", `unknown phase ${String(phase)}`);
+  const current = all().find((lane) => lane.id === id);
+  let allowed: ProtectDecision | null = null;
+  if (phase === "running" && current && current.phase !== "running" && !TERMINAL_PHASES.includes(current.phase)) {
+    // Gate what the lane will be after the patch, so a patch cannot slip a
+    // protected writer session or a frozen SHA past the check.
+    const after: FactoryLane = {
+      ...current,
+      ...(patch.agentSession ? { agentSession: patch.agentSession } : {}),
+      ...(patch.fullSha ? { fullSha: patch.fullSha.toLowerCase() } : {}),
+    };
+    const decision = gateLane(after, after, "transition", options.protectDir);
+    if (decision?.decision === "DENY") refuse(current.id, decision);
+    allowed = decision;
+  }
   return commit((draft) => {
     const lane = mustFind(draft, id);
     assertNotTerminal(lane);
@@ -475,6 +574,7 @@ export function transition(id: string, phase: FactoryLanePhase, patch: FactoryLa
       lane.claimedAt = now;
     }
     applyPatch(lane, patch);
+    if (allowed) pushGateEvidence(lane, allowed, now);
     const from = lane.phase;
     lane.phase = phase;
     if (TERMINAL_PHASES.includes(phase)) delete lane.claimedAt;
@@ -496,15 +596,24 @@ export function appendEvidence(id: string, evidence: Omit<FactoryLaneEvidence, "
   });
 }
 
-export interface ClaimWorktreeInput extends LaneOwnership {
+export interface ClaimWorktreeInput extends LaneOwnership, ProtectGateOptions {
   ownerBotId: string;
   laneId: string;
 }
 
 /** Exclusive claim on repo+branch+worktree (+pathClaims) for one lane's
- * owner. Throws `conflict` when any other holder overlaps. Re-claiming the
- * same ownership for the same lane is idempotent. */
+ * owner. Throws `conflict` when any other holder overlaps, `ineligible` when
+ * the protect gate denies the requested ownership (QA work, frozen tip,
+ * protected session, unavailable SoT). Re-claiming the same ownership for the
+ * same lane is idempotent. */
 export function claimWorktree(input: ClaimWorktreeInput): FactoryLane {
+  const current = all().find((lane) => lane.id === input.laneId);
+  let allowed: ProtectDecision | null = null;
+  if (current && !TERMINAL_PHASES.includes(current.phase) && current.ownerBotId === input.ownerBotId) {
+    const decision = gateLane(current, input, "claim", input.protectDir);
+    if (decision?.decision === "DENY") refuse(current.id, decision);
+    allowed = decision;
+  }
   return commit((draft) => {
     const lane = mustFind(draft, input.laneId);
     assertNotTerminal(lane);
@@ -514,6 +623,7 @@ export function claimWorktree(input: ClaimWorktreeInput): FactoryLane {
     const conflict = findConflict(draft, lane.id, input);
     if (conflict) throw new FactoryLaneError("conflict", `lane ${conflict.lane.id} already holds ${conflict.why}`);
     const now = Date.now();
+    if (allowed && lane.claimedAt === undefined) pushGateEvidence(lane, allowed, now);
     lane.repo = input.repo.trim();
     lane.branch = input.branch.trim();
     lane.worktreePath = input.worktreePath.trim();
@@ -564,7 +674,7 @@ export function recordQaDisposition(
   });
 }
 
-export interface ClaimNextEligibleOptions {
+export interface ClaimNextEligibleOptions extends ProtectGateOptions {
   /** Phases that count as "someone is waiting" (default ci_wait, qa_wait). */
   waitingPhases?: readonly FactoryLanePhase[];
   /** Try this owner's ready lanes first. */
@@ -574,14 +684,24 @@ export interface ClaimNextEligibleOptions {
 }
 
 /** The manager-loop step: while at least one lane waits on CI/QA, start the
- * oldest ready lane whose ownership overlaps no frozen or claimed lane. The
- * chosen lane moves to `running` with a claim and a claim evidence entry.
- * Ready lanes with a blocker are skipped. Returns null if nothing is waiting
- * (and not forced) or no ready lane is safe to start. */
+ * oldest ready lane whose ownership overlaps no frozen or claimed lane and
+ * which the protect gate allows. The chosen lane moves to `running` with a
+ * claim and a claim evidence entry. Ready lanes with a blocker are skipped;
+ * gate-denied lanes are skipped with `protect` evidence. Returns null if
+ * nothing is waiting (and not forced) or no ready lane is safe to start.
+ * Throws `ineligible` when a protect directory is configured but its SoT
+ * cannot be loaded — nothing is dispatched blind. */
 export function claimNextEligible(options: ClaimNextEligibleOptions = {}): FactoryLane | null {
   const waitingPhases: readonly FactoryLanePhase[] = options.waitingPhases ?? ["ci_wait", "qa_wait"];
   const waiting = all().filter((lane) => waitingPhases.includes(lane.phase));
   if (!waiting.length && !options.forceParallel) return null;
+  // Load the SoT once per step, and before choosing anything: a missing or
+  // broken protect list stops the whole step rather than any one lane.
+  const protectDir = resolveProtectDir(options.protectDir);
+  const sot = protectDir ? loadProtectSoT(protectDir) : undefined;
+  if (sot && !sot.ok) {
+    throw new FactoryLaneError("ineligible", `protect SoT unavailable, failing closed: ${sot.reason}`);
+  }
   const candidates = all()
     .map((lane, index) => ({ lane, index }))
     .filter(({ lane }) => lane.phase === "ready" && !lane.blocker)
@@ -590,19 +710,42 @@ export function claimNextEligible(options: ClaimNextEligibleOptions = {}): Facto
       const preferB = b.lane.ownerBotId === options.preferOwnerBotId ? 0 : 1;
       return preferA - preferB || a.lane.createdAt - b.lane.createdAt || a.index - b.index;
     });
-  const chosen = candidates.find(({ lane }) => !findConflict(all(), lane.id, lane));
-  if (!chosen) return null;
+  const denied: { laneId: string; decision: ProtectDecision }[] = [];
+  let chosen: { lane: FactoryLane; allowed: ProtectDecision | null } | undefined;
+  for (const { lane } of candidates) {
+    if (findConflict(all(), lane.id, lane)) continue;
+    const decision = gateLane(lane, lane, "claim", protectDir ?? undefined, sot);
+    if (decision?.decision === "DENY") {
+      denied.push({ laneId: lane.id, decision });
+      continue;
+    }
+    chosen = { lane, allowed: decision };
+    break;
+  }
+  const picked = chosen;
+  if (!picked && !denied.length) return null;
   return commit((draft) => {
-    const lane = mustFind(draft, chosen.lane.id);
     const now = Date.now();
+    for (const { laneId, decision } of denied) {
+      const lane = mustFind(draft, laneId);
+      pushGateEvidence(lane, decision, now);
+      lane.updatedAt = now;
+    }
+    if (!picked) return null;
+    const lane = mustFind(draft, picked.lane.id);
+    // Never start a lane twice: only a ready lane is ever dispatched.
+    if (lane.phase !== "ready") throw new FactoryLaneError("conflict", `lane ${lane.id} is already ${lane.phase}`);
     lane.claimedAt = lane.claimedAt ?? now;
     lane.phase = "running";
+    const dispatched = waiting.length
+      ? `dispatched while ${waiting.map((other) => `${other.id}:${other.phase}`).join(", ")} wait`
+      : "forced parallel dispatch";
     pushEvidence(
       lane,
       {
         kind: "claim",
         ref: lane.ownershipKey,
-        note: waiting.length ? `dispatched while ${waiting.map((other) => `${other.id}:${other.phase}`).join(", ")} wait` : "forced parallel dispatch",
+        note: picked.allowed ? `${dispatched}; protect ${gateNote(picked.allowed)}` : dispatched,
       },
       now,
     );
