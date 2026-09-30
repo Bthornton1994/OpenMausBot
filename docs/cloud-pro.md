@@ -48,8 +48,32 @@ Contract version: `1` (`cloudContractVersion` on the wire).
 The Cloud's `GET /api/auth/session` answers `"cloudHome": true` for a paired
 session; that is how the web UI knows to open the engine sign-in instead of
 the welcome flow, which describes the person's own computer (it can still be
-replayed from Settings). A paired session without admin scope (a phone paired
-as a client) is not shown the sign-in, since it cannot sign engines in.
+replayed from Settings).
+
+### Only your own devices
+
+A Cloud home is personal (`server/cloud-owner.ts`): only the owner's own
+devices connect (the desktop app, a phone, a browser signed in from the Cloud
+page), each with an admin session that the Admin's signed pairing, or one of
+those devices, gave it. The server mints and accepts nothing else, and says
+so in one line, "Cloud Pro is personal: only your own devices can connect.":
+
+- `POST /api/auth/pairing` refuses a window without admin scope (Remote
+  access offers no chat-only choice there), and `POST /api/auth/pair` and
+  `POST /api/pair` never redeem one;
+- email sign-in (`/api/auth/email/start`, `/api/auth/email/verify`) is off,
+  and Settings' People section, with its invites, is gone (a `signIn` list in
+  `PUT /api/config` is refused);
+- a session without admin scope does not authenticate (nor its event-stream
+  tickets), and the paired devices list shows only the owner's.
+
+At every start, any stored session without admin scope is revoked (the log
+says how many), and what it opened or wrote is nobody's. Once, at the first
+start that does this, every other person named on the Cloud (the device
+that opened a conversation, the last writer of a routine) is the owner: a
+conversation an owner's device opened before stays the owner's after that
+device is unpaired (`cloud-owner.json` keeps those keys). The guest rules
+below stay, for what a guest left behind before then.
 
 The card shows one of: **Setting up**, **Ready**, **Stopped**, **Payment
 problem**, **Could not be set up yet**. Only Ready can be connected to.
@@ -328,7 +352,7 @@ On the Cloud home (`server/shared-computers.ts`, `server/index.ts`):
 
 - Lending is on for every Cloud home, with no maintainer flag.
 - Only the owner's admin sessions (the Admin's signed pairing gives the
-  desktop one) can lend. A chat-only device the owner paired cannot.
+  desktop one) can lend.
 - The server refuses operations outside the scopes the Mac registered before
   queuing them, never retries an operation with an unknown outcome, and never
   substitutes its own files for an offline Mac.
@@ -369,15 +393,18 @@ On the Cloud home (`server/shared-computers.ts`, `server/index.ts`):
   **New conversation** button.
 - A conversation a guest opened (or a guest's routine opened for its
   results, or a room a guest opened) runs in Ask whatever the bot's own
-  level: no Auto reviewer, no Full access, no saved command answers for it.
+  level: no Auto reviewer, no Full access, no saved command answers for it
+  (judged by the conversation the turn runs in, a room's for a room turn,
+  never by whichever of the bot's conversations is active).
   So does a room turn whose latest line from a person is a guest's, and any
   work a guest's turn hands a teammate (delegation, coordination, a room
   handoff), however deep. A delegation or a question to a teammate runs in a
   new conversation of the guest's own on that teammate, never in the owner's
   conversation with it, and is never folded into a turn running there. It
   works in a folder of its own, never the bot's
-  project folder the owner's conversations share, and a card it raises never
-  offers "always allow".
+  project folder the owner's conversations share (one that already ran in
+  another folder keeps it), and a card it raises never offers "always
+  allow".
 - A guest's turn gets no shell and reads nothing outside its own folder, on
   every engine; an engine that cannot run it that way refuses it with one
   line ("This bot can't take requests from guests on this Cloud. Ask the
@@ -416,7 +443,10 @@ On the Cloud home (`server/shared-computers.ts`, `server/index.ts`):
     `.claude/settings.json`, skills, agents and commands). A guest's own
     folder is not watched: nothing there reaches the owner's turns. A skills,
     agents or commands folder of more than 200 entries is judged as a whole
-    (any entry added or removed there is a change). A
+    (any entry added or removed there, or an edit to an entry or its
+    `SKILL.md`, is a change). A working folder, `.claude` folder or skills
+    folder that is a link is read through it, and a folder that could not be
+    read is looked at again next time. A
     line someone else steers into the owner's running turn makes that turn
     count as theirs from then on. A link is judged by where it points, and
     on a Cloud home memory is never read through one. A flagged bot's turns
@@ -433,8 +463,7 @@ On the Cloud home (`server/shared-computers.ts`, `server/index.ts`):
 - What this cannot stop: any conversation whose bot can run commands without
   the owner approving (Auto or Full access, or a remembered command), a
   guest's included, controls the Cloud machine: it can change other bots'
-  files and these records. Pair only people you trust with your Cloud while
-  you lend your Mac.
+  files and these records.
 - Not covered yet: a bot whose memory changed can still pass its words to
   other bots through rooms, `ask_bot` and delegation, and a turn that may use
   the Mac can still read room names and routine listings through its tools.

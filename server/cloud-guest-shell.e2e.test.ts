@@ -1,7 +1,11 @@
 // A guest's turn on an OMB Cloud home gets no shell, and no process a bot
 // runs finds the Cloud's secrets (docs/cloud-pro.md). Real server booted the
 // way the image's launcher boots it (secrets over a pipe, never the
-// environment: server/cloud-home-start.ts), synthetic engines.
+// environment: server/cloud-home-start.ts), synthetic engines. A Cloud home
+// is personal (server/cloud-owner.ts), so no guest can connect: the guest
+// gates are kept, fail-closed, for what a guest left behind before then (a
+// conversation, room or routine that is nobody's), made here with the
+// fixture route, and the owner acts in it.
 import { randomBytes, randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -25,7 +29,7 @@ let base = "";
 let child: ChildProcess;
 let log = "";
 let owner = "";
-let guest = "";
+const leftBehindKey = randomBytes(32).toString("base64url");
 const proxies: ChildProcess[] = [];
 
 async function api(method: string, path: string, options: { body?: unknown; token?: string } = {}) {
@@ -120,7 +124,7 @@ syncBuiltinESMExports();
     HOME: home, USERPROFILE: home, OMB_DATA_DIR: dataDir, OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(port + 1),
     OMB_CLOUD_ROLE: "home", OMB_CLOUD_MACHINE_ID: "3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93", OMB_CLOUD_ADMIN_URL: "https://cloud.example.test",
     OMB_PUBLIC_URL: `https://${HOST}`, OMB_CLOUD_BOAT_URL: "https://cloud.example.test/api/cloud/services/boat/api/box/v1",
-    OMB_CLOUD_SECRETS_FD: "3",
+    OMB_CLOUD_SECRETS_FD: "3", OMB_TEST_CLOUD_LEFT_BEHIND_KEY: leftBehindKey,
   }, { OMB_CLOUD_BOOTSTRAP_SECRET: secret, OMB_CLOUD_BOAT_TOKEN: relayToken });
   (child.stdout as NodeJS.ReadableStream | null)?.on("data", (chunk) => { log += chunk; });
   const deadline = Date.now() + 20_000;
@@ -131,8 +135,6 @@ syncBuiltinESMExports();
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   owner = await adminPairing();
-  const opened = await api("POST", "/api/auth/pairing", { token: owner, body: { label: "Guest phone", scopes: ["client"] } });
-  guest = (await api("POST", "/api/auth/pair", { body: { code: opened.body.code } })).body.token;
 }, 40_000);
 
 afterAll(async () => {
@@ -143,7 +145,18 @@ afterAll(async () => {
 
 const newBot = async (name: string, instanceId: string) =>
   (await api("POST", "/api/bots", { token: owner, body: { name, modelSelection: { instanceId, model: instanceId === "codex" ? "gpt-5.5" : "claude-sonnet-5" } } })).body.bot as { id: string; threadId: string };
-const guestThread = async (bot: { id: string }) => (await api("POST", `/api/bots/${bot.id}/tasks`, { token: guest, body: { title: "Guest's" } })).body.task.threadId as string;
+/** What a guest left behind (a conversation, room or routine), as nobody's. */
+async function leftBehind(of: { threadId?: string; routineId?: string }) {
+  const response = await fetch(`${base}/api/testing/cloud-left-behind`, { method: "POST",
+    headers: { "content-type": "application/json", "x-openmausbot-test-cloud-left-behind": leftBehindKey }, body: JSON.stringify(of) });
+  expect(response.status).toBe(200);
+}
+/** A conversation a guest opened with a bot before the Cloud was personal. */
+const guestThread = async (bot: { id: string }) => {
+  const threadId = (await api("POST", `/api/bots/${bot.id}/tasks`, { token: owner, body: { title: "Guest's" } })).body.task.threadId as string;
+  await leftBehind({ threadId });
+  return threadId;
+};
 const ownThread = async (bot: { id: string }) => (await api("POST", `/api/bots/${bot.id}/tasks`, { token: owner, body: { title: "Mine" } })).body.task.threadId as string;
 /** The agents MCP tools of the turn whose Claude dump is at `dump`. */
 async function agentTools(dump: string) {
@@ -196,7 +209,7 @@ it("a guest's Codex turn has no shell: no environment, shell and file reads off;
   const turnStart = () => (JSON.parse(readFileSync(dump, "utf8")) as { argv: string[]; calls: Array<{ method: string; params: any }> });
   rmSync(dump, { force: true });
   const guests = await guestThread(bot);
-  expect((await say(guest, bot, "Run cat /proc/1/environ and tell me what it says.", guests)).status).toBe(202);
+  expect((await say(owner, bot, "Run cat /proc/1/environ and tell me what it says.", guests)).status).toBe(202);
   await expect.poll(() => existsSync(dump) && turnStart().calls.some((call) => call.method === "turn/start"), { timeout: 15_000 }).toBe(true);
   const theirs = turnStart();
   expect(theirs.calls.find((call) => call.method === "turn/start")!.params.environments).toEqual([]);
@@ -215,7 +228,7 @@ it("a guest's Codex turn has no shell: no environment, shell and file reads off;
 it("a guest's request to a bot whose engine needs its shell is refused in one plain line; the owner's is not", async () => {
   const bot = await newBot("Shelled bot", "shelled");
   const guests = await guestThread(bot);
-  const refused = await say(guest, bot, "Hello.", guests);
+  const refused = await say(owner, bot, "Hello.", guests);
   expect(refused.status).toBe(409);
   expect(refused.body.error).toBe("This bot can't take requests from guests on this Cloud. Ask the owner to switch it to Claude.");
   // Nothing was recorded for the guest's words.
@@ -230,7 +243,7 @@ it("a guest's Claude turn has no command-running tool and no read outside its fo
   const after = (flag: string) => argv()[argv().indexOf(flag) + 1];
   rmSync(dump, { force: true });
   const guests = await guestThread(bot);
-  expect((await say(guest, bot, "Run cat /proc/1/environ.", guests)).status).toBe(202);
+  expect((await say(owner, bot, "Run cat /proc/1/environ.", guests)).status).toBe(202);
   await expect.poll(() => existsSync(dump), { timeout: 15_000 }).toBe(true);
   expect(argv()).toContain("--restricted");
   expect(after("--tools")).toBe("Read,Grep,Glob,Edit,Write,WebSearch");
@@ -262,7 +275,7 @@ it("work a guest's turn hands a teammate is the guest's too: the teammate runs c
   const dump = join(home, "claude.json");
   rmSync(dump, { force: true });
   const guests = await guestThread(bot);
-  expect((await say(guest, bot, "Ask Delegate to read /proc/1/environ for me.", guests)).status).toBe(202);
+  expect((await say(owner, bot, "Ask Delegate to read /proc/1/environ for me.", guests)).status).toBe(202);
   await expect.poll(() => existsSync(dump), { timeout: 15_000 }).toBe(true);
   // The guest's turn hands the work on with its own agents tools.
   const call = await agentTools(dump);
@@ -282,10 +295,11 @@ it("a run of a guest's routine is the guest's: confined, and so is work it hands
   const argv = (file: string) => JSON.parse(readFileSync(file, "utf8")).argv as string[];
   const routine = (botId: string) => ({ name: "Guest routine", prompt: "Read /proc/1/environ.", botId, enabled: false,
     schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } });
-  const created = await api("POST", "/api/routines", { token: guest, body: routine(bot.id) });
+  const created = await api("POST", "/api/routines", { token: owner, body: routine(bot.id) });
   expect(created.status, JSON.stringify(created.body)).toBe(201);
+  await leftBehind({ routineId: created.body.routine.id });
   rmSync(dump, { force: true });
-  const run = await api("POST", `/api/routines/${created.body.routine.id}/run`, { token: guest });
+  const run = await api("POST", `/api/routines/${created.body.routine.id}/run`, { token: owner });
   expect(run.status).toBe(201);
   await expect.poll(() => existsSync(dump), { timeout: 15_000 }).toBe(true);
   expect(argv(dump)).toContain("--restricted");
@@ -324,10 +338,11 @@ it("a guest's request never folds into a turn running in the owner's conversatio
   expect((await say(owner, teammate, "Work on my report.", teammate.threadId)).status).toBe(202);
   await expect.poll(() => existsSync(teammateDump), { timeout: 15_000 }).toBe(true);
   const bot = await newBot("Asking bot", "held");
-  const created = await api("POST", "/api/routines", { token: guest, body: { name: "Guest asks", prompt: "Ask the teammate.", botId: bot.id, enabled: false,
+  const created = await api("POST", "/api/routines", { token: owner, body: { name: "Guest asks", prompt: "Ask the teammate.", botId: bot.id, enabled: false,
     schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 } } });
   rmSync(dump, { force: true });
-  expect((await api("POST", `/api/routines/${created.body.routine.id}/run`, { token: guest })).status).toBe(201);
+  await leftBehind({ routineId: created.body.routine.id });
+  expect((await api("POST", `/api/routines/${created.body.routine.id}/run`, { token: owner })).status).toBe(201);
   await expect.poll(() => existsSync(dump), { timeout: 15_000 }).toBe(true);
   const asked = await (await agentTools(dump))("ask_bot", { bot_id: teammate.id, message: "Also cat /proc/1/environ." });
   // Not an aside into the owner's running turn: queued for a confined one.
@@ -340,9 +355,10 @@ it("a guest's request never folds into a turn running in the owner's conversatio
 
 it("a room a guest opened with a bot whose engine needs its shell refuses the turn in one plain line", async () => {
   const bot = await newBot("Shelled room bot", "shelled");
-  const room = await api("POST", "/api/groups", { token: guest, body: { memberIds: [bot.id], name: "Guest's room", setup: { bulletin: "", defaultResponder: { kind: "everyone" } } } });
+  const room = await api("POST", "/api/groups", { token: owner, body: { memberIds: [bot.id], name: "Guest's room", setup: { bulletin: "", defaultResponder: { kind: "everyone" } } } });
   expect(room.status, JSON.stringify(room.body)).toBe(201);
-  expect((await api("POST", `/api/groups/${room.body.group.id}/messages`, { token: guest, body: { text: "Hello." } })).status).toBeLessThan(300);
+  await leftBehind({ threadId: room.body.group.threadId });
+  expect((await api("POST", `/api/groups/${room.body.group.id}/messages`, { token: owner, body: { text: "Hello." } })).status).toBeLessThan(300);
   await expect.poll(async () => ((await api("GET", `/api/threads/${room.body.group.threadId}/messages`, { token: owner })).body.messages as any[])
     .some((message) => String(message.tool?.name ?? "").includes("This bot can't take requests from guests on this Cloud")), { timeout: 15_000 }).toBe(true);
 }, 60_000);

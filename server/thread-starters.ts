@@ -49,6 +49,35 @@ export class ThreadStarters {
     return threads;
   }
 
+  /** Everyone a thread here was opened for. */
+  people(): Set<string> {
+    return new Set(this.starters.values());
+  }
+
+  /** Name `to` for every thread whose person `move` accepts: a one-time
+   * migration (server/cloud-owner.ts), not an ordinary record. How many
+   * threads changed. */
+  reassign(move: (person: string) => boolean, to: string): number {
+    if (!KEY.test(to)) return 0;
+    let moved = 0;
+    for (const [threadId, person] of this.starters) {
+      if (person === to || !move(person)) continue;
+      this.starters.set(threadId, to);
+      moved += 1;
+    }
+    if (moved) writeFileAtomic(this.file, JSON.stringify(Object.fromEntries(this.starters)) + "\n", { mode: 0o600 });
+    return moved;
+  }
+
+  /** Name `person` for this thread whoever it named before: only for
+   * taking trust away (a test fixture of what a revoked session left
+   * behind on a Cloud home). */
+  replace(threadId: string, person: string): void {
+    if (!KEY.test(person) || !THREAD.test(threadId)) return;
+    this.starters.set(threadId, person);
+    writeFileAtomic(this.file, JSON.stringify(Object.fromEntries(this.starters)) + "\n", { mode: 0o600 });
+  }
+
   /** Record once; a thread keeps the person it was first opened for. */
   set(threadId: string, person: string | undefined): void {
     if (!person || !KEY.test(person) || !THREAD.test(threadId) || this.starters.has(threadId)) return;

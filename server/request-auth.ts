@@ -80,6 +80,7 @@ export const SERVICE_ALLOW: ReadonlyArray<{ methods: readonly string[]; path: Re
   { methods: ["POST"], path: /^\/api\/threads\/[\w-]+\/respond$/ }, // decline only: see the handler
   { methods: ["GET", "POST", "PUT", "PATCH", "DELETE"], path: /^\/api\/internal\// }, // capability bearer checked in the handler
   { methods: ["POST"], path: /^\/api\/testing\/internal-capability$/ }, // exists only with its private key
+  { methods: ["POST"], path: /^\/api\/testing\/cloud-left-behind$/ }, // exists only with its private key, only takes trust away
 ];
 
 export function serviceAllowed(method: string, path: string): boolean {
