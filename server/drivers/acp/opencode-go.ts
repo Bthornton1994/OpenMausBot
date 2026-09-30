@@ -236,7 +236,9 @@ function runOpenCodeModelsVerbose(
       { timeout: 20_000, maxBuffer: 8 * 1024 * 1024, env: environment },
       (error, stdout, stderr) => {
         if (error) {
-          reject(new Error(stderr?.trim() || error.message, { cause: error }));
+          reject(Object.assign(new Error(stderr?.trim() || error.message, { cause: error }), {
+            timedOut: (error as { killed?: boolean }).killed === true,
+          }));
           return;
         }
         resolve(stdout);
@@ -290,7 +292,10 @@ export function probeOpenCodeSession(
       if (error) reject(error);
       else resolve(value);
     };
-    const timer = setTimeout(() => finish(new Error("OpenCode did not list its models in time")), timeoutMs);
+    const timer = setTimeout(
+      () => finish(Object.assign(new Error("OpenCode did not list its models in time"), { timedOut: true })),
+      timeoutMs,
+    );
     timer.unref?.();
     child.on("error", (error) => finish(error));
     child.on("close", (code) => finish(new Error(`OpenCode exited ${code} while listing its models`)));
@@ -361,8 +366,12 @@ export async function discoverOpenCodeModels(
   // OpenCode race to create its database, and one of them fails (seen 1 in 8
   // fresh homes). Once is enough to lose Zen's prices, which is what keeps a
   // paid model from becoming the default, so a failed half runs again alone.
-  if (session.status === "rejected") [session] = await Promise.allSettled([probeSession()]);
-  if (verbose.status === "rejected") [verbose] = await Promise.allSettled([readMetadata()]);
+  // A half that timed out is not retried: a wedged CLI must not double the
+  // wait at startup.
+  const retry = (result: PromiseSettledResult<unknown>) =>
+    result.status === "rejected" && (result.reason as { timedOut?: boolean } | null)?.timedOut !== true;
+  if (retry(session)) [session] = await Promise.allSettled([probeSession()]);
+  if (retry(verbose)) [verbose] = await Promise.allSettled([readMetadata()]);
   const metadata = verbose.status === "fulfilled" ? verbose.value : null;
   if (metadata) rememberPrices(metadata);
   const live = session.status === "fulfilled" ? catalogFromOpenCodeSession(session.value) : null;

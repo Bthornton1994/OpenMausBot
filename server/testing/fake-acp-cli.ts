@@ -64,7 +64,7 @@
 //                       method list as a JSON array — per process, so a
 //                       pooled child keeps one dump and a replacement child
 //                       starts its own
-//   FAKE_ACP_RPC_APPEND_FILE  append one {"pid","method"} JSON line per
+//   FAKE_ACP_RPC_APPEND_FILE  append one {"pid","method","cwd"} JSON line per
 //                       request, so a test can count RPCs across a pooled
 //                       child and its replacement together
 //   FAKE_ACP_RPC_FAILURE_FILE  read a JSON-RPC error object on session/prompt;
@@ -363,7 +363,7 @@ const recordMethod = (method: string) => {
   if (process.env.FAKE_ACP_RPC_DUMP) writeFileSync(process.env.FAKE_ACP_RPC_DUMP, JSON.stringify(rpcMethods));
   if (process.env.FAKE_ACP_RPC_APPEND_FILE) {
     try {
-      appendFileSync(process.env.FAKE_ACP_RPC_APPEND_FILE, JSON.stringify({ pid: process.pid, method }) + "\n");
+      appendFileSync(process.env.FAKE_ACP_RPC_APPEND_FILE, JSON.stringify({ pid: process.pid, method, cwd: process.cwd() }) + "\n");
     } catch {}
   }
 };
