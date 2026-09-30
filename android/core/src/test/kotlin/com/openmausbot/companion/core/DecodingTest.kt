@@ -407,6 +407,18 @@ class DecodingTest {
         assertTrue(notification.isBlocking)
         assertEquals("t1", notification.threadId)
         assertEquals("t1", stream.frame.threadId)
+        assertFalse(notification.quiet)
+    }
+
+    @Test
+    fun quietNotifyFrameAndANewKindDecode() {
+        val stream = CompanionJson.decodeFromString<StreamFrame>(
+            """{"kind":"notify","seq":13,"notification":{"kind":"stuck","botId":"b1","botName":"Scout","threadId":"t1","title":"Scout looks stuck","body":"Repeating the same steps.","quiet":true}}""",
+        )
+        val notification = (stream.frame as Frame.Notify).notification
+        assertEquals("stuck", notification.kind)
+        assertTrue(notification.quiet)
+        assertFalse(notification.isBlocking)
     }
 
     @Test

@@ -109,7 +109,9 @@ export function buildNotification(
                 ? `${who} hit a problem`
                 : kind === "delegation-settled"
                   ? `${who} resumed with results`
-                  : `${who} finished`;
+                  : kind === "stuck"
+                    ? `${who} looks stuck`
+                    : `${who} finished`;
 
   // A "finished" with nothing to say is not worth a notification — the
   // badge in the sidebar already carries that much.

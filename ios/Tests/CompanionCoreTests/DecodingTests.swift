@@ -776,6 +776,22 @@ final class DecodingTests: XCTestCase {
         XCTAssertTrue(notification.isBlocking)
         XCTAssertEqual(notification.threadId, "t1")
         XCTAssertEqual(frame.frame.threadId, "t1")
+        XCTAssertNil(notification.quiet)
+    }
+
+    func testAQuietNotifyFrameAndANewKindDecode() throws {
+        let json = """
+        {"kind":"notify","seq":13,"notification":{
+          "kind":"stuck","botId":"b1","botName":"Scout","threadId":"t1",
+          "title":"Scout looks stuck","body":"Repeating the same steps.","quiet":true}}
+        """
+        let frame = try JSONDecoder().decode(StreamFrame.self, from: Data(json.utf8))
+        guard case let .notify(notification) = frame.frame else {
+            return XCTFail("expected .notify")
+        }
+        XCTAssertEqual(notification.kind, "stuck")
+        XCTAssertEqual(notification.quiet, true)
+        XCTAssertFalse(notification.isBlocking)
     }
 
     // MARK: - A newer computer than the phone
