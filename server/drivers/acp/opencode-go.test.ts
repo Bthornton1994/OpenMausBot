@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { removeTempDir } from "../../testing/cleanup.ts";
@@ -10,9 +11,13 @@ import {
   canRunOpenCode,
   catalogFromOpenCodeSession,
   classifyOpenCodeError,
+  configuredOpenCodeFolderAction,
   createOpenCodeDriver,
+  describeOpenCodeAccountError,
   discoverOpenCodeModels,
   openCodeOwnedDirectories,
+  openCodeProviderKeysAllowed,
+  openMausOwnsWorkingFolder,
   OPENCODE_PROVIDER_ENV,
   parseOpenCodeModelsOutput,
   preferredOpenCodeModel,
@@ -291,11 +296,24 @@ describe("OpenCode catalog", () => {
   });
   it.each([
     ["Internal error: Invalid API key.", "invalid_credentials"],
+    // OpenRouter's refusal of an unknown key, through opencode 1.18.27
+    ["Internal error: User not found.", "invalid_credentials"],
     ["Internal error: Insufficient account funds.", "insufficient_funds"],
     ["Internal error: An active OpenCode Go subscription is required", "inactive_subscription"],
     ["Internal error: Monthly usage limit reached for this key", "quota_or_region_restriction"],
   ] as const)("classifies the real APIError %s", (message, expected) => {
     expect(classifyOpenCodeError(apiError(message))).toBe(expected);
+  });
+
+  // A plain rate limit is a transient 429: OpenCode retries it itself, and
+  // automatic recovery may still route around it. Only a spent quota is the
+  // account's to fix.
+  it.each([
+    "Internal error: Rate limit exceeded",
+    "Internal error: Rate limit reached for model openai/gpt-4o-mini in organization org-x",
+    "Internal error: 429 Too Many Requests: rate limit has been exceeded, retry in 20s",
+  ])("leaves a transient rate limit unclassified: %s", (message) => {
+    expect(classifyOpenCodeError(apiError(message))).toBeUndefined();
   });
 
   it("classifies OpenCode 2's authentication refusal and leaves real internal errors alone", () => {
@@ -305,6 +323,31 @@ describe("OpenCode catalog", () => {
       code: -32603, data: { details: "OpenCode service failure" },
     }))).toBeUndefined();
     expect(classifyOpenCodeError(apiError("Internal error: socket hang up"))).toBeUndefined();
+  });
+
+  // index.ts keeps only the first 160 characters of a chat error, so a fix
+  // longer than that was cut mid-command. With provider keys and `opencode
+  // auth login` the refusing account may not be Zen's.
+  it.each(["invalid_credentials", "insufficient_funds", "inactive_subscription", "quota_or_region_restriction"] as const)(
+    "words %s briefly and names the provider that refused",
+    (code) => {
+      for (const model of [undefined, "opencode/big-pickle", "opencode-go/minimax-m3", "openrouter/openai/gpt-4o-mini",
+        "anthropic/claude-sonnet-5", `${"very-long-provider-name".repeat(4)}/model`]) {
+        const text = describeOpenCodeAccountError(code, model);
+        expect(text.length, `${code} ${model}`).toBeLessThanOrEqual(160);
+        if (model?.startsWith("openrouter/")) {
+          expect(text).toContain("OpenRouter");
+          expect(text).not.toMatch(/Zen|OpenCode Go|Settings → Connections/u);
+        }
+        if (model?.startsWith("anthropic/")) expect(text).toContain("Anthropic");
+      }
+    },
+  );
+
+  it("points a rejected Zen key at the key OpenMaus saves", () => {
+    expect(describeOpenCodeAccountError("invalid_credentials", "opencode/big-pickle")).toContain("Settings → Connections");
+    expect(describeOpenCodeAccountError("insufficient_funds", "opencode/big-pickle")).toContain("Zen");
+    expect(describeOpenCodeAccountError("inactive_subscription", "opencode-go/minimax-m3")).toContain("OpenCode Go subscription");
   });
 
   it("passes the person's provider keys through, as the CLI would see them", async () => {
@@ -342,6 +385,33 @@ describe("OpenCode catalog", () => {
     } finally {
       await removeTempDir(scratch);
     }
+  });
+
+  it("allows provider keys only where the server's environment is one person's own", () => {
+    const own = { cloudHome: false, hostedWorkspace: false, organisationManaged: false, sharedSignIn: false };
+    expect(openCodeProviderKeysAllowed(own)).toBe(true);
+    for (const key of Object.keys(own) as Array<keyof typeof own>) {
+      expect(openCodeProviderKeysAllowed({ ...own, [key]: true }), key).toBe(false);
+    }
+  });
+
+  // The first catalog probe runs inside registry.load at startup. Wired after
+  // it, the policy did not apply to that probe; and a server whose sign-in
+  // list lets others in would bill every member's OpenCode bot to the
+  // operator's keys.
+  it("is wired in index.ts before the first catalog probe, with the sign-in list", () => {
+    const source = readFileSync(new URL("../../index.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+    const wired = source.indexOf("setOpenCodeProviderKeyPolicy(openCodeKeysAllowed);");
+    const firstLoad = source.indexOf("await registry.load(providerConfigs(), decorateHostedProvider);");
+    expect(wired).toBeGreaterThan(0);
+    expect(firstLoad).toBeGreaterThan(wired);
+    expect(source.match(/setOpenCodeProviderKeyPolicy\(/g)).toHaveLength(1);
+    const policy = source.slice(source.indexOf("const openCodeKeysAllowed = "), wired);
+    expect(policy).toContain("sharedSignIn: sharedSignIn(signInAllowList())");
+    expect(policy).toContain("cloudHome: Boolean(CLOUD_HOME)");
+    expect(policy).toContain("hostedWorkspace: HOSTED_WORKSPACE");
+    expect(policy).toContain("organisationManaged: openCodeOrganisationManaged()");
+    expect(source).toContain("openCodeOrganisationManaged = () => managedPolicy.current() !== null || managedDesktop.enrolled();");
   });
 
   it("keeps provider keys out on a Cloud home or a managed desktop", async () => {
@@ -541,14 +611,212 @@ describe("OpenCode turns without a sign-in gate", () => {
   });
 });
 
+// Measured on opencode 1.18.27: after `opencode auth login` and a model
+// refresh, a conversation's pooled `opencode acp` still listed its old 7
+// models, and the fallback ran big-pickle while saying the new OpenRouter
+// model was "no longer offered".
+describe("OpenCode after a login added since its process started", () => {
+  const added = "openrouter/openai/gpt-4o-mini";
+  const fixtures: Array<{ scratch: string; instance: ProviderInstance; recorder: EventRecorder }> = [];
+  afterEach(async () => {
+    for (const entry of fixtures.splice(0)) {
+      entry.recorder.stop();
+      await entry.instance.dispose();
+      await removeTempDir(entry.scratch);
+    }
+    resetOpenCodeModelCache();
+  });
+  const open = async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-login-"));
+    const modelsFile = join(scratch, "models");
+    writeFileSync(modelsFile, "opencode/big-pickle");
+    // the instance catalog already lists the new model (refreshed after login)
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle", added));
+    const instance = await driver.create({
+      instanceId: "opencode-login", displayName: "OpenCode", enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false, workspace: scratch },
+      environment: {
+        HOME: scratch, USERPROFILE: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: join(scratch, "data"),
+        FAKE_ACP_MODELS_FILE: modelsFile, FAKE_ACP_LAUNCH_COUNT_FILE: join(scratch, "launches"),
+        FAKE_ACP_RPC_APPEND_FILE: join(scratch, "rpc.jsonl"),
+      },
+    });
+    const recorder = recordEvents(instance.adapter);
+    fixtures.push({ scratch, instance, recorder });
+    const run = async (model: string) => {
+      const { turnId } = await instance.adapter.sendTurn({ threadId: "t-login", text: "hello", model });
+      const done = await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+      return { done, events: recorder.events.filter((event) => event.turnId === turnId) };
+    };
+    const launches = () => Number(readFileSync(join(scratch, "launches"), "utf8"));
+    const prompts = () => readFileSync(join(scratch, "rpc.jsonl"), "utf8").trim().split("\n")
+      .filter((line) => (JSON.parse(line) as { method: string }).method === "session/prompt").length;
+    const login = () => {
+      writeFileSync(modelsFile, `opencode/big-pickle,${added}`);
+      mkdirSync(join(scratch, "data", "opencode"), { recursive: true });
+      writeFileSync(join(scratch, "data", "opencode", "auth.json"), JSON.stringify({ openrouter: { type: "api", key: "sk-or-fixture" } }));
+    };
+    return { run, launches, prompts, login, modelsFile };
+  };
+
+  it("starts a fresh process once OpenCode's logins change, and runs the new model", async () => {
+    const f = await open();
+    expect((await f.run("opencode/big-pickle")).done).toMatchObject({ ok: true });
+    f.login();
+    const { done, events } = await f.run(added);
+    expect(done).toMatchObject({ ok: true });
+    expect(events.some((event) => event.type === "runtime.notice")).toBe(false);
+    expect(events.find((event) => event.type === "session.started")).toMatchObject({ model: added });
+    expect(f.launches()).toBe(2);
+  });
+
+  it("never swaps a model the catalog lists for another one, and retries on a fresh process", async () => {
+    const f = await open();
+    expect((await f.run("opencode/big-pickle")).done).toMatchObject({ ok: true });
+    // the provider arrived some other way (no auth.json change): the pooled
+    // process cannot know it
+    writeFileSync(f.modelsFile, `opencode/big-pickle,${added}`);
+    const stale = await f.run(added);
+    expect(stale.done).toMatchObject({ ok: false });
+    expect(stale.events.some((event) => event.type === "runtime.notice")).toBe(false);
+    expect(stale.events.find((event) => event.type === "runtime.error")).toMatchObject({ message: expect.stringContaining(added) });
+    // nothing ran: the only prompt so far is the first turn's
+    expect(f.prompts()).toBe(1);
+    const retry = await f.run(added);
+    expect(retry.done).toMatchObject({ ok: true });
+    expect(f.launches()).toBe(2);
+  });
+});
+
+describe("OpenCode catalog probes", () => {
+  afterEach(() => resetOpenCodeModelCache());
+
+  // A probe in a folder outside git lands in OpenCode's global project, so
+  // `opencode run --continue` in any other such folder resumed it (checked on
+  // 1.18.27: an own-repo folder keeps its sessions out of that list).
+  it("runs in a folder that is its own git project", async () => {
+    try {
+      execFileSync("git", ["--version"], { stdio: "ignore" });
+    } catch {
+      return;
+    }
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-probe-folder-"));
+    try {
+      const rpc = join(scratch, "rpc.jsonl");
+      await discoverOpenCodeModels({ ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_RPC_APPEND_FILE: rpc }, FAKE_CLI);
+      const folder = (readFileSync(rpc, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { method: string; cwd: string })
+        .find((entry) => entry.method === "session/new"))!.cwd;
+      const root = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { cwd: folder, encoding: "utf8" }).trim();
+      expect(root).toMatch(/^[0-9a-f]{40,64}$/u);
+      expect(realpathSync(execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: folder, encoding: "utf8" }).trim()))
+        .toBe(realpathSync(folder));
+      // once: a second probe keeps the same project
+      resetOpenCodeModelCache();
+      await discoverOpenCodeModels({ ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle" }, FAKE_CLI);
+      expect(execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { cwd: folder, encoding: "utf8" }).trim()).toBe(root);
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+});
+
 describe("OpenCode access to folders OpenMaus owns", () => {
-  it("names the attachments folder and only this bot's folders", () => {
-    expect(openCodeOwnedDirectories("bot-7")).toEqual([
-      ATTACHMENTS_DIR, workspaceDir("bot-7"), join(TASK_WORKSPACES_DIR, "bot-7"),
-    ]);
+  it("names the attachments folder and only this bot's shared folder", () => {
+    expect(openCodeOwnedDirectories("bot-7")).toEqual([ATTACHMENTS_DIR, workspaceDir("bot-7")]);
     expect(openCodeOwnedDirectories("..")).toEqual([ATTACHMENTS_DIR]);
     expect(openCodeOwnedDirectories("../other")).toEqual([ATTACHMENTS_DIR]);
     expect(openCodeOwnedDirectories()).toEqual([ATTACHMENTS_DIR]);
+  });
+
+  // OpenCode loads opencode.json, .opencode/ and AGENTS.md from every folder
+  // above its working folder. Measured on 1.18.27: an Ask-mode turn allowed
+  // into task-workspaces/<bot> wrote an opencode.json there allowing every
+  // folder, and the bot's next conversation then read $HOME with no card.
+  it.each([
+    ["a conversation's own folder", join(TASK_WORKSPACES_DIR, "bot-7", "thread-1")],
+    ["the bot's shared folder (a room's)", workspaceDir("bot-7")],
+    ["a folder inside the shared one", join(workspaceDir("bot-7"), "memory")],
+    ["the attachments folder", ATTACHMENTS_DIR],
+    ["OpenMaus's data folder", dirname(ATTACHMENTS_DIR)],
+    ["a project folder", join(tmpdir(), "project")],
+  ])("never allows the working folder or a folder above it: %s", (_label, cwd) => {
+    const inside = (path: string, folder: string) => {
+      const rest = relative(folder, path);
+      return rest === "" || (!rest.startsWith("..") && !isAbsolute(rest));
+    };
+    const allowed = openCodeOwnedDirectories("bot-7", cwd);
+    for (const directory of allowed) expect(inside(cwd, directory), directory).toBe(false);
+    // earlier conversations are never on the list: their parent sits above
+    // every conversation's working folder
+    expect(allowed).not.toContain(join(TASK_WORKSPACES_DIR, "bot-7"));
+  });
+
+  it("switches off project config only in OpenMaus's own working folders", () => {
+    expect(openMausOwnsWorkingFolder(join(TASK_WORKSPACES_DIR, "bot-7", "thread-1"))).toBe(true);
+    expect(openMausOwnsWorkingFolder(workspaceDir("bot-7"))).toBe(true);
+    expect(openMausOwnsWorkingFolder(TASK_WORKSPACES_DIR)).toBe(false);
+    expect(openMausOwnsWorkingFolder(join(tmpdir(), "project"))).toBe(false);
+    expect(openMausOwnsWorkingFolder(`${TASK_WORKSPACES_DIR}-elsewhere`)).toBe(false);
+  });
+
+  // OpenCode merges OPENCODE_PERMISSION over the person's config and an
+  // object replaces a string (checked with `opencode debug config` on
+  // 1.18.27), so OpenMaus's folder map turned their "deny" into "ask".
+  it("keeps the person's single folder rule ahead of OpenMaus's folders", () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-folder-rule-"));
+    try {
+      const configDir = join(scratch, "config", "opencode");
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(join(configDir, "opencode.jsonc"), [
+        "{",
+        "  // the person's own rule",
+        '  "permission": { "external_directory": "deny", /* no folders */ "bash": "ask", },',
+        "}",
+      ].join("\n"));
+      const env = { HOME: scratch, XDG_CONFIG_HOME: join(scratch, "config") };
+      const project = join(scratch, "project", "src");
+      mkdirSync(project, { recursive: true });
+      expect(configuredOpenCodeFolderAction(env, project, true)).toBe("deny");
+      // a project map replaces the string, exactly as in OpenCode
+      writeFileSync(join(scratch, "project", "opencode.json"), JSON.stringify({ permission: { external_directory: { "/srv/*": "allow" } } }));
+      expect(configuredOpenCodeFolderAction(env, project, true)).toBeUndefined();
+      // unless project config is off
+      expect(configuredOpenCodeFolderAction(env, project, false)).toBe("deny");
+      expect(configuredOpenCodeFolderAction({ ...env, OPENCODE_CONFIG_CONTENT: '{"permission":{"external_directory":"ask"}}' }, project, false)).toBe("ask");
+    } finally {
+      void removeTempDir(scratch);
+    }
+  });
+
+  it("carries the person's deny into a turn's folder policy", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-deny-"));
+    const dump = join(scratch, "env.json");
+    mkdirSync(join(scratch, "opencode"), { recursive: true });
+    writeFileSync(join(scratch, "opencode", "opencode.json"), JSON.stringify({ permission: { external_directory: "deny" } }));
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
+    const instance = await driver.create({
+      instanceId: "opencode-deny", displayName: "OpenCode", enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false, workspace: scratch },
+      environment: { HOME: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_DUMP: dump },
+    });
+    const recorder = recordEvents(instance.adapter);
+    const cwd = join(TASK_WORKSPACES_DIR, "bot-7", "thread-deny");
+    mkdirSync(cwd, { recursive: true });
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-deny", botId: "bot-7", text: "hi", model: "opencode/big-pickle", approvalMode: "ask", cwd });
+      expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: true });
+      const env = (JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> }).env;
+      expect(env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe("1");
+      expect(Object.entries(JSON.parse(env.OPENCODE_PERMISSION).external_directory)).toEqual([
+        ["*", "deny"],
+        ...openCodeOwnedDirectories("bot-7", cwd).flatMap((directory) => [[directory, "allow"], [join(directory, "*"), "allow"]]),
+      ]);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      await removeTempDir(cwd);
+      await removeTempDir(scratch);
+    }
   });
 
   it.each([["ask", false], ["full", true]] as const)("sets OpenCode's folder policy for %s turns", async (approvalMode, full) => {
@@ -574,7 +842,9 @@ describe("OpenCode access to folders OpenMaus owns", () => {
         return;
       }
       // the person's own rules stay, first; OpenMaus's folders are allowed
-      // after them; nothing else is widened
+      // after them; nothing else is widened. A project folder of the
+      // person's keeps its own OpenCode config.
+      expect(JSON.parse(readFileSync(dump, "utf8")).env.OPENCODE_DISABLE_PROJECT_CONFIG).toBeUndefined();
       expect(policy.bash).toBe("ask");
       expect(Object.entries(policy.external_directory)).toEqual([
         ["/srv/shared/*", "deny"],
@@ -784,6 +1054,14 @@ describe("OpenCode session variants", () => {
       expect(second.events.some((event) => event.type === "runtime.notice")).toBe(false);
     },
   );
+
+  // The app hid an unprefixed notice with the tool steps (Tool calls is off
+  // by default); `notice:` makes it a status row (src/lib/activity-runs.ts).
+  it("is stored as a status row the person always sees", () => {
+    const source = readFileSync(new URL("../../index.ts", import.meta.url), "utf8");
+    const handler = source.slice(source.indexOf('case "runtime.notice":'), source.indexOf('case "runtime.error":'));
+    expect(handler).toContain("name: `notice: ${event.message.slice(0, 240)}`");
+  });
 
   it("still switches to a model the session offers", async () => {
     const f = await fixture({});

@@ -717,6 +717,38 @@ describe("default fleet", () => {
     expect(map.bedrock.environment).toEqual({ CLAUDE_CODE_USE_BEDROCK: "1" });
   });
 
+  // The same leak as a Claude router instance, in the API-key engines: a
+  // hand-written instance with its own URL got the workspace key and sent it
+  // to that URL's host.
+  it("never hands a workspace API key to an API-key instance with its own endpoint or key", () => {
+    const map = instanceConfigs({
+      openaiCompat: { key: "sk-or-WORKSPACE" },
+      mistral: { key: "mistral-WORKSPACE" },
+      xai: { key: "xai-WORKSPACE" },
+      instances: {
+        claude: { driver: "claudeAgent" },
+        openaiCompat: { driver: "openai-compat" },
+        sameUrl: { driver: "openai-compat", config: { url: "https://openrouter.ai/api/v1/" } },
+        groq: { driver: "openai-compat", config: { url: "https://third-party.example.test/v1" } },
+        ownKey: { driver: "openai-compat", config: { key: "sk-own" } },
+        ownVariable: { driver: "openai-compat", config: { apiKeyEnv: "GROQ_API_KEY" } },
+        mistral: { driver: "mistral" },
+        mistralProxy: { driver: "mistral", config: { url: "https://mistral-proxy.example.test/v1" } },
+        grokApi: { driver: "grok" },
+        grokProxy: { driver: "grok", config: { url: "https://xai-proxy.example.test/v1" } },
+        grokOwn: { driver: "grok", environment: { XAI_API_KEY: "xai-own" } },
+      },
+    });
+    expect(map.openaiCompat.environment).toMatchObject({ OPENAI_COMPAT_API_KEY: "sk-or-WORKSPACE" });
+    expect(map.sameUrl.environment).toMatchObject({ OPENAI_COMPAT_API_KEY: "sk-or-WORKSPACE" });
+    for (const id of ["groq", "ownKey", "ownVariable"]) expect(map[id].environment, id).toEqual({});
+    expect(map.mistral.environment).toEqual({ MISTRAL_API_KEY: "mistral-WORKSPACE" });
+    expect(map.mistralProxy.environment).toEqual({});
+    expect(map.grokApi.environment).toEqual({ XAI_API_KEY: "xai-WORKSPACE" });
+    expect(map.grokProxy.environment).toEqual({});
+    expect(map.grokOwn.environment).toEqual({ XAI_API_KEY: "xai-own" });
+  });
+
   it("preserves a per-instance OpenAI-compatible URL override", () => {
     const map = instanceConfigs({
       openaiCompat: { url: "https://workspace.example.test/v1" },

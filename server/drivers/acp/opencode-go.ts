@@ -1,9 +1,10 @@
 // The maintained OpenCode CLI through its ACP stdio interface. OpenCode is
 // the harness; Zen, Go, OpenRouter, and user-configured/local providers are
 // models discovered from that harness rather than separate OpenMaus drivers.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 
 import { ATTACHMENTS_DIR } from "../../attachments.ts";
 import { cloudHomeConfigured } from "../../cloud-home.ts";
@@ -247,23 +248,59 @@ function runOpenCodeModelsVerbose(
   });
 }
 
-/** A folder OpenMaus owns for catalog probes. OpenCode records every
- * session, empty ones included, so probes stay out of the person's projects. */
-function discoveryDirectory(): string {
-  const directory = join(DATA_DIR, "providers", "opencode", "discovery");
-  mkdirSync(directory, { recursive: true });
-  return directory;
+function runGit(directory: string, args: string[]): Promise<void> {
+  // The person's git settings stay out: no signing prompt, no hooks, no
+  // repository named by a GIT_* variable.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+  return new Promise((resolveRun, rejectRun) => {
+    execFile("git", [
+      "-c", "user.name=OpenMaus", "-c", "user.email=model-discovery@openmaus.invalid",
+      "-c", "commit.gpgsign=false", "-c", `core.hooksPath=${join(directory, ".git", "no-hooks")}`,
+      ...args,
+    ], { cwd: directory, env: { ...env, GIT_TERMINAL_PROMPT: "0" }, timeout: 10_000, windowsHide: true }, (error) => {
+      if (error) rejectRun(error);
+      else resolveRun();
+    });
+  });
+}
+
+let discoveryFolder: Promise<string> | null = null;
+
+/** A folder OpenMaus owns for catalog probes, made its own git project once.
+ * OpenCode records every session, empty ones included, under the project of
+ * its working folder, and every folder outside git shares one global project:
+ * `opencode run --continue` in any of them would resume OpenMaus's empty probe
+ * instead of the person's last session. Without git the probe still works and
+ * its session lands in the global list, as before. */
+function discoveryDirectory(): Promise<string> {
+  discoveryFolder ??= (async () => {
+    const directory = join(DATA_DIR, "providers", "opencode", "discovery");
+    mkdirSync(directory, { recursive: true });
+    const marker = join(directory, ".openmaus-project");
+    if (!existsSync(marker)) {
+      try {
+        await runGit(directory, ["init", "-q"]);
+        await runGit(directory, ["commit", "-q", "--allow-empty", "--no-verify", "-m", "OpenMaus model discovery"]);
+        writeFileSync(marker, "OpenCode files this folder's sessions under its own project.\n");
+      } catch {
+        // No git: probes run here all the same.
+      }
+    }
+    return directory;
+  })();
+  return discoveryFolder;
 }
 
 /** Open one ACP session on the binary and environment a turn uses, and
  * return what session/new answered. No prompt is sent and the process is
  * stopped as soon as the answer arrives. */
-export function probeOpenCodeSession(
+export async function probeOpenCodeSession(
   cli: string,
   environment: Record<string, string | undefined>,
-  cwd = discoveryDirectory(),
+  folder?: string,
   timeoutMs = DISCOVERY_TIMEOUT_MS,
 ): Promise<unknown> {
+  const cwd = folder ?? await discoveryDirectory();
   return new Promise((resolve, reject) => {
     let child: ReturnType<typeof spawnCli>;
     try {
@@ -410,6 +447,7 @@ export async function canRunOpenCode(
 }
 
 export function resetOpenCodeModelCache() {
+  discoveryFolder = null;
   lastSuccessfulCatalog.clear();
   discoveryProbeCache.clear();
   freeModels.clear();
@@ -435,12 +473,29 @@ export const OPENCODE_PROVIDER_ENV = [
   "MINIMAX_API_KEY",
 ] as const;
 
-/** On a Cloud home, a hosted team workspace or an organisation-managed
- * desktop, the server's environment is not the person's own shell: a key
- * there belongs to whoever runs the machine, so it stays out of OpenCode. */
-let providerKeysAllowed = (): boolean => !cloudHomeConfigured() && !hostedWorkspaceConfigured();
+/** Whether OpenCode may read provider keys from the server's own
+ * environment. Only when that environment is the person's own shell: not on a
+ * Cloud home, a hosted team workspace or an organisation-managed desktop, and
+ * not on a server whose sign-in list lets other people in, where every
+ * member's bot would otherwise run on, and bill, the operator's key. */
+export function openCodeProviderKeysAllowed(state: {
+  cloudHome: boolean;
+  hostedWorkspace: boolean;
+  organisationManaged: boolean;
+  sharedSignIn: boolean;
+}): boolean {
+  return !state.cloudHome && !state.hostedWorkspace && !state.organisationManaged && !state.sharedSignIn;
+}
 
-/** The server narrows this once it knows about Company enrollment. */
+let providerKeysAllowed = (): boolean => openCodeProviderKeysAllowed({
+  cloudHome: cloudHomeConfigured(),
+  hostedWorkspace: hostedWorkspaceConfigured(),
+  organisationManaged: false,
+  sharedSignIn: false,
+});
+
+/** The server sets this before any driver is created, and narrows it with
+ * Company enrollment and its sign-in list. */
 export function setOpenCodeProviderKeyPolicy(allowed: () => boolean): void {
   providerKeysAllowed = allowed;
 }
@@ -567,25 +622,140 @@ function hasStoredOpenCodeAuth(env: Record<string, string | undefined>) {
   });
 }
 
-/** Folders OpenMaus owns that an OpenCode bot reads outside its
- * per-conversation working folder: the attachments people send, and this
- * bot's own shared folder and earlier conversations (the file locations its
- * prompt lists). Paths mirror server/attachments.ts and server/workspace.ts. */
-export function openCodeOwnedDirectories(botId?: string): string[] {
+/** Whether `path` is `folder` itself or somewhere inside it. */
+function withinFolder(path: string, folder: string): boolean {
+  const rest = relative(resolvePath(folder), resolvePath(path));
+  return rest === "" || (rest !== ".." && !rest.startsWith(`..${sep}`) && !isAbsolute(rest));
+}
+
+/** Whether a turn works in one of OpenMaus's own folders: a bot's shared
+ * folder or a conversation's private one (server/workspace.ts). Everything in
+ * them was written by bots, so none of it may become OpenCode configuration. */
+export function openMausOwnsWorkingFolder(cwd: string): boolean {
+  return [join(DATA_DIR, "workspaces"), join(DATA_DIR, "task-workspaces")].some((root) =>
+    withinFolder(cwd, root) && resolvePath(cwd) !== resolvePath(root));
+}
+
+/** Folders OpenMaus owns that an OpenCode bot may use outside its working
+ * folder without an approval card: the attachments people send (every turn
+ * that read one stalled on a card) and this bot's own shared folder, which
+ * holds the memory its prompt points at.
+ *
+ * Never a folder at or above the turn's working folder. OpenCode reads
+ * opencode.json, .opencode/ and AGENTS.md from every folder above its working
+ * folder, so a file planted there would configure the bot's later
+ * conversations: one prompt-injected turn could allow every folder for good.
+ * That is also why earlier conversations (task-workspaces/<bot>, the parent of
+ * every conversation's folder) still ask.
+ *
+ * Accepted: OpenCode's folder rule covers writes as well as reads, and it
+ * allows edits and shell by default, so a bot can also change or delete files
+ * in the attachments folder, which holds every conversation's uploads under
+ * random names. Its edit rules match paths relative to the project and its
+ * shell rules match command text, so neither can fence one folder reliably. */
+export function openCodeOwnedDirectories(botId?: string, cwd?: string): string[] {
   const directories = [ATTACHMENTS_DIR];
   // One path segment only: a bot id never names a folder outside its own.
-  if (botId && /^[\w-][\w.-]*$/u.test(botId) && botId !== "..") {
-    directories.push(join(DATA_DIR, "workspaces", botId), join(DATA_DIR, "task-workspaces", botId));
+  if (botId && /^[\w-][\w.-]*$/u.test(botId) && botId !== "..") directories.push(join(DATA_DIR, "workspaces", botId));
+  return cwd ? directories.filter((directory) => !withinFolder(cwd, directory)) : directories;
+}
+
+/** JSON with comments and trailing commas, as OpenCode reads its config. */
+function parseJsonc(text: string): unknown {
+  let plain = "";
+  let inString = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (inString) {
+      plain += character;
+      if (character === "\\") plain += text[++index] ?? "";
+      else if (character === '"') inString = false;
+    } else if (character === '"') {
+      inString = true;
+      plain += character;
+    } else if (character === "/" && text[index + 1] === "/") {
+      while (index < text.length && text[index] !== "\n") index += 1;
+      plain += "\n";
+    } else if (character === "/" && text[index + 1] === "*") {
+      index += 2;
+      while (index < text.length && !(text[index] === "*" && text[index + 1] === "/")) index += 1;
+      index += 1;
+    } else plain += character;
   }
-  return directories;
+  try {
+    return JSON.parse(plain.replace(/,(\s*[}\]])/gu, "$1"));
+  } catch {
+    return undefined;
+  }
+}
+
+function readText(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/** The folder rule the person's own OpenCode config ends with, when it is a
+ * single action ("deny", "ask" or "allow") rather than a folder map.
+ * OPENCODE_PERMISSION is merged over the config and an object replaces a
+ * string, so without this OpenMaus's folder list would quietly turn a "deny"
+ * into OpenCode's default "ask". A folder map needs nothing: the two maps
+ * merge. Sources in OpenCode's own order: global config, OPENCODE_CONFIG,
+ * project files from the root down (unless project config is off), the
+ * .opencode folders, then OPENCODE_CONFIG_CONTENT. */
+export function configuredOpenCodeFolderAction(
+  env: Record<string, string | undefined>,
+  cwd: string,
+  projectConfig: boolean,
+): string | undefined {
+  let rule: unknown;
+  const apply = (raw: string | undefined) => {
+    if (!raw) return;
+    const config = parseJsonc(raw) as { permission?: unknown } | undefined;
+    const permission = config && typeof config === "object" ? config.permission : undefined;
+    if (!permission || typeof permission !== "object" || Array.isArray(permission)) return;
+    const value = (permission as Record<string, unknown>).external_directory;
+    if (typeof value === "string") rule = value;
+    else if (value && typeof value === "object" && !Array.isArray(value)) {
+      rule = rule && typeof rule === "object" ? { ...rule as object, ...value } : value;
+    }
+  };
+  const global = opencodeConfigDir(env);
+  for (const name of ["config.json", "opencode.json", "opencode.jsonc"]) apply(readText(join(global, name)));
+  if (env.OPENCODE_CONFIG) apply(readText(env.OPENCODE_CONFIG));
+  const projectFolders: string[] = [];
+  if (projectConfig) {
+    // Up to the git root, or the top of the disk outside git.
+    for (let folder = resolvePath(cwd); ; folder = dirname(folder)) {
+      projectFolders.push(folder);
+      if (existsSync(join(folder, ".git")) || dirname(folder) === folder) break;
+    }
+    for (const folder of [...projectFolders].reverse()) {
+      for (const name of ["opencode.json", "opencode.jsonc"]) apply(readText(join(folder, name)));
+    }
+  }
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const configFolders = [
+    ...projectFolders.map((folder) => join(folder, ".opencode")),
+    join(home, ".opencode"),
+    ...(env.OPENCODE_CONFIG_DIR ? [env.OPENCODE_CONFIG_DIR] : []),
+  ];
+  for (const folder of configFolders) {
+    for (const name of ["opencode.json", "opencode.jsonc"]) apply(readText(join(folder, name)));
+  }
+  apply(env.OPENCODE_CONFIG_CONTENT);
+  return typeof rule === "string" ? rule : undefined;
 }
 
 /** OpenCode asks before a tool touches a folder outside the session's
  * working folder (its `external_directory` permission), which stalled every
  * turn that read an attachment on an approval card. Allow exactly the
- * folders OpenMaus owns for this bot; every other folder still asks. The
- * rules depend only on the bot, so a conversation keeps one process. */
-function allowOwnedDirectories(env: Record<string, string | undefined>, botId?: string): void {
+ * folders OpenMaus owns for this bot; every other folder keeps the person's
+ * rule, or OpenCode's default "ask". The rules depend only on the bot and the
+ * working folder, so a conversation keeps one process. */
+function allowOwnedDirectories(env: Record<string, string | undefined>, botId: string | undefined, cwd: string): void {
   let permission: Record<string, unknown> = {};
   if (env.OPENCODE_PERMISSION) {
     try {
@@ -597,16 +767,20 @@ function allowOwnedDirectories(env: Record<string, string | undefined>, botId?: 
       return;
     }
   }
+  const directories = openCodeOwnedDirectories(botId, cwd);
+  if (!directories.length) return;
   const existing = permission.external_directory;
   // OpenCode evaluates rules in order and the last match wins, so these go
-  // after anything already there. No "*" of our own: OpenCode's defaults
-  // (ask, and allow for its own output folder) stay in force.
-  const rules: Record<string, unknown> = typeof existing === "string"
-    ? { "*": existing }
-    : existing && typeof existing === "object" && !Array.isArray(existing)
-      ? { ...(existing as Record<string, unknown>) }
-      : {};
-  for (const directory of openCodeOwnedDirectories(botId)) {
+  // after anything already there: the person's single action first as "*",
+  // then OpenMaus's folders.
+  let rules: Record<string, unknown>;
+  if (typeof existing === "string") rules = { "*": existing };
+  else if (existing && typeof existing === "object" && !Array.isArray(existing)) rules = { ...(existing as Record<string, unknown>) };
+  else {
+    const configured = configuredOpenCodeFolderAction(env, cwd, env.OPENCODE_DISABLE_PROJECT_CONFIG !== "1");
+    rules = configured ? { "*": configured } : {};
+  }
+  for (const directory of directories) {
     rules[directory] = "allow";
     rules[join(directory, "*")] = "allow";
   }
@@ -614,19 +788,46 @@ function allowOwnedDirectories(env: Record<string, string | undefined>, botId?: 
   env.OPENCODE_PERMISSION = JSON.stringify(permission);
 }
 
-/** Account failures in plain words, with the fix. */
-function describeOpenCodeAccountError(code: AccountErrorCode): string {
+/** Account failures in plain words, with the fix, naming the provider that
+ * refused: with provider keys and `opencode auth login` a model may be
+ * OpenRouter's or Anthropic's, not Zen's. Each stays under the 160
+ * characters a chat error row shows. */
+export function describeOpenCodeAccountError(code: AccountErrorCode, model?: string): string {
+  const provider = model && model.includes("/") ? model.slice(0, model.indexOf("/")) : "";
+  const zen = provider === "opencode";
+  const go = provider === "opencode-go";
+  const label = providerLabel(provider);
+  const name = zen ? "OpenCode Zen" : go ? "OpenCode Go" : provider ? (label.length > 24 ? provider.slice(0, 24) : label) : "OpenCode";
   switch (code) {
     case "invalid_credentials":
-      return "OpenCode could not use this model's API key: it is missing or was rejected. Check the OpenCode key in " +
-        "Settings → Connections, or sign in again with `opencode auth login`. A wrong key also stops Zen's free models.";
+      return zen || go || !provider
+        ? "OpenCode rejected its key, or has none for this model. Fix it in Settings → Connections or with `opencode auth login`."
+        : `OpenCode's ${name} key for this model is missing or was rejected. Fix it with \`opencode auth login\`, or choose another model.`;
     case "insufficient_funds":
-      return "Your OpenCode Zen balance has run out. Add credit at opencode.ai, or choose one of Zen's free models for this bot.";
+      return zen || !provider
+        ? "Your OpenCode Zen balance has run out. Add credit at opencode.ai, or choose one of Zen's free models for this bot."
+        : `Your ${name} account has run out of credit. Add credit there, or choose another model for this bot.`;
     case "inactive_subscription":
-      return "This model needs an active OpenCode Go subscription. Subscribe at opencode.ai, or choose a Zen model for this bot.";
+      return go || !provider
+        ? "This model needs an active OpenCode Go subscription. Subscribe at opencode.ai, or choose a Zen model for this bot."
+        : `This model needs an active ${name} subscription. Renew it there, or choose another model for this bot.`;
     case "quota_or_region_restriction":
-      return "OpenCode's usage limit for this account has been reached. Wait for it to reset, or choose another model for this bot.";
+      return `${name} says this account's usage limit has been reached. Wait for it to reset, or choose another model for this bot.`;
   }
+}
+
+/** OpenCode's logins, as one value that changes when `opencode auth login`
+ * adds or replaces one. A running `opencode acp` never reads auth.json again,
+ * so a conversation's process must be replaced once it changes. */
+function openCodeLoginsFingerprint(env: Record<string, string | undefined>): string {
+  return storedAuthPaths(env).map((path) => {
+    try {
+      const stat = statSync(path);
+      return `${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return "-";
+    }
+  }).join("|");
 }
 
 const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
@@ -662,9 +863,13 @@ const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
   modelVariants: true,
   resolveTurnModel: (model, env) => model ? ensureOpenCodeInjectModel(model, env) : model,
   transformEnv: withholdProviderKeysWhenManaged,
-  applyTurnEnv: (env, { fullAuto, botId }) => {
+  spawnFingerprint: openCodeLoginsFingerprint,
+  applyTurnEnv: (env, { fullAuto, botId, cwd }) => {
+    // In OpenMaus's own folders nothing is the person's project: a bot wrote
+    // it, and OpenCode would otherwise take it as configuration.
+    if (openMausOwnsWorkingFolder(cwd)) env.OPENCODE_DISABLE_PROJECT_CONFIG = "1";
     if (!fullAuto) {
-      allowOwnedDirectories(env, botId);
+      allowOwnedDirectories(env, botId, cwd);
       return;
     }
     // Scope native permissions to this child, not the user's OpenCode config.
@@ -701,9 +906,13 @@ const support = (loadCatalog: OpenCodeCatalogLoader): AcpSupport => ({
  * data: {service: "session", errorName: "APIError"}}`. */
 const ACCOUNT_ERROR_TEXT: ReadonlyArray<readonly [RegExp, AccountErrorCode]> = [
   [/insufficient (?:account )?(?:funds|balance|credits?)|out of credits?|no credits? (?:left|remaining)|payment required|\b402\b/iu, "insufficient_funds"],
-  [/\bquota\b|usage limit|limit (?:has been )?(?:reached|exceeded)|(?:hourly|daily|weekly|monthly|5-hour) limit/iu, "quota_or_region_restriction"],
+  // Not plain "rate limit exceeded": that is a transient 429, which OpenCode
+  // retries itself and automatic recovery may still route around.
+  [/\bquota\b|usage limit|(?:hourly|daily|weekly|monthly|5-hour) limit/iu, "quota_or_region_restriction"],
   [/\bsubscription\b/iu, "inactive_subscription"],
-  [/invalid api key|api key (?:is )?(?:invalid|missing|revoked|expired)|incorrect api key|unauthori[sz]ed|\b401\b|authentication (?:failed|required)/iu, "invalid_credentials"],
+  // "User not found." is OpenRouter's refusal of an unknown key (recorded
+  // through opencode 1.18.27 after `opencode auth login` with a dummy key).
+  [/invalid api key|api key (?:is )?(?:invalid|missing|revoked|expired)|incorrect api key|unauthori[sz]ed|\b401\b|authentication (?:failed|required)|(?:^|internal error: )user not found\b/iu, "invalid_credentials"],
 ];
 
 export function classifyOpenCodeError(error: unknown): ProviderErrorCode | undefined {

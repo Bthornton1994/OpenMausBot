@@ -666,10 +666,12 @@ describe("Antigravity driver over shared ACP", () => {
     expect(dumpState.env.GEMINI_HOME).toBe(antigravityProfileDirectory(instanceId));
     expect(dumpState.env.GEMINI_API_KEY).toBeUndefined();
     expect(dumpState.env.GOOGLE_API_KEY).toBeUndefined();
-    // The session starts on the chosen model, so only the mode is set.
-    expect(dumpState.env.AGY_ACP_DEFAULT_MODEL).toBe("gemini-3.8-flash-low");
+    // Nothing yet says this account offers the model, so the session is
+    // not started on it: the switch is what checks it.
+    expect(dumpState.env.AGY_ACP_DEFAULT_MODEL).toBeUndefined();
     const calls = JSON.parse(readFileSync(`${dump}.config.json`, "utf8"));
     expect(calls).toEqual([
+      { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: "gemini-3.8-flash-low" } },
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "mode", value: approvalMode === "full" ? "yolo" : approvalMode === "edits" ? "auto_edit" : "default" } },
     ]);
     const mcp = JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8"));
@@ -704,16 +706,18 @@ describe("Antigravity driver over shared ACP", () => {
       config: { cli: fake.executable, fullAuto: false },
     });
     recorder = recordEvents(instance.adapter);
-    const run = async (approvalMode: "ask" | "full" | "edits", model: string) => {
+    const run = async (approvalMode: "ask" | "full" | "edits", model: string, threadId = "thread-pooled") => {
       const { turnId } = await instance!.adapter.sendTurn({
-        threadId: "thread-pooled", text: "hello", approvalMode, model, cwd: fake.directory,
+        threadId, text: "hello", approvalMode, model, cwd: fake.directory,
       });
       expect(await recorder!.until((event) => event.type === "turn.completed" && event.turnId === turnId)).toMatchObject({ ok: true });
     };
+    // An earlier conversation's session lists the models this account offers.
+    await run("ask", "gemini-3.8-flash-high", "thread-earlier");
     await run("ask", "gemini-3.8-flash-high");
     await run("full", "gemini-3.8-flash-high");
     await run("edits", "gemini-3.8-flash-low");
-    expect(Number(readFileSync(launches, "utf8"))).toBe(1);
+    expect(Number(readFileSync(launches, "utf8"))).toBe(2);
     expect(JSON.parse(readFileSync(dump, "utf8")).env.AGY_ACP_DEFAULT_MODEL).toBe("gemini-3.8-flash-high");
     expect(JSON.parse(readFileSync(`${dump}.config.json`, "utf8")).map((call: any) => [call.params.configId, call.params.value])).toEqual([
       ["mode", "default"],
@@ -721,6 +725,50 @@ describe("Antigravity driver over shared ACP", () => {
       ["model", "gemini-3.8-flash-low"],
       ["mode", "auto_edit"],
     ]);
+  });
+
+  // Measured on agy_acp_server 1.1.1: any id in AGY_ACP_DEFAULT_MODEL is
+  // taken unchecked (even "bogus-model-xyz"), while the model switch refuses
+  // one the account cannot use with -32602. Starting sessions on a saved
+  // model the account never offered skipped that check.
+  it("never starts a session on a model this account has not offered", async () => {
+    ensureDirs();
+    const fake = fakeRuntime();
+    const dump = join(fake.directory, "dump.json");
+    const instanceId = "antigravity-unavailable";
+    const tokenDirectory = join(antigravityProfileDirectory(instanceId), "antigravity-acp");
+    mkdirSync(tokenDirectory, { recursive: true });
+    writeFileSync(join(tokenDirectory, "acp_token.json"), "{}", { mode: 0o600 });
+    instance = await AntigravityDriver.create({
+      instanceId,
+      displayName: "Antigravity",
+      environment: {
+        FAKE_ACP_AUTH_METHOD: "oauth-personal",
+        FAKE_ACP_MODELS: "gemini-3.7-flash-high,gemini-3.8-flash-low",
+        FAKE_ACP_MODES: "default,yolo,auto_edit",
+        FAKE_ACP_DUMP: dump,
+      },
+      enabled: true,
+      config: { cli: fake.executable, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+    const run = async (threadId: string, model: string) => {
+      const { turnId } = await instance!.adapter.sendTurn({ threadId, text: "hello", approvalMode: "ask", model, cwd: fake.directory });
+      const done = await recorder!.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+      return { done, events: recorder!.events.filter((event) => event.turnId === turnId) };
+    };
+    expect((await run("thread-known", "gemini-3.8-flash-low")).done).toMatchObject({ ok: true });
+    // a tier-locked model, and OMB's static default the account lacks
+    for (const [index, model] of ["gemini-3.8-pro-high", STATIC_ANTIGRAVITY_MODELS.default].entries()) {
+      const { done, events } = await run(`thread-unavailable-${index}`, model);
+      expect(done).toMatchObject({ ok: false });
+      expect(JSON.parse(readFileSync(dump, "utf8")).env.AGY_ACP_DEFAULT_MODEL).toBeUndefined();
+      expect(events.find((event) => event.type === "runtime.error")).toMatchObject({ message: expect.stringContaining(model) });
+      expect(events.some((event) => event.type === "item.completed" && event.itemType === "assistant_text")).toBe(false);
+    }
+    // an offered one still starts on the session's own model
+    expect((await run("thread-offered", "gemini-3.8-flash-low")).done).toMatchObject({ ok: true });
+    expect(JSON.parse(readFileSync(dump, "utf8")).env.AGY_ACP_DEFAULT_MODEL).toBe("gemini-3.8-flash-low");
   });
 
   it("fails closed when Antigravity does not confirm its permission mode", async () => {

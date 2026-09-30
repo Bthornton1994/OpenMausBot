@@ -205,6 +205,8 @@ interface AcpSession {
   /** the last model fallback reported on this process ("wanted\nused"), so
    * a pooled conversation says it once rather than on every turn */
   fallbackNotice?: string;
+  /** the model the process was told to start sessions on (sessionModelEnv) */
+  launchModel?: string;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -265,8 +267,16 @@ export interface AcpSupport {
   /** The environment variable this runtime reads its new-session default
    * model from. Set at spawn to the turn's model so session/new already runs
    * it and the separate model switch is skipped. It is not part of the spawn
-   * contract: a later model change still goes over the wire. */
+   * contract: a later model change still goes over the wire. The runtime
+   * takes any id from it unchecked (Antigravity even adds it to the session's
+   * list), and the switch it replaces was the only check, so it is set only
+   * for a model this account has itself offered: in the discovered catalog,
+   * or in a session list from a process started without it. */
   sessionModelEnv?: string;
+  /** Part of the spawn contract beside the environment: state outside it
+   * that a running process never reads again (OpenCode's auth.json), so a
+   * conversation whose process predates a change gets a fresh one. */
+  spawnFingerprint?(env: Record<string, string | undefined>): string;
   /** The approval mode is applied to the session on every turn (in
    * configureSession) and nothing about the process depends on it, so an
    * approval change must not respawn the process. */
@@ -322,7 +332,7 @@ export interface AcpSupport {
   classifyError?(error: unknown): ProviderErrorCode | undefined;
   /** Plain words for an account failure (bad key, no credit, a used-up
    * quota, no subscription) in place of the provider's raw RPC text. */
-  describeAccountError?(code: AccountErrorCode): string;
+  describeAccountError?(code: AccountErrorCode, model?: string): string;
   /** Compose the session/prompt text. Default prepends the persona. */
   buildPromptText?(turn: SendTurnInput): string;
   /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
@@ -582,11 +592,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         return env;
       };
       let models = support.models;
+      // Models this account itself offered (see sessionModelEnv): the
+      // discovered catalog, never the static one, or a live session's list.
+      let accountModels: ReadonlySet<string> | null = null;
       const refreshModels = async () => {
         if (!support.resolveModels) return;
         try {
           const resolved = await support.resolveModels(childEnv(), config, instanceId);
-          if (resolved.options.length) models = resolved;
+          if (resolved.options.length) {
+            models = resolved;
+            accountModels = new Set(resolved.options.map((option) => option.id));
+          }
         } catch {
           // Keep the last usable catalog when an optional discovery source is down.
         }
@@ -1388,13 +1404,25 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const contractKey = JSON.stringify([
           launch.command, launch.args ?? [], spawnArgs, cwd,
           support.sessionScopedApproval ? null : turnConfig.fullAuto === true, envFingerprint,
+          support.spawnFingerprint?.(spawnEnv) ?? null,
         ]);
         // The new-session default model rides the spawn env but stays out of
         // the fingerprint above: only session/new reads it, and a pooled
         // process switches later models over the wire as before.
-        const launchEnv = support.sessionModelEnv && cliTurn.model && /^[\w.:/-]{1,200}$/u.test(cliTurn.model)
-          ? { ...spawnEnv, [support.sessionModelEnv]: cliTurn.model }
+        const launchModel = support.sessionModelEnv && cliTurn.model && /^[\w.:/-]{1,200}$/u.test(cliTurn.model)
+          && accountModels?.has(cliTurn.model) ? cliTurn.model : undefined;
+        const launchEnv = support.sessionModelEnv && launchModel
+          ? { ...spawnEnv, [support.sessionModelEnv]: launchModel }
           : spawnEnv;
+        // whether this turn's process was started by this turn: its model
+        // list is then current, not a pooled process's older one
+        let launchedThisTurn = false;
+        const launchSession = () => {
+          const opened = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], launchEnv, cwd, contractKey);
+          opened.launchModel = launchModel;
+          launchedThisTurn = true;
+          return opened;
+        };
         const sessionKey = JSON.stringify(mcpServers);
 
         if (turn.sessionReset) {
@@ -1416,7 +1444,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             if (pooled.dead) sessions.delete(threadId);
             else closeSession(threadId, "contract");
           }
-          session = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], launchEnv, cwd, contractKey);
+          session = launchSession();
           sessions.set(threadId, session);
         }
         // `session` rebinds mid-turn: when the establishment retry below
@@ -1444,6 +1472,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // replaces both: a saved variant belongs to the model it replaced.
         let reportedModel = turn.model;
         let variant = turn.variant;
+        // set below when this process lists fewer models than the catalog
+        let staleProcess = false;
         const modelOf = (result: any): string | null => {
           const option = (Array.isArray(result?.configOptions) ? result.configOptions : []).find(
             (entry: any) => entry?.id === (support.selectModel?.configId ?? "model"),
@@ -1645,7 +1675,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 // session/new on the replacement child.
                 session.current = null;
                 closeSession(threadId, "reestablish");
-                session = openSession(threadId, launch, [...(launch.args ?? []), ...spawnArgs], launchEnv, cwd, contractKey);
+                session = launchSession();
                 sessions.set(threadId, session);
                 session.current = current;
                 runtimeAcceptsImages = await handshake();
@@ -1694,10 +1724,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 selectedModel = modelOf(session.sessionConfigResult);
                 const wanted = cliTurn.model;
                 const offered = offeredModels(session.sessionConfigResult, configId);
+                // A process started without a default model lists exactly
+                // what this account offers.
+                if (support.sessionModelEnv && !session.launchModel && offered.length) accountModels = new Set(offered);
+                // The instance catalog lists the model but a pooled process
+                // does not: the process is older than the catalog (a provider
+                // added since it started). That is no reason to run another
+                // model. The switch below fails with the runtime's own words,
+                // and the process is closed so the retry starts on a fresh
+                // one. A process this turn started is current, so there the
+                // catalog is the stale one and the fallback applies.
+                staleProcess = Boolean(support.fallbackModel && wanted && !launchedThisTurn && offered.length
+                  && !offered.includes(wanted) && models.options.some((option) => option.id === wanted));
                 // A local inject writes its provider for this turn, so a
                 // process started earlier may not list it yet: never replace it.
                 if (support.fallbackModel && offered.length && !skipSubscriptionAuthForLocalInject(turn.model)
-                    && (!wanted || !offered.includes(wanted))) {
+                    && !staleProcess && (!wanted || !offered.includes(wanted))) {
                   const fallback = support.fallbackModel(session.sessionConfigResult, models.default);
                   if (fallback && fallback !== wanted && offered.includes(fallback)) {
                     const notice = wanted ? `${wanted}\n${fallback}` : null;
@@ -1916,7 +1958,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               emit({
                 ...base(threadId, turnId),
                 type: "runtime.error",
-                message: accountError ? support.describeAccountError?.(code) ?? message : message,
+                message: accountError ? support.describeAccountError?.(code, cliTurn.model) ?? message : message,
                 ...(needsAuth ? { setup: true } : {}),
               });
               // Internal RPC failures can leave a live child poisoned just
@@ -1927,6 +1969,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (!needsAuth && !accountError && ((e as any)?.acpPromptStall === true || (e as any)?.acpSessionFailure === true
                   || code === "upstream_outage") && session.child.exitCode === null && !session.closing) {
                 closeSession(threadId, (e as any)?.acpPromptStall === true ? "prompt-stall" : "rpc-failure");
+              } else if (staleProcess && !state.promptSent && session.child.exitCode === null && !session.closing) {
+                closeSession(threadId, "stale-models");
               }
               settle(threadId, session, false, needsAuth ? "auth_required" : "rpc_error");
             }

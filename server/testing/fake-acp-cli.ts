@@ -78,9 +78,14 @@
 //                        surface: session/new and session/load return
 //                        configOptions, and session/set_config_option switches
 //                        the model (rejecting an unadvertised one with -32602).
-//                        A new session starts on AGY_ACP_DEFAULT_MODEL when it
-//                        names one of them (Google Antigravity's own default
-//                        variable), else on the first.
+//                        A new session starts on AGY_ACP_DEFAULT_MODEL (Google
+//                        Antigravity's own default variable) when it is set,
+//                        else on the first. Like agy_acp_server 1.1.1, any id
+//                        there is taken unchecked and added to the list.
+//   FAKE_ACP_MODELS_FILE  path of a file with the same comma-separated list,
+//                        read once when the process starts: a process started
+//                        before the file changed keeps the old list, the way
+//                        `opencode acp` never re-reads a login added later
 //   FAKE_ACP_MODELS_LIST=v2  OpenCode 2's `models` surface: plain `models`
 //                        answers an empty list with exit 0 (its first answer
 //                        after the background service starts), and `models
@@ -122,10 +127,12 @@ const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42
 // model is chosen with session/set_config_option, because `opencode acp` takes
 // no -m. Off unless FAKE_ACP_MODELS is set, so every existing mode is byte-
 // identical to before.
-const models = (process.env.FAKE_ACP_MODELS ?? "").split(",").filter(Boolean);
-let currentModel: string | null = process.env.AGY_ACP_DEFAULT_MODEL && models.includes(process.env.AGY_ACP_DEFAULT_MODEL)
-  ? process.env.AGY_ACP_DEFAULT_MODEL
-  : models[0] ?? null;
+const models = (process.env.FAKE_ACP_MODELS_FILE && existsSync(process.env.FAKE_ACP_MODELS_FILE)
+  ? readFileSync(process.env.FAKE_ACP_MODELS_FILE, "utf8")
+  : process.env.FAKE_ACP_MODELS ?? "").split(",").map((id) => id.trim()).filter(Boolean);
+const defaultModelEnv = process.env.AGY_ACP_DEFAULT_MODEL;
+if (models.length && defaultModelEnv && !models.includes(defaultModelEnv)) models.push(defaultModelEnv);
+let currentModel: string | null = models.length && defaultModelEnv ? defaultModelEnv : models[0] ?? null;
 const variantConfigs: Record<string, { id?: string; currentValue?: string; options: any[] }> =
   JSON.parse(process.env.FAKE_ACP_VARIANTS ?? "{}");
 let currentVariant = variantConfigs[currentModel ?? ""]?.currentValue;
@@ -250,6 +257,7 @@ const dumpEnv = Object.fromEntries(
     "AGY_ACP_FORCE_FILE_STORAGE",
     "ANTIGRAVITY_HARNESS_PATH",
     "AGY_ACP_DEFAULT_MODEL",
+    "OPENCODE_DISABLE_PROJECT_CONFIG",
     "GEMINI_API_KEY",
     "MISTRAL_API_KEY",
     "OMB_ANTHROPIC_API_KEY",

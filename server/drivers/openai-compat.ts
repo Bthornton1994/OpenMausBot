@@ -85,12 +85,16 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
 
   async create(input) {
     const { config } = input;
+    // An instance that names its own key variable reads only that one: the
+    // workspace key (OPENAI_COMPAT_API_KEY) belongs to the workspace's
+    // endpoint and must not reach this instance's host.
+    const ownKeyVariable = config.apiKeyEnv !== "OPENAI_COMPAT_API_KEY";
     const apiKey =
       config.key ??
       input.environment[config.apiKeyEnv] ??
-      input.environment.OPENAI_COMPAT_API_KEY ??
+      (ownKeyVariable ? undefined : input.environment.OPENAI_COMPAT_API_KEY) ??
       process.env[config.apiKeyEnv] ??
-      process.env.OPENAI_COMPAT_API_KEY ??
+      (ownKeyVariable ? undefined : process.env.OPENAI_COMPAT_API_KEY) ??
       "";
     // The default key variable is the one Settings → Connections saves; an
     // instance with its own variable is configured where it was written.
