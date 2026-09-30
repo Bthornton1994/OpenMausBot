@@ -1,7 +1,21 @@
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// How many times the fingerprint touches the disk, for the cost test: the
+// count is what the design promises, whatever the machine's speed.
+const fsCalls = vi.hoisted(() => ({ lstat: 0, opendir: 0, read: 0 }));
+vi.mock("node:fs", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...fs,
+    lstatSync: ((...args: Parameters<typeof fs.lstatSync>) => { fsCalls.lstat++; return fs.lstatSync(...args); }) as typeof fs.lstatSync,
+    opendirSync: ((...args: Parameters<typeof fs.opendirSync>) => { fsCalls.opendir++; return fs.opendirSync(...args); }) as typeof fs.opendirSync,
+    readFileSync: ((...args: Parameters<typeof fs.readFileSync>) => { fsCalls.read++; return fs.readFileSync(...args); }) as typeof fs.readFileSync,
+  };
+});
+
 import { botMemoryFiles, createLendingMemory, FOLDER_ENTRY_CAP, memoryFiles, memoryFingerprint } from "./lending-memory.ts";
 
 let dir = "";
@@ -239,13 +253,23 @@ describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
     const snapshot = () => botMemoryFiles(bot, { workspace: () => ws, taskWorkspaces: tasks });
     const cold = snapshot();
     expect(Object.keys(cold).filter((name) => name.endsWith("AGENTS.md"))).toHaveLength(10);
+    // Warm, each conversation's folder costs one look (its entries are not
+    // listed again, nothing unchanged is read), a conversation that never ran
+    // costs nothing, and the rest is a handful of fixed look-ups.
+    Object.assign(fsCalls, { lstat: 0, opendir: 0, read: 0 });
+    snapshot();
+    expect(fsCalls.opendir).toBe(0);
+    expect(fsCalls.read).toBe(0);
+    expect(fsCalls.lstat).toBeGreaterThanOrEqual(3_000);
+    expect(fsCalls.lstat).toBeLessThan(3_000 + 10 + 100);
+    // …which is milliseconds, even on a slow runner (about 9 ms on a laptop).
     const runs: number[] = [];
     for (let i = 0; i < 5; i++) {
       const started = performance.now();
       snapshot();
       runs.push(performance.now() - started);
     }
-    expect(Math.min(...runs)).toBeLessThan(20);
+    expect(Math.min(...runs)).toBeLessThan(process.platform === "win32" ? 250 : 100);
     // …and the record stays small: only the files that exist are kept.
     const memory = createLendingMemory({ file: join(dir, "record.json"), files: snapshot, knownBots: () => ["bot1"] });
     memory.reconcile("bot1", false);
