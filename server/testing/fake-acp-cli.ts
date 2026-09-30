@@ -103,6 +103,16 @@
 //                        replay?}, emitted after the named RPC response.
 //   FAKE_ACP_USAGE_ROOT  put the prompt result's usage at the root instead of
 //                        under _meta (what opencode 1.18.18 actually does)
+//   FAKE_ACP_MODE_ACK_FILE  path of a file read on every mode switch: while it
+//                        exists, "empty" answers without configOptions (the
+//                        switch cannot be confirmed) and "error" refuses it,
+//                        leaving the session in its previous mode either way
+//
+// With FAKE_ACP_DUMP and FAKE_ACP_MODES or FAKE_ACP_MODELS, every
+// session/prompt appends {"pid","sessionId","mode","model"} to
+// <FAKE_ACP_DUMP>.prompts.jsonl: what the prompt actually ran under, across a
+// pooled child and its replacement. The .config.json log is per process, so
+// on a pooled child it also holds earlier turns' switches.
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
@@ -703,6 +713,16 @@ function handle(msg: any) {
         break;
       }
       if (configId === "mode" && modes.includes(value)) {
+        const ackFile = process.env.FAKE_ACP_MODE_ACK_FILE;
+        const ack = ackFile && existsSync(ackFile) ? readFileSync(ackFile, "utf8").trim() : "";
+        if (ack === "error") {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Internal error: could not change mode" } });
+          break;
+        }
+        if (ack === "empty") {
+          result(msg.id, {});
+          break;
+        }
         currentMode = value;
         configCalls.push({ method: msg.method, params: msg.params });
         if (process.env.FAKE_ACP_DUMP) {
@@ -734,6 +754,11 @@ function handle(msg: any) {
       break;
     }
     case "session/prompt": {
+      if (process.env.FAKE_ACP_DUMP && (modes.length || models.length)) {
+        appendFileSync(`${process.env.FAKE_ACP_DUMP}.prompts.jsonl`, JSON.stringify({
+          pid: process.pid, sessionId: msg.params?.sessionId, mode: currentMode, model: currentModel,
+        }) + "\n");
+      }
       emitConfigUpdates("session/prompt", msg.params.sessionId);
       if (process.env.FAKE_ACP_DUMP && process.env.FAKE_ACP_VARIANTS) {
         writeFileSync(`${process.env.FAKE_ACP_DUMP}.selection.json`, JSON.stringify({

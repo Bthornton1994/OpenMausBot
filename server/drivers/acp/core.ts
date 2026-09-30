@@ -279,7 +279,10 @@ export interface AcpSupport {
   spawnFingerprint?(env: Record<string, string | undefined>): string;
   /** The approval mode is applied to the session on every turn (in
    * configureSession) and nothing about the process depends on it, so an
-   * approval change must not respawn the process. */
+   * approval change must not respawn the process. The pooled session may
+   * still hold an earlier turn's looser mode, so configureSession must set
+   * this turn's mode and throw unless the runtime confirms it; the core then
+   * sends no prompt and discards the process (see approvalUnconfirmed). */
   sessionScopedApproval?: boolean;
   /** Mutate the child env in place: strip a key, inject a policy. Receives the
    *  instance config so a support can vary with fullAuto. */
@@ -551,6 +554,11 @@ export function versionAtLeast(installed: VersionTriple, floor: VersionTriple): 
 }
 
 export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> {
+  // Without a per-turn configureSession nothing would ever apply the mode
+  // that sessionScopedApproval keeps out of the spawn contract.
+  if (support.sessionScopedApproval && !support.configureSession) {
+    throw new Error(`${support.displayName}: sessionScopedApproval needs configureSession to apply each turn's mode`);
+  }
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
   const decodeConfig = decodeAcpConfig(support.defaultCli);
@@ -1474,6 +1482,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         let variant = turn.variant;
         // set below when this process lists fewer models than the catalog
         let staleProcess = false;
+        // Set while a sessionScopedApproval support applies this turn's mode.
+        // Still set if that throws: the pooled session may be left on an
+        // earlier turn's looser mode, so its process must not be reused.
+        let approvalUnconfirmed = false;
         const modelOf = (result: any): string | null => {
           const option = (Array.isArray(result?.configOptions) ? result.configOptions : []).find(
             (entry: any) => entry?.id === (support.selectModel?.configId ?? "model"),
@@ -1777,6 +1789,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
 
               if (support.configureSession) {
+                approvalUnconfirmed = support.sessionScopedApproval === true;
                 await support.configureSession({
                   request: (method, params, timeoutMs) =>
                     request(method, params, timeoutMs ?? SESSION_CONFIG_TIMEOUT),
@@ -1787,6 +1800,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     ? sessionResult.models.availableModels
                     : [],
                 });
+                approvalUnconfirmed = false;
                 // initialize's currentModelId is the CLI default,
                 // not the model this turn asked for. After a successful pin,
                 // report the slug we set so the UI does not claim otherwise.
@@ -1932,8 +1946,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const failure = classifyError({ text: message });
               const transientStartup = failure.transient || (failure.reason === "unknown" && code === "upstream_outage");
               const denied = /\b(?:(?:permission|access) denied|(?:approval|permission) (?:required|denied|rejected)|requires? (?:approval|permission)|policy (?:restriction|violation)|(?:blocked|denied|restricted) by (?:the )?policy)\b/i.test(message);
-              if (turn.startupRecovery && transientStartup && !needsAuth && !accountError && !denied && (!code || code === "upstream_outage")
-                  && ![-32700, -32600, -32601, -32602].includes((e as any)?.code)
+              // An unconfirmed approval switch sent no prompt and its process
+              // is discarded either way, so a fresh one can take the turn.
+              const retryableStartup = approvalUnconfirmed || (transientStartup && (!code || code === "upstream_outage")
+                && ![-32700, -32600, -32601, -32602].includes((e as any)?.code));
+              if (turn.startupRecovery && retryableStartup && !needsAuth && !accountError && !denied
                   && !state.promptSent && !state.startupActivity && !state.producedItem && !state.text
                   && !state.stopped && !session.closing && !asks.size && !current.runningTools.size) {
                 // Quiesce before killing: the child's close event must not
@@ -1969,6 +1986,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               if (!needsAuth && !accountError && ((e as any)?.acpPromptStall === true || (e as any)?.acpSessionFailure === true
                   || code === "upstream_outage") && session.child.exitCode === null && !session.closing) {
                 closeSession(threadId, (e as any)?.acpPromptStall === true ? "prompt-stall" : "rpc-failure");
+              } else if (approvalUnconfirmed && session.child.exitCode === null && !session.closing) {
+                // Fail closed: the session may still hold a looser mode from
+                // an earlier turn. Nothing was prompted; the next turn starts
+                // a fresh process, whose session begins in the runtime's own
+                // default mode, and applies its mode there.
+                closeSession(threadId, "approval-unconfirmed");
               } else if (staleProcess && !state.promptSent && session.child.exitCode === null && !session.closing) {
                 closeSession(threadId, "stale-models");
               }

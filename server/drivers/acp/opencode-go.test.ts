@@ -708,8 +708,11 @@ describe("OpenCode catalog probes", () => {
         .find((entry) => entry.method === "session/new"))!.cwd;
       const root = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { cwd: folder, encoding: "utf8" }).trim();
       expect(root).toMatch(/^[0-9a-f]{40,64}$/u);
-      expect(realpathSync(execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: folder, encoding: "utf8" }).trim()))
-        .toBe(realpathSync(folder));
+      // .native on both sides: git prints Windows' long path, while the temp
+      // folder can arrive as its 8.3 short name (C:\Users\RUNNER~1\…), which
+      // only the native resolver expands
+      expect(realpathSync.native(execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: folder, encoding: "utf8" }).trim()))
+        .toBe(realpathSync.native(folder));
       // once: a second probe keeps the same project
       resetOpenCodeModelCache();
       await discoverOpenCodeModels({ ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle" }, FAKE_CLI);

@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DATA_DIR, ensureDirs } from "../config.ts";
-import type { ProviderInstance } from "../contracts.ts";
+import { TurnNotStartedError, type ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import * as procs from "../procs.ts";
@@ -903,6 +903,132 @@ describe("Antigravity driver over shared ACP", () => {
       (event) => event.type === "runtime.error" && /did not apply yolo permission mode/u.test(event.message),
     )).toBe(true);
   });
+
+  // An approval change keeps the pooled process (sessionScopedApproval), so
+  // the permission mode has to come from each turn: a resumed session must
+  // never run under a looser mode an earlier turn left on it. The fake
+  // records the mode each prompt actually ran under.
+  it("runs each turn of a pooled, resumed session under that turn's own permission mode", async () => {
+    ensureDirs();
+    const fake = fakeRuntime();
+    const dump = join(fake.directory, "dump.json");
+    const rpcDump = join(fake.directory, "rpc.json");
+    const launches = join(fake.directory, "launches");
+    const instanceId = "antigravity-mode-per-turn";
+    const tokenDirectory = join(antigravityProfileDirectory(instanceId), "antigravity-acp");
+    mkdirSync(tokenDirectory, { recursive: true });
+    writeFileSync(join(tokenDirectory, "acp_token.json"), "{}", { mode: 0o600 });
+    instance = await AntigravityDriver.create({
+      instanceId,
+      displayName: "Antigravity",
+      environment: {
+        FAKE_ACP_AUTH_METHOD: "oauth-personal",
+        FAKE_ACP_MODELS: "gemini-3.8-flash-high",
+        FAKE_ACP_MODES: "default,yolo,auto_edit",
+        FAKE_ACP_DUMP: dump,
+        FAKE_ACP_RPC_DUMP: rpcDump,
+        FAKE_ACP_LAUNCH_COUNT_FILE: launches,
+      },
+      enabled: true,
+      // the legacy instance flag must never outrank a turn's own mode
+      config: { cli: fake.executable, fullAuto: true },
+    });
+    recorder = recordEvents(instance.adapter);
+    const promptModes = () => readFileSync(`${dump}.prompts.jsonl`, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line).mode as string);
+    const sequence = [
+      ["full", "yolo"], ["full", "yolo"], ["ask", "default"], ["auto", "default"],
+      ["ask", "default"], ["full", "yolo"], ["edits", "auto_edit"], ["ask", "default"],
+    ] as const;
+    for (const [index, [approvalMode, native]] of sequence.entries()) {
+      const { turnId } = await instance.adapter.sendTurn({
+        threadId: "thread-mode-per-turn",
+        text: `turn ${index}`,
+        approvalMode,
+        model: "gemini-3.8-flash-high",
+        cwd: fake.directory,
+        // The harness mints fresh MCP credentials every turn, so each later
+        // turn resumes the recorded session on the pooled process.
+        ...(index ? { resumeCursor: "fake-acp-session" } : {}),
+        integrations: { agents: { command: "agents-mcp", args: [], env: { TOKEN: `turn-${index}` } } },
+      });
+      expect(await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId)).toMatchObject({ ok: true });
+      expect(promptModes()).toHaveLength(index + 1);
+      expect([approvalMode, promptModes().at(-1)]).toEqual([approvalMode, native]);
+    }
+    // one process throughout, each later turn resumed on it
+    expect(Number(readFileSync(launches, "utf8"))).toBe(1);
+    expect((JSON.parse(readFileSync(rpcDump, "utf8")) as string[]).filter((method) => method === "session/resume"))
+      .toHaveLength(sequence.length - 1);
+  });
+
+  it.each(["empty", "error"] as const)(
+    "never prompts a pooled session whose stricter mode was not confirmed (%s answer), and replaces its process",
+    async (answer) => {
+      ensureDirs();
+      const fake = fakeRuntime();
+      const dump = join(fake.directory, "dump.json");
+      const launches = join(fake.directory, "launches");
+      const modeAck = join(fake.directory, "mode-ack");
+      const instanceId = `antigravity-unconfirmed-downgrade-${answer}`;
+      const tokenDirectory = join(antigravityProfileDirectory(instanceId), "antigravity-acp");
+      mkdirSync(tokenDirectory, { recursive: true });
+      writeFileSync(join(tokenDirectory, "acp_token.json"), "{}", { mode: 0o600 });
+      instance = await AntigravityDriver.create({
+        instanceId,
+        displayName: "Antigravity",
+        environment: {
+          FAKE_ACP_AUTH_METHOD: "oauth-personal",
+          FAKE_ACP_MODELS: "gemini-3.8-flash-high",
+          FAKE_ACP_MODES: "default,yolo",
+          FAKE_ACP_DUMP: dump,
+          FAKE_ACP_LAUNCH_COUNT_FILE: launches,
+          FAKE_ACP_MODE_ACK_FILE: modeAck,
+        },
+        enabled: true,
+        config: { cli: fake.executable, fullAuto: false },
+      });
+      recorder = recordEvents(instance.adapter);
+      const promptModes = () => existsSync(`${dump}.prompts.jsonl`)
+        ? readFileSync(`${dump}.prompts.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line).mode as string)
+        : [];
+      const turn = (approvalMode: "full" | "ask", index: number, startupRecovery = false) => instance!.adapter.sendTurn({
+        threadId: "thread-unconfirmed-downgrade",
+        text: `turn ${index}`,
+        approvalMode,
+        model: "gemini-3.8-flash-high",
+        cwd: fake.directory,
+        ...(index ? { resumeCursor: "fake-acp-session" } : {}),
+        ...(startupRecovery ? { startupRecovery } : {}),
+      });
+      const run = async (approvalMode: "full" | "ask", index: number) => {
+        const { turnId } = await turn(approvalMode, index);
+        return recorder!.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+      };
+      expect(await run("full", 0)).toMatchObject({ ok: true });
+      expect(promptModes()).toEqual(["yolo"]);
+      // The owner switches to Ask; the runtime does not confirm the switch.
+      writeFileSync(modeAck, answer);
+      expect(await run("ask", 1)).toMatchObject({ ok: false });
+      // nothing ran under the looser mode the session still holds
+      expect(promptModes()).toEqual(["yolo"]);
+      writeFileSync(modeAck, "");
+      // and that process is gone: the next turn gets a fresh one
+      expect(await run("ask", 2)).toMatchObject({ ok: true });
+      expect(promptModes()).toEqual(["yolo", "default"]);
+      expect(Number(readFileSync(launches, "utf8"))).toBe(2);
+      // With automatic recovery on, the harness gets the turn back unstarted
+      // and retries it on a fresh process instead of a failed reply.
+      expect(await run("full", 3)).toMatchObject({ ok: true });
+      writeFileSync(modeAck, answer);
+      await expect(turn("ask", 4, true)).rejects.toBeInstanceOf(TurnNotStartedError);
+      expect(promptModes()).toEqual(["yolo", "default", "yolo"]);
+      writeFileSync(modeAck, "");
+      expect(await run("ask", 5)).toMatchObject({ ok: true });
+      expect(promptModes()).toEqual(["yolo", "default", "yolo", "default"]);
+      expect(Number(readFileSync(launches, "utf8"))).toBe(3);
+    },
+  );
 
   it.each([
     ["question", undefined],
