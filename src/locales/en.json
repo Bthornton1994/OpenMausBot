@@ -186,6 +186,7 @@
   "approval.action.confirm": "Confirm",
   "approval.action.allowOnce": "Allow once",
   "approval.held.native": "The provider requires your approval for this action.",
+  "approval.held.risky": "Held for you: this looks risky, so Full access did not approve it automatically.",
   "approval.held.sandbox": "This changes the provider sandbox, so only Full access can approve it automatically.",
   "approval.held.localComputer": "Controlling your computer is never covered by Always allow, so this needs you.",
   "approval.held.unattended": "A webhook or another bot started this turn, so Approve for me is paused and every action asks.",

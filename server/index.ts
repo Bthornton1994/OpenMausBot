@@ -46,7 +46,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalHeldNote, approvalHeldReason, approvalModeForOrigin, autoVerdict, deliverFullAccessApproval, delegationInheritsFullAccess } from "./auto-approve.ts";
+import { approvalHeldNote, approvalHeldReason, approvalModeForOrigin, autoVerdict, deliverFullAccessApproval, delegationInheritsFullAccess, type AutoVerdict } from "./auto-approve.ts";
 import { CommandAllowlistStore, commandAllowlistCandidate } from "./command-allowlist.ts";
 import type { CommandAllowlistCandidate, CommandAllowlistResponse } from "../shared/command-allowlist.ts";
 import { updateClaudeCli } from "./claude-update.ts";
@@ -328,6 +328,9 @@ import { judgeRecallCandidates, MEMORY_RECALL_MIN_PROBABILITY, reorderSearchResu
 import { pickSkills } from "./decider/skill-pick.ts";
 import { decideTaskOutcome } from "./decider/task-outcome.ts";
 import { SteerSplitLane, decideSteerSplit, type SteerSplitInput } from "./decider/steer-split.ts";
+import { decideRiskHold, riskCheckSkips } from "./decider/risk-check.ts";
+import { decideStuck, lastUserText, recentToolSteps, stuckChip } from "./decider/stuck-check.ts";
+import { decideNotificationQuiet, notificationQuietable } from "./decider/notify-urgency.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh, NATIVELY_REPLAYING_DRIVER_KINDS, peerMessageText } from "./turn-context.ts";
 import { Handoffs, handedStateUsable, recordHanded, renderUnseen, sessionStart, unseenMessages, withUnseenMessages, type ContextMessage } from "./delta-context.ts";
@@ -5468,6 +5471,10 @@ const lastReply = new Map<string, string>();
 const sessionModelByThread = new Map<string, string>();
 /** threads already told that the provider's reviewer never started */
 const nativeReviewNoticed = new Set<string>();
+/** Full access approvals waiting on the decision model's risk check, by
+ * `threadId:requestId`. request.resolved removes one, so an answer that
+ * lands after the request was settled elsewhere acts on nothing. */
+const riskChecksInFlight = new Set<string>();
 /** a driver kind as the chat should name it: "claudeAgent" → "Claude" */
 const providerLabel = (provider: string): string => {
   const bare = provider.replace(/Agent$/, "");
@@ -5477,9 +5484,15 @@ const providerLabel = (provider: string): string => {
 /** Put a notification on the wire. Clients decide what to do with it — a
  * desktop notification now, a push to a paired phone later. */
 function notify(notification: Notification | null) {
+  if (!notification) return;
   // nested rather than spread — the frame's own `kind` names the frame,
   // exactly like {kind:"message", message} and {kind:"bot", bot}
-  if (notification) broadcast({ kind: "notify", notification });
+  const send = (frame: Notification) => broadcast({ kind: "notify", notification: frame });
+  // A report of finished work may arrive quietly when the decision model
+  // judges it can wait (decider/notify-urgency.ts). It waits at most the
+  // job's 1.5 s budget; anything else, and any failure, sends as today.
+  if (!notificationQuietable(notification) || !deciderReady(cfg, "notifyUrgency")) return send(notification);
+  void decideNotificationQuiet(decider, notification).then(send, () => send(notification));
 }
 
 // Group threads: the fold needs to know WHO is talking — the turn engine
@@ -5503,6 +5516,10 @@ const turnContext = new Map<string, { tokens?: number; window?: number }>();
 // the same class of stuck-loop detection; retaining an unlimited set of
 // unique arguments would let one pathological turn grow the server forever.
 const repeats = new RepeatDetector({ thresholds: [5, 10, 20], maxKeysPerThread: 256 });
+/** Turns whose stuck check has been asked, by thread: the token its answer
+ * must still find to act. Cleared wherever `repeats` settles, so an answer
+ * that lands after the turn ended says nothing. */
+const stuckChecks = new Map<string, symbol>();
 
 // ── stall watchdog ─────────────────────────────────────────────────────
 // ask_bot has a short inline wait budget, while room turns have a separately
@@ -5536,6 +5553,7 @@ const watchdog = new TurnWatchdog({
     const stalledVmTarget = groupSpeakers.has(turn.threadId) ? localVmThreadTargets.get(turn.threadId) : undefined;
     revokeInternalCapabilitiesForThread(turn.threadId);
     repeats.settle(turn.threadId);
+    stuckChecks.delete(turn.threadId);
     const bot = botForThread(turn.botId, turn.threadId);
     const routineRun = activeRoutineRunForThread(turn.threadId);
     const instance = bot
@@ -7046,6 +7064,81 @@ bus.subscribe((event: RuntimeEvent) => {
           },
         });
       }
+      // The card path: a person decides. Also where a Full access approval
+      // the risk check held lands, once its answer is in (below).
+      const showCard = (cardVerdict: AutoVerdict | null, rule?: string) => {
+        const heldContext = { source: cardVerdict?.source, permission };
+        // A structured ask (Claude's AskUserQuestion) is a question whatever
+        // the provider routed it as: it has no allow/deny answer, only the
+        // model's own options. The card carries them so the person can choose.
+        const questions = event.questions?.length ? event.questions : undefined;
+        const message = pushMessage({
+          role: "bot",
+          kind: "options",
+          card: {
+            title:
+              permission && event.approvalScope === "local-computer"
+                ? "Local computer approval"
+                : permission
+                  ? "Approval needed"
+                  : "Your bot has a question",
+            subtitle: event.summary,
+            options: event.choices?.length ? event.choices : permission ? ["Allow", "Deny"] : [],
+            requestId: event.requestId,
+            tool: permission ? event.tool : undefined,
+            questionRequest: questions
+              ? { version: 1, questions, ...(event.origin === "output" ? { origin: "output" as const } : {}) }
+              : undefined,
+            commandAllowlist: command ?? undefined,
+            // Provider-owned session grants remain separate from exact commands.
+            // Never on a guest's turn: an "always" for it would outlive it.
+            allowSession: permission && event.allowSession && !event.requiresExplicitApproval && !guestDriven ? true : undefined,
+            // The text stays for cards saved before heldCode existed, and for
+            // clients that do not know the key yet.
+            held: approvalHeldReason(heldContext),
+            heldCode: approvalHeldNote(heldContext),
+            approvalScope: event.approvalScope,
+          },
+        });
+        if (event.requestId) askMessageByRequest.set(`${event.threadId}:${event.requestId}`, message.id);
+        if (command && asker && event.requestId) pendingCommandRules.set(`${event.threadId}:${event.requestId}`, { botId: asker.id, candidate: command });
+        // Every card that reaches a human is a decision too: "the provider
+        // left this for you, in this mode". `question` marks the cards no
+        // rule may ever answer; a permission card without a verdict (no known
+        // asker, or no requestId to answer through) can only mean nothing was
+        // granted.
+        appendDecision(DATA_DIR, {
+          threadId: event.threadId,
+          requestId: event.requestId,
+          botId: asker?.id,
+          botName: asker?.name,
+          tool: event.tool,
+          summary: event.summary,
+          decision: "card-shown",
+          source: !permission ? "question" : cardVerdict ? cardVerdict.source : "no-grant",
+          origin: !permission && event.origin === "output" ? "output" : undefined,
+          ...(rule ? { rule } : {}),
+          unattended: unattended || undefined,
+        });
+        // Notify from HERE, not from a separate subscriber on request.opened:
+        // this is the branch where a card actually reached a human. Anything
+        // Full access answered took the early return above and never buzzes.
+        if (asker) {
+          const card = store.messagesFor(event.threadId).find((candidate) => candidate.id === message.id)?.card;
+          if (card && !card.answered) {
+            // the bot is not working now — it is waiting on a person
+            if (bot) store.setTaskActivity(bot.id, event.threadId, "waiting-on-you");
+            else if (asker.busy) store.setActivity(asker.id, "waiting-on-you");
+            const notificationBot = (routineRun && routineSourceOwner(routineRun)?.bot) || asker;
+            notify(buildNotification(
+              permission ? "approval" : "question",
+              notificationBot,
+              (routineRun && routineSourceThread(routineRun)) || event.threadId,
+              event.summary,
+            ));
+          }
+        }
+      };
       if (verdict?.approve && asker && event.requestId) {
         const settled = verdict.approve;
         const instance = event.providerInstanceId
@@ -7063,7 +7156,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // Claiming approval first and correcting later means a moment
         // where the transcript says "approved" over a request nothing
         // answered — and if the provider is gone entirely, forever.
-        void (async () => {
+        const approve = async () => {
           const outcome = await deliverFullAccessApproval(instance?.adapter, event.threadId, requestId, event.turnId, isCurrent);
           if (!isCurrent()) return;
           if (outcome !== "allowed-once") {
@@ -7092,87 +7185,50 @@ bus.subscribe((event: RuntimeEvent) => {
             decision: "auto-approved",
             source: verdict.source,
           });
-        })().catch(() => {
+        };
+        const receiptFailed = () => {
           // A receipt failure must neither crash the server nor manufacture
           // a new permission request after the provider took our answer.
           console.error("[approval] Could not record the provider approval result.");
-        });
+        };
+        // Risk check (decider/risk-check.ts): before Full access answers for
+        // the person, a confident "High" holds the request for them instead.
+        // It only ever turns this approval into a card: a saved exact command
+        // is the person's own answer already and is never second-guessed, and
+        // reviewed read-only tools are not asked about. Any failure, timeout
+        // or less sure answer approves exactly as below.
+        if (verdict.source === "full-access" && deciderReady(cfg, "riskCheck") && !riskCheckSkips(tool)) {
+          const requestKey = `${event.threadId}:${requestId}`;
+          const turnAtAsk = liveTurnByThread.get(event.threadId);
+          riskChecksInFlight.add(requestKey);
+          const input = [...store.activePath(event.threadId)].reverse()
+            .find((candidate) => candidate.kind === "activity" && candidate.tool?.name === tool && candidate.tool.input)?.tool?.input;
+          const task = bot
+            ? store.taskByThread(bot.id, event.threadId)?.title
+            : group?.tasks?.find((candidate) => candidate.threadId === event.threadId)?.title;
+          void (async () => {
+            const risk = await decideRiskHold(decider, { tool, summary, command: event.command?.command, input, task });
+            // Answered or withdrawn while Jev thought: nothing left to answer.
+            if (!riskChecksInFlight.delete(requestKey)) return;
+            // A card only while its turn and thread are still the ones that
+            // asked; otherwise, like any less sure answer, approve as today.
+            const stillAsking = !shouldIgnoreProviderEvent(event) &&
+              liveTurnByThread.get(event.threadId) === turnAtAsk &&
+              Boolean(store.botByThread(event.threadId) || store.groupByThread(event.threadId));
+            if (!risk.hold || !stillAsking) return approve();
+            showCard({ approve: null, source: "decider-risk" }, `riskCheck High p=${risk.probability.toFixed(2)}`);
+          })().catch(receiptFailed);
+          break;
+        }
+        void approve().catch(receiptFailed);
         break;
       }
-      const heldContext = { source: verdict?.source, permission };
-      // A structured ask (Claude's AskUserQuestion) is a question whatever
-      // the provider routed it as: it has no allow/deny answer, only the
-      // model's own options. The card carries them so the person can choose.
-      const questions = event.questions?.length ? event.questions : undefined;
-      const message = pushMessage({
-        role: "bot",
-        kind: "options",
-        card: {
-          title:
-            permission && event.approvalScope === "local-computer"
-              ? "Local computer approval"
-              : permission
-                ? "Approval needed"
-                : "Your bot has a question",
-          subtitle: event.summary,
-          options: event.choices?.length ? event.choices : permission ? ["Allow", "Deny"] : [],
-          requestId: event.requestId,
-          tool: permission ? event.tool : undefined,
-          questionRequest: questions
-            ? { version: 1, questions, ...(event.origin === "output" ? { origin: "output" as const } : {}) }
-            : undefined,
-          commandAllowlist: command ?? undefined,
-          // Provider-owned session grants remain separate from exact commands.
-          // Never on a guest's turn: an "always" for it would outlive it.
-          allowSession: permission && event.allowSession && !event.requiresExplicitApproval && !guestDriven ? true : undefined,
-          // The text stays for cards saved before heldCode existed, and for
-          // clients that do not know the key yet.
-          held: approvalHeldReason(heldContext),
-          heldCode: approvalHeldNote(heldContext),
-          approvalScope: event.approvalScope,
-        },
-      });
-      if (event.requestId) askMessageByRequest.set(`${event.threadId}:${event.requestId}`, message.id);
-      if (command && asker && event.requestId) pendingCommandRules.set(`${event.threadId}:${event.requestId}`, { botId: asker.id, candidate: command });
-      // Every card that reaches a human is a decision too: "the provider
-      // left this for you, in this mode". `question` marks the cards no
-      // rule may ever answer; a permission card without a verdict (no known
-      // asker, or no requestId to answer through) can only mean nothing was
-      // granted.
-      appendDecision(DATA_DIR, {
-        threadId: event.threadId,
-        requestId: event.requestId,
-        botId: asker?.id,
-        botName: asker?.name,
-        tool: event.tool,
-        summary: event.summary,
-        decision: "card-shown",
-        source: !permission ? "question" : verdict ? verdict.source : "no-grant",
-        origin: !permission && event.origin === "output" ? "output" : undefined,
-        unattended: unattended || undefined,
-      });
-      // Notify from HERE, not from a separate subscriber on request.opened:
-      // this is the branch where a card actually reached a human. Anything
-      // Full access answered took the early return above and never buzzes.
-      if (asker) {
-        const card = store.messagesFor(event.threadId).find((candidate) => candidate.id === message.id)?.card;
-        if (card && !card.answered) {
-          // the bot is not working now — it is waiting on a person
-          if (bot) store.setTaskActivity(bot.id, event.threadId, "waiting-on-you");
-          else if (asker.busy) store.setActivity(asker.id, "waiting-on-you");
-          const notificationBot = (routineRun && routineSourceOwner(routineRun)?.bot) || asker;
-          notify(buildNotification(
-            permission ? "approval" : "question",
-            notificationBot,
-            (routineRun && routineSourceThread(routineRun)) || event.threadId,
-            event.summary,
-          ));
-        }
-      }
+      showCard(verdict);
       break;
     }
     case "request.resolved": {
       if (event.requestId) pendingCommandRules.delete(`${event.threadId}:${event.requestId}`);
+      if (event.requestId) riskChecksInFlight.delete(`${event.threadId}:${event.requestId}`);
       // answered (by whoever): the turn is working again, unless it settled
       const waiting = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       if (bot && store.taskByThread(bot.id, event.threadId)?.activity === "waiting-on-you") {
@@ -8004,7 +8060,10 @@ function finalizeDelegationWatch(
 // from every permission ask's summary (the command being approved).
 bus.subscribe((event: RuntimeEvent) => {
   if (shouldIgnoreProviderEvent(event)) return;
-  if (event.type === "turn.completed" || event.type === "session.exited") return void repeats.settle(event.threadId);
+  if (event.type === "turn.completed" || event.type === "session.exited") {
+    stuckChecks.delete(event.threadId);
+    return void repeats.settle(event.threadId);
+  }
   let key: string | null = null;
   if (event.type === "item.started" && event.itemType === "tool") {
     // a title with more than a bare identifier is a call with arguments
@@ -8022,7 +8081,43 @@ bus.subscribe((event: RuntimeEvent) => {
     kind: "activity",
     tool: { name: `Same call repeated ${threshold}× — ${tool}: ${args.slice(0, 80)}${args.length > 80 ? "…" : ""} — it may be stuck`, ok: false },
   });
+  checkStuck(event.threadId);
 });
+
+/** Stuck check (decider/stuck-check.ts), at the first repeat chip of a turn
+ * and never again in it: a confident "stuck" adds a plainer chip and a
+ * notification. It only reports; the turn runs on untouched. */
+function checkStuck(threadId: string) {
+  if (stuckChecks.has(threadId) || !deciderReady(cfg, "stuckCheck")) return;
+  const token = Symbol(threadId);
+  stuckChecks.set(threadId, token);
+  const owner = store.botByThread(threadId);
+  const group = owner ? undefined : store.groupByThread(threadId);
+  const speaker = group ? groupSpeakers.get(threadId) : undefined;
+  // the bot as this thread knows it (a thread-aware copy for a 1:1), or
+  // the room member speaking now
+  const who = owner ? botForThread(owner.id, threadId) ?? owner : speaker ? store.bot(speaker.botId) : undefined;
+  if (!who) return;
+  const path = store.activePath(threadId);
+  const title = owner
+    ? store.taskByThread(owner.id, threadId)?.title
+    : group?.tasks?.find((candidate) => candidate.threadId === threadId)?.title;
+  const task = lastUserText(path) ?? title;
+  void (async () => {
+    const verdict = await decideStuck(decider, { task, steps: recentToolSteps(path) });
+    // the turn settled (or a new one began) while the model thought, or the
+    // conversation is gone: nothing to report on
+    if (!verdict.stuck || stuckChecks.get(threadId) !== token) return;
+    if (!store.botByThread(threadId) && !store.groupByThread(threadId)) return;
+    store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name: stuckChip(who.name), ok: false } });
+    notify(buildNotification("stuck", who, threadId, "Repeating the same steps. Stop it or give it a hint.", {
+      avatarUrl: who.avatarUrl,
+      ...(group ? { group: { id: group.id, name: group.name } } : {}),
+    }));
+  })().catch(() => {
+    console.error("[decider] Could not report a stuck check.");
+  });
+}
 
 // Drain queued delegations for a source thread after its turn settles.
 // Run as a separate subscriber so the drain logic stays out of the main
