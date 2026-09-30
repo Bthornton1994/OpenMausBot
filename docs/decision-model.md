@@ -276,8 +276,8 @@ The log stays on this machine: workspace backups leave it out.
 - **Cloud Pro:** decisions are included, with no key to paste. With no key of
   the person's own, the Cloud home uses its relay token
   (`OMB_CLOUD_DECIDER_TOKEN`), sent only to the Admin's relay, never to Jev
-  or `baseUrl`, and only for room routing and the key check (other jobs need
-  a key of the person's own). Settings says **Included with Cloud Pro**, and
+  or `baseUrl`, and only for requests that match a job's fixed contract
+  (room routing, the key check, and each job in `server/decider/jobs.ts`). Settings says **Included with Cloud Pro**, and
   the master switch is on until someone switches it off. A key saved here
   always wins; clearing it falls back to the included decisions. See
   [cloud-pro.md](cloud-pro.md), "Included Boat computers, voice and
