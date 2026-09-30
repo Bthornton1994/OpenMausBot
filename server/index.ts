@@ -2780,7 +2780,9 @@ function cancelDirectTurnDispatch(botId: string, expectedThreadId?: string): Dir
 /** The bot's browser for this turn: agent-browser, one isolated session per
  * browser profile or per bot (docs/plans/browser-engine.md). Null, with the
  * reason logged once, when the engine is not on this machine. */
-const browserRuntime = new BrowserRuntime();
+// Click by description is offered per tools/list, so a Settings change to the
+// decider applies from the next turn.
+const browserRuntime = new BrowserRuntime({ clickByDescription: { decider, ready: () => deciderReady(cfg, "browserClick") } });
 const browserLive = new BrowserLive({ runtime: browserRuntime });
 // Temporary profiles last for this server run, but are never saved to disk.
 // The viewer and the agent must address the SAME temporary browser.

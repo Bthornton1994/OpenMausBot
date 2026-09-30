@@ -35,8 +35,25 @@ New rooms start on Auto while the decider and its room job are on. Existing
 rooms keep their mode. With Jev off, an Auto room shows a one-line hint and
 answers like lead mode.
 
-Browser clicks, tool selection and where work runs are listed as "Coming
-soon" and have no switch yet.
+**Click by description.** With **Click by description** switched on (it
+starts off), bots using the built-in browser get one more tool,
+`agent_browser_click_text`. A bot names what to click in words ("the blue
+Sign in button", "the Remember me checkbox") instead of reading a snapshot
+and picking a ref. The tool takes a snapshot of the page, offers Jev up to
+255 of its clickable elements (buttons, links, fields, checkboxes and so on,
+each described by its role, label and the section it sits in), and sends
+only the words and the page's address and title as the state.
+
+- If one element comes back with a probability of at least 0.6, it is
+  clicked, and the bot is told what: *Clicked button "Sign in" (Jev 92%)*.
+- Anything less sure, and any failure at all, clicks nothing. The bot gets a
+  short list of the closest elements with their refs and clicks one itself,
+  as it would without Jev.
+
+With the switch off, or no key, the tool is not offered at all. A person
+taking over the browser while Jev decides stops the click.
+
+Tool selection and where work runs are not wired yet.
 
 ## It fails open
 
