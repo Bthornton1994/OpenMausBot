@@ -76,8 +76,8 @@ export interface CloudOwnershipOptions {
    * into; `name` records its writer, `pause` turns it off. */
   routines: {
     ids(): Iterable<string>; writer(id: string): string | undefined; fingerprinted(id: string): boolean; resultsOpener(id: string): string | undefined;
-    /** Its instructions as they stand. */
-    prompt(id: string): string | undefined;
+    /** What it runs as it stands, in the terms a card's approval is (index.ts approvalShape). */
+    shape(id: string): string | undefined;
     name(id: string, person: string): void; pause(ids: readonly string[]): void;
   };
   /** A conversation's working folder is no longer pinned: its next turn pins its own. */
@@ -85,7 +85,7 @@ export interface CloudOwnershipOptions {
   /** Everyone who wrote a user line (not a bot's) and who answered a card,
    * anywhere, and who approved each routine a bot proposed (its card), with
    * the instructions they approved. */
-  lines(): { senders: Iterable<string>; answerers: Iterable<string>; approvals: Iterable<[routineId: string, person: string, instructions: string]> };
+  lines(): { senders: Iterable<string>; answerers: Iterable<string>; approvals: Iterable<[routineId: string, person: string, shape: string]> };
   /** The id of a restore applied at this boot: what it brought is the owner's. */
   restoredNow?: string;
   /** The id of the last restore on record here, applied at this boot or before. */
@@ -199,11 +199,12 @@ export function settleCloudOwnership(options: CloudOwnershipOptions): CloudOwner
   const moved = attempt(options, "name the owner on their conversations", () => options.starters.reassign((person) => proven.has(person), options.ownerKey), [], incomplete).length;
   const ownersKey = (person: string | undefined) => person !== undefined && (person === options.ownerKey || proven.has(person));
   // A card the owner allowed is proof of what it showed them: only while the
-  // routine still runs those instructions (anyone could rewrite a routine on
-  // v0.1.91 without being recorded).
+  // routine still runs exactly that (its instructions, bot, schedule, where
+  // it runs and no attachment: anyone could change a routine on v0.1.91
+  // without being recorded).
   const approved = new Set<string>();
-  for (const [id, person, instructions] of lines.approvals) {
-    if (ownersKey(person) && options.routines.prompt(id) === instructions) approved.add(id);
+  for (const [id, person, shape] of lines.approvals) {
+    if (ownersKey(person) && options.routines.shape(id) === shape) approved.add(id);
   }
   let owners = 0, nobodys = 0;
   attempt(options, "name each routine's writer", () => {

@@ -438,7 +438,7 @@ import {
 } from "./browser-engine.ts";
 import { createScreenFrameSource, type ScreenCapture } from "./screen-frame-source.ts";
 import { screenFrameHash, screenSurfaceForTool, screenTouchingTool, settledFrameIsNews } from "./screen-frame-gate.ts";
-import { RoutineRequestService } from "./routine-requests.ts";
+import { asSchedule, RoutineRequestService } from "./routine-requests.ts";
 import { createOptionsCard } from "./options-card.ts";
 import { buildBotOverview, type BotOverview, connectedAppsFacts } from "./bot-overview.ts";
 import { ProfileRequestService } from "./profile-requests.ts";
@@ -1043,6 +1043,35 @@ function cloudOwnersRoutine(routineId: string | undefined): void {
   if (!routine || !cloudRoutineAuthors || !CLOUD_OWNER_KEY) return;
   cloudRoutineAuthors.record(routine.id, routine);
   cloudRoutineAuthors.wrote(routine.id, CLOUD_OWNER_KEY);
+}
+
+/** On a Cloud home: a routine that is the owner's as it stands: their
+ * fingerprint matches what it runs, or they are its writer and no
+ * fingerprint of theirs was ever recorded (a template, a restore). */
+function cloudRoutineIsOwners(routineId: string | undefined): boolean {
+  const routine = routineId ? routines?.listRoutines().find((candidate) => candidate.id === routineId) : undefined;
+  if (!routine || !cloudRoutineAuthors || !CLOUD_OWNER_KEY) return false;
+  return cloudRoutineAuthors.authored(routine.id, routine) ||
+    (cloudRoutineAuthors.writer(routine.id) === CLOUD_OWNER_KEY && !cloudRoutineAuthors.recorded(routine.id));
+}
+
+/** After the owner approved a routine request (its card, or at once in their
+ * own conversation): a routine it created is theirs; one it changed, paused
+ * or resumed stays theirs only if it already was (`wasOwners`, taken before
+ * the change). Approving a harmless change never makes anyone else's routine
+ * the owner's. */
+function cloudOwnerApplied(action: string, routineId: string | undefined, wasOwners: boolean): void {
+  if (action === "create" || ((action === "update" || action === "pause" || action === "resume") && wasOwners)) cloudOwnersRoutine(routineId);
+}
+
+/** What the owner saw on a card that proposed a routine, and what a routine
+ * runs, in the same terms (everything its fingerprint covers except an
+ * interval's anchor, which only moves when it runs). */
+function approvalShape(shape: { prompt?: string; botId?: string; runOn?: string; schedule?: unknown; target?: string; groupId?: string | null; attachments?: { id: string; path: string }[] }): string {
+  const schedule = shape.schedule && typeof shape.schedule === "object" ? { ...(shape.schedule as Record<string, unknown>) } : null;
+  if (schedule) delete schedule.anchorAt;
+  return JSON.stringify([shape.prompt ?? "", shape.botId ?? "", shape.runOn ?? "maus", schedule, shape.target ?? "bot", shape.groupId ?? null,
+    (shape.attachments ?? []).map((attachment) => [attachment.id, attachment.path])]);
 }
 
 /** Who opens a routine's results conversation on a Cloud home: the writer
@@ -10226,7 +10255,7 @@ if (CLOUD_HOME && CLOUD_OWNER_KEY && cloudRoutineAuthors) {
       writer: (id) => authors.writer(id),
       fingerprinted: (id) => { const routine = routineById(id); return Boolean(routine) && authors.authored(id, routine!); },
       resultsOpener: (id) => { const results = routineById(id)?.resultsThreadId; return results ? threadStarters.get(results) : undefined; },
-      prompt: (id) => routineById(id)?.prompt,
+      shape: (id) => { const routine = routineById(id); return routine ? approvalShape(routine) : undefined; },
       name: (id, person) => authors.wrote(id, person),
       pause: (ids) => { for (const id of ids) routines?.update(id, { enabled: false }); },
     },
@@ -10244,7 +10273,9 @@ if (CLOUD_HOME && CLOUD_OWNER_KEY && cloudRoutineAuthors) {
           // A routine a bot proposed, created when this person allowed its card.
           const request = line.card?.routineRequest;
           if (answerer && line.card?.answered === "allow" && request?.operation.action === "create" && request.resultId) {
-            approvals.push([request.resultId, answerer, request.operation.routine.instructions]);
+            const definition = request.operation.routine;
+            approvals.push([request.resultId, answerer, approvalShape({ prompt: definition.instructions, botId: request.operation.forBot?.botId ?? request.botId,
+              runOn: definition.runOn, schedule: asSchedule(definition.schedule, 0) })]);
           }
         }
       }
@@ -10875,9 +10906,12 @@ function resolveAndSendRoutine(
   const card = store.messagesFor(args.threadId).find(
     (message) => message.card?.requestId === args.requestId && message.card.routineRequest,
   )?.card;
+  // On a Cloud home a routine the owner approved on its card is theirs; one
+  // it only changed stays whosever it was (cloudOwnerApplied).
+  const operation = card?.routineRequest?.operation;
+  const wasOwners = operation && operation.action !== "create" ? cloudRoutineIsOwners(operation.routineId) : false;
   const result = routineRequests.resolve(args);
-  // On a Cloud home a routine the owner approved on its card is theirs.
-  if (ownersAnswer && result.claimed && result.state === "applied") cloudOwnersRoutine(result.resultId);
+  if (ownersAnswer && result.claimed && result.state === "applied") cloudOwnerApplied(result.action, result.resultId, wasOwners);
   if (
     result.claimed &&
     (result.state === "applied" || result.state === "denied")
@@ -15419,6 +15453,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           : body.action === "update"
             ? { action: body.action, routineId: body.routineId, changes: body.changes, forBot }
             : { action: body.action, routineId: body.routineId, forBot };
+        // Whether the routine a change is for is the owner's, and whether this
+        // turn acts for the owner (their own conversation, or a run of a
+        // routine that is theirs), both before the change.
+        const wasOwners = proposedInput.action !== "create" && typeof proposedInput.routineId === "string" ? cloudRoutineIsOwners(proposedInput.routineId) : false;
+        const run = activeRoutineRunForThread(fromThreadId);
+        const ownersTurn = cloudOwnerOnlyThread(fromThreadId) || (run != null && run.threadId === fromThreadId && cloudRoutineIsOwners(run.routineId));
         const proposed = await routineRequests.submit({
           botId: from.id,
           threadId: fromThreadId,
@@ -15432,7 +15472,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // the card. From anywhere else, a routine it created or changed is no
         // longer the owner's, like anyone else's edit (the routine PATCH).
         const applied = CLOUD_HOME && proposed.state === "applied" && "result" in proposed ? proposed.result : undefined;
-        if (applied?.resultId && cloudOwnerOnlyThread(fromThreadId)) cloudOwnersRoutine(applied.resultId);
+        if (applied?.resultId && ownersTurn) cloudOwnerApplied(applied.action, applied.resultId, wasOwners);
         else if (applied?.resultId && (applied.action === "create" || applied.action === "update")) {
           cloudRoutineAuthors?.forget(applied.resultId);
           cloudRoutineAuthors?.wrote(applied.resultId, CLOUD_NOBODY_KEY);
