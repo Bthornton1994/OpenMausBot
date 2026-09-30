@@ -1,0 +1,48 @@
+name: t1736u Ubuntu full pnpm test
+
+# Verifies exact tip a09eb8d with literal pnpm test on ubuntu-latest.
+# Product code under test is pinned by checkout ref.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [cos/t1736u-ubuntu-verify]
+
+permissions:
+  contents: read
+
+jobs:
+  full-pnpm-test:
+    name: pnpm test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact t1734u tip
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: a09eb8d9942fed0fbae9b4453cebd2af9ccc578a
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Record environment
+        run: |
+          set -eux
+          echo "RUNNER_OS=${RUNNER_OS:-}"
+          echo "ImageOS=${ImageOS:-}"
+          echo "ImageVersion=${ImageVersion:-}"
+          echo "RUNNER_NAME=${RUNNER_NAME:-}"
+          node -v
+          pnpm -v
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "a09eb8d9942fed0fbae9b4453cebd2af9ccc578a"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Full pnpm test
+        run: pnpm test
