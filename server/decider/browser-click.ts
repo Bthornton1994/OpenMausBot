@@ -170,17 +170,24 @@ export interface BrowserClickPage {
 
 /** The request for up to 255 of the most plausible elements, within the
  * relay's state and body caps. Null with fewer than two elements. */
+/** Always offered last: Jev can only choose among what it is shown, so a
+ * vague or unmatched target needs somewhere to go other than the likeliest
+ * element on the page. Choosing it never clicks anything. */
+export const NO_MATCH_OPTION = "__none__";
+const NO_MATCH_MEANING = "None of these: no element on the page is the one `target` describes, or `target` is too vague to tell which.";
+
 export function browserClickRequest(target: string, page: BrowserClickPage, elements: readonly PageElement[]) {
   const state = {
     target: clip(target, TARGET_MAX),
     page: { url: clip(page.url ?? "", URL_MAX), title: clip(page.title ?? "", TITLE_MAX) },
   };
   if (Buffer.byteLength(JSON.stringify(state)) > RELAY_MAX_STATE_BYTES) return null;
-  let kept = rankElements(elements, target).slice(0, JEV_MAX_OPTIONS);
+  let kept = rankElements(elements, target).slice(0, JEV_MAX_OPTIONS - 1);
   const build = (cap: number) => {
     const options: Record<string, string> = {};
     // Page order reads more naturally than plausibility order.
     for (const element of [...kept].sort((a, b) => a.index - b.index)) options[element.ref] = elementOption(element, cap);
+    options[NO_MATCH_OPTION] = NO_MATCH_MEANING;
     return options;
   };
   const fits = (options: Record<string, string>) =>
@@ -221,8 +228,8 @@ export async function pickElement(
     if (!result.ok) return { kind: "unsure", reason: result.reason, candidates: byPlausibility() };
     const { choice, pTop, probabilities } = result.answers;
     const chosen = request.elements.find((element) => element.ref === choice);
-    if (!chosen) return { kind: "unsure", reason: "malformed", candidates: byPlausibility() };
-    if (pTop < BROWSER_CLICK_MIN_PROBABILITY) {
+    if (!chosen && choice !== NO_MATCH_OPTION) return { kind: "unsure", reason: "malformed", candidates: byPlausibility() };
+    if (!chosen || pTop < BROWSER_CLICK_MIN_PROBABILITY) {
       const candidates = request.elements
         .map((element) => ({ element, probability: probabilities[element.ref] ?? 0 }))
         .sort((a, b) => b.probability - a.probability || a.element.index - b.element.index)

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  BROWSER_CLICK_MIN_PROBABILITY, browserClickRequest, clickByDescription, elementOption, parseSnapshot, pickElement, rankElements,
+  BROWSER_CLICK_MIN_PROBABILITY, browserClickRequest, clickByDescription, elementOption, NO_MATCH_OPTION, parseSnapshot, pickElement, rankElements,
 } from "./browser-click.ts";
 import type { Decider } from "./index.ts";
 import { jevRequestBody } from "./jev.ts";
@@ -78,17 +78,19 @@ describe("browser click request", () => {
     expect(request.question.instructions).toBe(BROWSER_CLICK.instructions);
     expect(Object.keys(request.state).sort()).toEqual(["page", "target"]);
     expect(request.state).toEqual({ target: "the blue Sign in button", page: PAGE });
-    expect(Object.keys(request.question.options)).toHaveLength(elements.length);
+    // every element, then "none of these" last
+    expect(Object.keys(request.question.options)).toEqual([...elements.map((element) => element.ref), NO_MATCH_OPTION]);
     expect(request.question.options.e11).toBe("button \"Sign in\", under the heading \"Welcome back\"");
     expect(relayAccepts("browserClick", request.state, { answer: { type: "choice", ...request.question } })).toBe(true);
   });
 
-  it("caps a large real page at 255 plausible elements within the relay's size caps", () => {
+  it("caps a large real page at 254 plausible elements plus \"none of these\", within the relay's size caps", () => {
     const elements = parseSnapshot(SNAPSHOTS.wikipedia);
     const request = browserClickRequest("the Log in link at the top", { url: "https://en.wikipedia.org/wiki/Web_browser", title: "Web browser - Wikipedia" }, elements)!;
     const options = request.question.options;
     const keys = Object.keys(options);
     expect(keys.length).toBe(255);
+    expect(keys.at(-1)).toBe(NO_MATCH_OPTION);
     expect(keys).toContain(elements.find((element) => element.name === "Log in")!.ref);
     expect(keys.every((key) => key.length <= OPTION_KEY_MAX)).toBe(true);
     expect(Object.values(options).every((text) => text.length <= OPTION_TEXT_MAX)).toBe(true);
@@ -141,6 +143,15 @@ describe("picking an element", () => {
     expect(pick.reason).toBe("low_confidence");
     expect(pick.candidates.slice(0, 3).map(({ element, probability }) => [element.ref, probability])).toEqual([["e11", 0.45], ["e12", 0.4], ["e8", 0.1]]);
     expect(pick.candidates).toHaveLength(5);
+  });
+
+  it("clicks nothing when Jev says none of the elements is meant, however sure it is", async () => {
+    const pick = await pickElement(answering(picked(NO_MATCH_OPTION, 0.9, { e11: 0.08, e12: 0.02 })), "the thing", PAGE, elements);
+    expect(pick.kind).toBe("unsure");
+    if (pick.kind !== "unsure") return;
+    expect(pick.reason).toBe("low_confidence");
+    expect(pick.candidates.slice(0, 2).map(({ element }) => element.ref)).toEqual(["e11", "e12"]);
+    expect(pick.candidates.every(({ element }) => element.ref !== NO_MATCH_OPTION)).toBe(true);
   });
 
   it("fails open on any decider failure, a choice never offered, or a throw", async () => {

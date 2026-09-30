@@ -229,6 +229,10 @@ and picking a ref. The tool takes a snapshot of the page, offers Jev up to
 each described by its role, label and the section it sits in), and sends
 only the words and the page's address and title as the state.
 
+Jev is also offered "none of these": a target that matches nothing on
+the page, or is too vague to tell ("the thing"), clicks nothing however sure
+Jev is, and the bot gets the likeliest candidates instead.
+
 - If one element comes back with a probability of at least 0.6, it is
   clicked, and the bot is told what: *Clicked button "Sign in" (Jev 92%)*.
 - Anything less sure, and any failure at all, clicks nothing. The bot gets a
