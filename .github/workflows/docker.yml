@@ -196,12 +196,13 @@ jobs:
           test "$(uids dist-server/cloud-home-start.js)" = "0 "
           test "$(uids dist-server/index.js)" = "$maus "
           test "$(uids 'caddy run')" = "$maus "
-          # No secret in the server's starting environment, which any maus process can read.
+          # No secret in the server's starting environment, read as any maus process (an
+          # engine's shell) can read it: root in the container lacks CAP_SYS_PTRACE for that.
           spid=$(docker exec home sh -c 'for p in /proc/[0-9]*; do case "$(tr "\0" " " < "$p/cmdline" 2>/dev/null)" in *"dist-server/in""dex.js"*) echo "${p#/proc/}";; esac; done')
           test -n "$spid"
-          docker exec home grep -qaF OMB_CLOUD_ROLE=home "/proc/$spid/environ"                 # the probe reads it
+          docker exec -u maus home grep -qaF OMB_CLOUD_ROLE=home "/proc/$spid/environ"         # the probe reads it
           for value in "$secret" "box_omb_$relay"; do
-            if docker exec home grep -qaF -- "$value" "/proc/$spid/environ"; then echo "a secret is in the server's environment"; exit 1; fi
+            if docker exec -u maus home grep -qaF -- "$value" "/proc/$spid/environ"; then echo "a secret is in the server's environment"; exit 1; fi
           done
           # The root launcher runs only code maus cannot change; maus owns only the volume.
           docker exec -u maus home sh -c 'for f in /app /app/dist-server /app/dist-server/index.js /app/dist-server/cloud-home-start.js /app/cloud/Caddyfile /usr/local/bin/caddy; do if test -w "$f"; then echo "maus can write $f"; exit 1; fi; done; test -w /data'
