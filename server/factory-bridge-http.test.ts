@@ -1,14 +1,15 @@
 /**
  * Focused factory bridge HTTP tests (t1742u + t1743u harden).
  */
-import { mkdirSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import { listenFactoryBridge, FACTORY_BRIDGE_MAX_BODY_BYTES } from "./factory-bridge-http.ts";
+import { clientErrorMessage, listenFactoryBridge, FACTORY_BRIDGE_MAX_BODY_BYTES } from "./factory-bridge-http.ts";
 import {
+  FactoryLaneError,
   listLanes,
   transition,
   upsertLane,
@@ -427,5 +428,58 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     const res = await json(base, "GET", "/factory/lanes", undefined, { origin: "https://evil.example" });
     expect(res.status).toBe(400);
     expect(res.body.error.message).toMatch(/Origin/);
+  });
+
+  it("F5 bad protect SoT replies fail closed without leaking paths", async () => {
+    const PATHISH = /[A-Za-z]:\\|\/Users\/|\/home\//;
+    const missing = join(DATA_DIR, "protect-f5-missing");
+    mkdirSync(missing, { recursive: true });
+    process.env.COS_FACTORY_PROTECT_DIR = missing;
+
+    const reg = await json(base, "POST", "/factory/lanes", laneInput("f5-reg"));
+    const claim = await json(base, "POST", "/factory/claim", {});
+    for (const res of [reg, claim]) {
+      expect(res.status).toBe(403);
+      expect(res.body.error.code).toBe("ineligible");
+      expect(res.body.error.message).toBe("protect SoT unavailable, failing closed");
+      expect(res.body.error.message).not.toMatch(PATHISH);
+      expect(res.body.error.message).not.toContain(missing);
+    }
+    expect(listLanes()).toHaveLength(0);
+
+    // Full detail stays server-side.
+    const logged = readFileSync(join(DATA_DIR, "bridge.log"), "utf8");
+    expect(logged).toContain(missing);
+  });
+
+  it("F5 authorized errors keep useful non-path messages", async () => {
+    const unsupported = await json(base, "POST", "/factory/claim", { protectDir: "C:\\evil\\protect" });
+    expect(unsupported.status).toBe(400);
+    expect(unsupported.body.error.message).toBe("unsupported fields: protectDir");
+
+    const noType = await json(base, "POST", "/factory/lanes", JSON.stringify(laneInput("f5-type")), {
+      "content-type": "text/plain",
+    });
+    expect(noType.status).toBe(400);
+    expect(noType.body.error.message).toBe("Content-Type must be application/json");
+
+    const missingLane = await json(base, "GET", "/factory/lanes/nope-f5");
+    expect(missingLane.status).toBe(404);
+    expect(missingLane.body.error.message).toBe("no factory lane nope-f5");
+  });
+
+  it("F5 clientErrorMessage redacts absolute paths", () => {
+    const msg = (text: string) => clientErrorMessage(new FactoryLaneError("invalid", text));
+    expect(msg("protect SoT unavailable, failing closed: cannot read C:\\cos\\protect\\x.json")).toBe(
+      "protect SoT unavailable, failing closed",
+    );
+    expect(msg("worktree C:\\work\\wt-a overlaps D:/other/wt")).toBe("worktree <path> overlaps <path>");
+    expect(msg("worktree /home/me/wt overlaps /Users/me/wt and \\\\srv\\share\\wt")).toBe(
+      "worktree <path> overlaps <path> and <path>",
+    );
+    expect(msg(`dir ${FIXTURE} bad`)).not.toContain(FIXTURE);
+    expect(msg("lane acme/widgets in ci_wait/qa_wait; Content-Type must be application/json")).toBe(
+      "lane acme/widgets in ci_wait/qa_wait; Content-Type must be application/json",
+    );
   });
 });

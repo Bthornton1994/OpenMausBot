@@ -381,19 +381,30 @@ export async function handleFactoryBridgeRequest(
     });
   } catch (error) {
     if (error instanceof FactoryLaneError) {
-      const safe = error.message === "unauthorized" || error.message === "bridge auth not configured"
-        ? error.message
-        : error.message.includes("protect SoT")
-          ? error.message
-          : error.message;
-      log(`ERR ${error.code}: ${safe}`);
-      send(res, statusFor(error), { error: { code: error.code, message: safe } });
+      log(`ERR ${error.code}: ${error.message}`);
+      send(res, statusFor(error), { error: { code: error.code, message: clientErrorMessage(error) } });
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
     log(`ERR internal: ${message}`);
     send(res, 500, { error: { code: "internal", message: "internal error" } });
   }
+}
+
+const PROTECT_SOT_CLIENT_MESSAGE = "protect SoT unavailable, failing closed";
+const WINDOWS_PATH = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`,;)]*/g;
+const POSIX_PATH = /(?<![\w.:/~-])\/[^\s"'`,;:)/]+(?:\/[^\s"'`,;:)]*)*/g;
+
+/**
+ * Client-facing error text. Full detail stays in the server log; HTTP clients
+ * never see filesystem paths (protect dir, worktrees, temp dirs).
+ */
+export function clientErrorMessage(error: FactoryLaneError): string {
+  if (error.message.includes("protect SoT")) return PROTECT_SOT_CLIENT_MESSAGE;
+  let message = error.message;
+  const protectDir = process.env.COS_FACTORY_PROTECT_DIR?.trim();
+  if (protectDir) message = message.split(protectDir).join("<path>");
+  return message.replace(WINDOWS_PATH, "<path>").replace(POSIX_PATH, "<path>");
 }
 
 export function createFactoryBridgeServer(options: FactoryBridgeOptions = {}): Server {
