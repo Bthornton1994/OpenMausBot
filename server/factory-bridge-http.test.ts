@@ -177,6 +177,30 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     expect(wrongType.status).toBe(400);
   });
 
+  it("F3 requires application/json Content-Type on writes", async () => {
+    // A Uint8Array body makes fetch send no Content-Type header at all.
+    const noType = await fetch(`${base}/factory/lanes`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${TOKEN}` },
+      body: new TextEncoder().encode(JSON.stringify(laneInput("f3-none"))),
+    });
+    expect(noType.status).toBe(400);
+    const noTypeBody: any = await noType.json();
+    expect(noTypeBody.error.message).toMatch(/Content-Type must be application\/json/);
+
+    const wrongType = await fetch(`${base}/factory/lanes`, {
+      method: "POST",
+      headers: { "content-type": "text/plain", authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify(laneInput("f3-text")),
+    });
+    expect(wrongType.status).toBe(400);
+    expect(listLanes()).toHaveLength(0);
+
+    const ok = await json(base, "POST", "/factory/lanes", laneInput("f3-json"));
+    expect(ok.status).toBe(200);
+    expect(listLanes()).toHaveLength(1);
+  });
+
   it("register cannot spoof phase, fullSha, or agentSession", async () => {
     const spoof = await json(base, "POST", "/factory/lanes", {
       title: "spoof",
@@ -381,6 +405,22 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     });
     expect(okCi.status).toBe(200);
     expect(okCi.body.lane.phase).toBe("ci_wait");
+  });
+
+  it("F8 same-phase frozen patch is protect-gated", async () => {
+    const lane = upsertLane(laneInput("f8", { fullSha: SHA }));
+    const toCi = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "ci_wait", fullSha: SHA });
+    expect(toCi.status).toBe(200);
+    expect(toCi.body.lane.phase).toBe("ci_wait");
+
+    const swap = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, {
+      phase: "ci_wait",
+      fullSha: VA_TIP,
+    });
+    expect(swap.status).toBe(403);
+    expect(swap.body.error.code).toBe("ineligible");
+    expect(getLane(lane.id)?.phase).toBe("ci_wait");
+    expect(getLane(lane.id)?.fullSha).toBe(SHA);
   });
 
   it("rejects bad Origin for non-health requests", async () => {

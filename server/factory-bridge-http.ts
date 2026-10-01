@@ -149,8 +149,10 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
 }
 
 async function readJsonObject(req: IncomingMessage, { allowEmpty = false } = {}): Promise<Record<string, unknown>> {
+  // F3/t1746u: a missing Content-Type is rejected too, so a simple
+  // cross-origin request cannot reach a mutating route.
   const type = String(req.headers["content-type"] ?? "");
-  if (type && !/^application\/json\b/i.test(type)) {
+  if (!/^application\/json\b/i.test(type)) {
     throw new FactoryLaneError("invalid", "Content-Type must be application/json");
   }
   const raw = await readBody(req, FACTORY_BRIDGE_MAX_BODY_BYTES);

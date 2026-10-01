@@ -554,7 +554,14 @@ export function transition(
   let allowed: ProtectDecision | null = null;
   // F2/t1743u: gate entry into ANY frozen phase (running/ci_wait/qa_wait/owner_gate),
   // not only running — otherwise ready→ci_wait can take ownership + fullSha past protect.
-  if (FROZEN_PHASES.includes(phase) && current && current.phase !== phase && !TERMINAL_PHASES.includes(current.phase)) {
+  // F8/t1746u: a same-phase transition that patches fullSha or agentSession is
+  // re-gated too, so a lane already in ci_wait cannot adopt a frozen tip.
+  if (
+    FROZEN_PHASES.includes(phase) &&
+    current &&
+    !TERMINAL_PHASES.includes(current.phase) &&
+    (current.phase !== phase || patch.fullSha || patch.agentSession)
+  ) {
     // Gate what the lane will be after the patch, so a patch cannot slip a
     // protected writer session or a frozen SHA past the check.
     const after: FactoryLane = {
