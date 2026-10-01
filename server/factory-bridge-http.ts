@@ -1,7 +1,8 @@
 /**
  * Local-only factory lane bridge (t1742u / hardened t1743u).
  *
- * Loopback HTTP for CoS/Grok: inspect, register, claim, transition, wait, report.
+ * Loopback HTTP for CoS/Grok: inspect, register, claim, transition, record a
+ * QA verdict, wait, report.
  * Protect dir is server-config only (COS_FACTORY_PROTECT_DIR / COS_FACTORY_ROOT).
  * Mutating ops fail closed when protect SoT is missing or unreadable.
  * Non-health endpoints require FACTORY_BRIDGE_TOKEN. No CORS. No request protectDir.
@@ -18,6 +19,7 @@ import {
   getLane,
   laneReport,
   listLanes,
+  recordQaDisposition,
   transition,
   upsertLane,
   waitLane,
@@ -27,6 +29,7 @@ import {
   type FactoryLaneInput,
   type FactoryLanePhase,
   type FactoryLanePatch,
+  type QaDisposition,
 } from "./factory-lanes.ts";
 import { loadProtectSoT, resolveProtectDir } from "./factory-protect-gate.ts";
 
@@ -294,6 +297,7 @@ const REGISTER_KEYS = ["id", "title", "ownerBotId", "repo", "branch", "worktreeP
 const CLAIM_KEYS = ["laneId", "ownerBotId", "repo", "branch", "worktreePath", "pathClaims", "preferOwnerBotId", "forceParallel"] as const;
 const WAIT_KEYS = ["timeoutMs", "pollMs", "reload"] as const;
 const TRANSITION_KEYS = ["phase", "fullSha", "reviewerBotId", "outcome", "nextAction", "blocker", "prUrl", "changedFiles"] as const;
+const QA_KEYS = ["reviewerBotId", "disposition", "ref", "note"] as const;
 
 export async function handleFactoryBridgeRequest(
   req: IncomingMessage,
@@ -389,6 +393,35 @@ export async function handleFactoryBridgeRequest(
       if (changedFiles) patch.changedFiles = changedFiles;
       const lane = transition(decodeURIComponent(transit[1]!), phase as FactoryLanePhase, patch, { protectDir });
       log(`TRANSITION lane=${lane.id} phase=${lane.phase}`);
+      send(res, 200, { lane });
+      return;
+    }
+
+    // t1755u: QA verdicts go through the bridge too, so a bridge client never
+    // needs a second process writing the lane file. recordQaDisposition owns
+    // the rules (known disposition, independent and assigned reviewer).
+    const verdict = path.match(/^\/factory\/lanes\/([^/]+)\/qa$/);
+    if (method === "POST" && verdict) {
+      serverProtectDir();
+      const body = await readJsonObject(req, { limits });
+      assertOnlyKeys(body, QA_KEYS);
+      const reviewerBotId = str(body.reviewerBotId);
+      const disposition = str(body.disposition);
+      const ref = str(body.ref);
+      if (!reviewerBotId || !disposition || !ref) {
+        throw new FactoryLaneError("invalid", "reviewerBotId, disposition and ref are required non-empty strings");
+      }
+      if (body.note !== undefined && typeof body.note !== "string") {
+        throw new FactoryLaneError("invalid", "note must be a string");
+      }
+      const note = str(body.note);
+      const lane = recordQaDisposition(decodeURIComponent(verdict[1]!), {
+        reviewerBotId,
+        disposition: disposition as QaDisposition,
+        ref,
+        ...(note ? { note } : {}),
+      });
+      log(`QA lane=${lane.id} disposition=${lane.qaDisposition} reviewer=${reviewerBotId} phase=${lane.phase}`);
       send(res, 200, { lane });
       return;
     }

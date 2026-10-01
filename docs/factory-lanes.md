@@ -16,6 +16,12 @@ it changes no model routing, approvals, or engine behavior.
   platform honours it). The change is applied to a copy and only becomes
   current after the write succeeds, so a failed write never leaves a claim held
   in memory but missing on disk.
+- One process at a time may write the file. Each process keeps the lanes in
+  memory, and a change neither re-reads nor locks the file first, so two
+  processes writing the same `DATA_DIR` lose each other's changes. While the
+  bridge (`scripts/factory-bridge.ts`) runs, make every change through it, QA
+  verdicts included; other processes read through it, or with
+  `waitLane(…, { reload: true })`.
 - Missing file → empty. Unparseable file → empty, and the bad file is first
   copied to `factory-lanes.json.corrupt-<epoch ms>` so the next save cannot
   destroy it. Individual invalid lanes are dropped on load.
@@ -105,7 +111,7 @@ without waiting. Pass `reload: true` when another process writes the file.
   self-reviewer is dropped on load.
 - `recordQaDisposition(id, { reviewerBotId, disposition, ref, note? })` only
   accepts the lane's assigned reviewer, never its owner, and logs `qa`
-  evidence.
+  evidence that names the reviewer (`FAIL by qa-bot — missing test`).
 
 ### QA hold (`qa_wait`)
 
@@ -125,8 +131,9 @@ is refused with `code: "ineligible"` and writes nothing.
 - No verdict means QA is pending: the lane cannot resume implementation,
   finish, or be released. `PASS`, `BLOCKED`, `NOT RUN` and `UNKNOWN` never
   hand it back for rework.
-- The rework handoff logs `rework` evidence — the reviewer, and the `ref` of
-  the FAIL's `qa` evidence — just before the `qa_wait->running` (or
+- The rework handoff logs `rework` evidence — the reviewer who recorded the
+  FAIL (never one the same transition assigns), and the `ref` of the FAIL's
+  `qa` evidence — just before the `qa_wait->running` (or
   `qa_wait->ready`) phase entry. Rework still passes the protect gate — on the
   transition to `running`, or when the manager loop dispatches the `ready`
   lane — so a FAIL never opens a frozen tip or a protected session.
@@ -134,13 +141,21 @@ is refused with `code: "ineligible"` and writes nothing.
   phase, or in an earlier round, does not release a new hold.
 - While the lane is in `qa_wait`, neither a transition patch nor `upsertLane`
   may set or change `fullSha`; record the tip when entering `qa_wait`.
+- Nor may either change or clear an assigned `reviewerBotId`, so the verdict
+  that releases the lane comes from the reviewer who held it. Restating it is
+  fine, and a held lane with no reviewer may be given one — without one, no
+  verdict, and so no exit, is possible.
 - `releaseOwnership` is refused until a verdict is recorded (the phase keeps
   blocking other writers either way).
 - The implementer claim APIs keep refusing a `qa_wait` lane even after `FAIL`
   (rule `qa_phase`); the handoff goes through `transition`.
-- The loopback bridge (`scripts/factory-bridge.ts`) has no route that records a
-  verdict, so a bridge client cannot move a lane out of `qa_wait` until one is
-  recorded in-process through `recordQaDisposition`.
+- The loopback bridge (`scripts/factory-bridge.ts`) records verdicts with
+  `POST /factory/lanes/:id/qa` (`{ reviewerBotId, disposition, ref, note? }`).
+  It calls `recordQaDisposition` behind the same token, JSON-only body and
+  fail-closed protect-directory check as the bridge's other writes. The token
+  authorizes the caller, not a bot: the bridge checks the `reviewerBotId` it is
+  given against the lane's assigned reviewer, but cannot prove the caller is
+  that bot.
 
 ## Protect gate (`server/factory-protect-gate.ts`)
 

@@ -131,7 +131,7 @@ describe("factory lanes: manager loop", () => {
     );
     const reviewed = recordQaDisposition(a.id, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
     expect(reviewed.qaDisposition).toBe("PASS");
-    expect(reviewed.evidence.at(-1)).toMatchObject({ kind: "qa", ref: "_cos/QA_DIGEST.md", note: "PASS" });
+    expect(reviewed.evidence.at(-1)).toMatchObject({ kind: "qa", ref: "_cos/QA_DIGEST.md", note: "PASS by qa-bot" });
   });
 
   it("does not dispatch when nothing is waiting unless forced", () => {
@@ -325,6 +325,87 @@ describe("factory lanes: QA hold (t1754u)", () => {
     expect(getLane(lane.id)!.fullSha).toBe(SHA_A);
     // Restating the same tip (any case) is not a change.
     expect(transition(lane.id, "done", { fullSha: SHA_A.toUpperCase(), outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", fullSha: SHA_A });
+  });
+});
+
+describe("factory lanes: QA hold freezes the reviewer (t1755u)", () => {
+  it("refuses to swap or clear a held lane's reviewer by transition or upsert, and writes nothing", () => {
+    const lane = heldByQa("a");
+    const before = getLane(lane.id)!;
+    for (const reviewerBotId of ["qa-bot-2", ""]) {
+      expectLaneError(() => transition(lane.id, "qa_wait", { reviewerBotId }), "ineligible", /its reviewer qa-bot is frozen/);
+      expectLaneError(() => upsertLane({ ...laneInput("a"), id: lane.id, reviewerBotId }), "ineligible", /its reviewer qa-bot is frozen/);
+    }
+    expect(getLane(lane.id)).toEqual(before);
+
+    // Nor in the move that ends the hold.
+    verdict(lane.id, "PASS");
+    expectLaneError(() => transition(lane.id, "done", { reviewerBotId: "qa-bot-2" }), "ineligible", /its reviewer qa-bot is frozen/);
+    expect(getLane(lane.id)).toMatchObject({ phase: "qa_wait", reviewerBotId: "qa-bot" });
+
+    // Restating the assigned reviewer is not a change.
+    expect(upsertLane({ ...laneInput("a"), id: lane.id, reviewerBotId: "qa-bot", nextAction: "await QA" })).toMatchObject({
+      phase: "qa_wait",
+      reviewerBotId: "qa-bot",
+      nextAction: "await QA",
+    });
+    expect(transition(lane.id, "done", { reviewerBotId: "qa-bot", outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", reviewerBotId: "qa-bot" });
+  });
+
+  it("lets a held lane with no reviewer be given one, since no verdict could release it otherwise, then freezes it", () => {
+    const lane = upsertLane(laneInput("a", { phase: "qa_wait", fullSha: SHA_A }));
+    expectLaneError(() => verdict(lane.id, "PASS"), "qa_independence", /reviewed by nobody yet/);
+    expect(transition(lane.id, "qa_wait", { reviewerBotId: "qa-bot" }).reviewerBotId).toBe("qa-bot");
+    expectLaneError(() => transition(lane.id, "qa_wait", { reviewerBotId: "qa-bot-2" }), "ineligible", /its reviewer qa-bot is frozen/);
+    verdict(lane.id, "PASS");
+    expect(transition(lane.id, "done", { outcome: "KEEP_DRAFT" }).phase).toBe("done");
+  });
+
+  it("unfreezes the reviewer once the lane leaves qa_wait", () => {
+    const lane = heldByQa("a");
+    verdict(lane.id, "FAIL");
+    transition(lane.id, "running");
+    expect(transition(lane.id, "running", { reviewerBotId: "qa-bot-2" }).reviewerBotId).toBe("qa-bot-2");
+    expect(upsertLane({ ...laneInput("a"), id: lane.id, reviewerBotId: "qa-bot-3" }).reviewerBotId).toBe("qa-bot-3");
+    // The next round may enter qa_wait under a new reviewer, who alone can release it.
+    expect(transition(lane.id, "qa_wait", { fullSha: "b".repeat(40), reviewerBotId: "qa-bot-4" })).toMatchObject({ phase: "qa_wait", reviewerBotId: "qa-bot-4" });
+    expectLaneError(() => verdict(lane.id, "PASS"), "qa_independence", /reviewed by qa-bot-4, not qa-bot/);
+  });
+
+  it("names the reviewer who recorded the FAIL in the qa and rework evidence", () => {
+    const lane = heldByQa("a");
+    const failed = recordQaDisposition(lane.id, { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST.md", note: "missing test" });
+    expect(failed.evidence.at(-1)).toEqual({ at: expect.any(Number), kind: "qa", ref: "_cos/QA_DIGEST.md", note: "FAIL by qa-bot — missing test" });
+    // The handoff cannot swap in another reviewer to take the credit…
+    expectLaneError(() => transition(lane.id, "running", { reviewerBotId: "qa-bot-2" }), "ineligible", /its reviewer qa-bot is frozen/);
+    expect(getLane(lane.id)).toEqual(failed);
+    // …so the rework note names the reviewer who failed it.
+    const rework = transition(lane.id, "running", { reviewerBotId: "qa-bot" });
+    expect(rework.evidence.at(-2)).toEqual({
+      at: expect.any(Number),
+      kind: "rework",
+      ref: "_cos/QA_DIGEST.md",
+      note: "QA FAIL by qa-bot handed the lane back for rework",
+    });
+  });
+
+  it("never credits a reviewer assigned on the handoff with a FAIL recorded before them", () => {
+    // A stored lane (say, written by an older tool) holding a FAIL but no reviewer.
+    const now = Date.now();
+    const stored = {
+      ...laneInput("a"),
+      id: "a",
+      phase: "qa_wait",
+      fullSha: SHA_A,
+      qaDisposition: "FAIL",
+      evidence: [{ at: now, kind: "qa", ref: "_cos/QA_DIGEST.md", note: "FAIL" }],
+      createdAt: now,
+      updatedAt: now,
+    };
+    writeFileSync(FILE, JSON.stringify({ version: 1, lanes: [stored] }));
+    const rework = transition("a", "running", { reviewerBotId: "qa-bot-2" });
+    expect(rework).toMatchObject({ phase: "running", reviewerBotId: "qa-bot-2" });
+    expect(rework.evidence.at(-2)).toMatchObject({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: "QA FAIL by its reviewer handed the lane back for rework" });
   });
 });
 

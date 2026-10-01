@@ -572,6 +572,112 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     ]);
   });
 
+  it("t1755u F3 transition route cannot swap a held lane's reviewer; restating it is fine", async () => {
+    const lane = heldByQa("t1755u-f3");
+    const before = getLane(lane.id);
+    const swap = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "qa_wait", reviewerBotId: "qa-bot-2" });
+    expect(swap.status).toBe(403);
+    expect(swap.body.error.code).toBe("ineligible");
+    expect(swap.body.error.message).toMatch(/its reviewer qa-bot is frozen/);
+    expect(getLane(lane.id)).toEqual(before);
+
+    const restate = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, {
+      phase: "qa_wait",
+      reviewerBotId: "qa-bot",
+      nextAction: "await QA",
+    });
+    expect(restate.status).toBe(200);
+    expect(restate.body.lane).toMatchObject({ phase: "qa_wait", reviewerBotId: "qa-bot", nextAction: "await QA" });
+  });
+
+  it("t1755u F1 QA route records the assigned reviewer's FAIL, refuses anyone else, and enables the rework handoff", async () => {
+    const lane = heldByQa("t1755u-qa-fail");
+    const before = getLane(lane.id);
+    const qa = (body: unknown, headers: Record<string, string> = {}) => json(base, "POST", `/factory/lanes/${lane.id}/qa`, body, headers);
+    const move = (body: Record<string, unknown>) => json(base, "POST", `/factory/lanes/${lane.id}/transition`, body);
+    const fail = { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST.md", note: "missing test" };
+
+    // QA pending: the handoff is still refused.
+    const pending = await move({ phase: "running" });
+    expect(pending.status).toBe(403);
+    expect(pending.body.error.message).toMatch(/no QA verdict recorded/);
+
+    expect((await qa(fail, { authorization: "Bearer wrong-token" })).status).toBe(401);
+    for (const reviewerBotId of [lane.ownerBotId, "someone-else"]) {
+      const res = await qa({ ...fail, reviewerBotId });
+      expect(res.status, reviewerBotId).toBe(403);
+      expect(res.body.error.code, reviewerBotId).toBe("qa_independence");
+    }
+    for (const [label, body] of [
+      ["unknown disposition", { ...fail, disposition: "MAYBE" }],
+      ["no ref", { reviewerBotId: "qa-bot", disposition: "FAIL" }],
+      ["no reviewer", { disposition: "FAIL", ref: "_cos/QA_DIGEST.md" }],
+      ["note not text", { ...fail, note: { why: "x" } }],
+      ["extra field", { ...fail, phase: "running" }],
+    ] as const) {
+      const res = await qa(body);
+      expect(res.status, label).toBe(400);
+      expect(res.body.error.code, label).toBe("invalid");
+    }
+    expect((await qa({ ...fail, phase: "running" })).body.error.message).toBe("unsupported fields: phase");
+    const textPlain = await qa(JSON.stringify(fail), { "content-type": "text/plain" });
+    expect(textPlain.status).toBe(400);
+    expect(textPlain.body.error.message).toBe("Content-Type must be application/json");
+    expect((await json(base, "POST", "/factory/lanes/nope-t1755u/qa", fail)).status).toBe(404);
+    expect(getLane(lane.id)).toEqual(before);
+
+    const recorded = await qa(fail);
+    expect(recorded.status).toBe(200);
+    expect(recorded.body.lane).toMatchObject({ id: lane.id, phase: "qa_wait", qaDisposition: "FAIL", reviewerBotId: "qa-bot" });
+    expect(recorded.body.lane.evidence.at(-1)).toMatchObject({ kind: "qa", ref: "_cos/QA_DIGEST.md", note: "FAIL by qa-bot — missing test" });
+    expect(getLane(lane.id)?.qaDisposition).toBe("FAIL");
+
+    // The handoff cannot credit another reviewer with that FAIL.
+    const swap = await move({ phase: "running", reviewerBotId: "qa-bot-2" });
+    expect(swap.status).toBe(403);
+    expect(swap.body.error.code).toBe("ineligible");
+    expect(getLane(lane.id)?.phase).toBe("qa_wait");
+
+    const rework = await move({ phase: "running", nextAction: "fix the QA findings" });
+    expect(rework.status).toBe(200);
+    expect(rework.body.lane).toMatchObject({ phase: "running", reviewerBotId: "qa-bot", nextAction: "fix the QA findings" });
+    expect(rework.body.lane.evidence.slice(-2)).toEqual([
+      expect.objectContaining({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: "QA FAIL by qa-bot handed the lane back for rework" }),
+      expect.objectContaining({ kind: "phase", ref: "qa_wait->running" }),
+    ]);
+    expect(readFileSync(join(DATA_DIR, "bridge.log"), "utf8")).not.toContain(TOKEN);
+  });
+
+  it("t1755u F1 QA route fails closed without a protect SoT, and a PASS through it lets the lane finish", async () => {
+    const lane = heldByQa("t1755u-qa-pass");
+    const before = getLane(lane.id);
+    const pass = { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" };
+    const qa = () => json(base, "POST", `/factory/lanes/${lane.id}/qa`, pass);
+
+    delete process.env.COS_FACTORY_PROTECT_DIR;
+    const unset = await qa();
+    const missing = join(DATA_DIR, "protect-t1755u-missing");
+    mkdirSync(missing, { recursive: true });
+    process.env.COS_FACTORY_PROTECT_DIR = missing;
+    const unreadable = await qa();
+    process.env.COS_FACTORY_PROTECT_DIR = FIXTURE;
+    for (const res of [unset, unreadable]) {
+      expect(res.status).toBe(403);
+      expect(res.body.error).toEqual({ code: "ineligible", message: "protect SoT unavailable, failing closed" });
+    }
+    expect(getLane(lane.id)).toEqual(before);
+
+    const recorded = await qa();
+    expect(recorded.status).toBe(200);
+    expect(recorded.body.lane).toMatchObject({ phase: "qa_wait", qaDisposition: "PASS" });
+    const back = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "running" });
+    expect(back.status).toBe(403);
+    expect(back.body.error.message).toMatch(/\(QA PASS\); running needs QA FAIL$/);
+    const done = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "done", outcome: "KEEP_DRAFT" });
+    expect(done.status).toBe(200);
+    expect(done.body.lane).toMatchObject({ phase: "done", qaDisposition: "PASS", outcome: "KEEP_DRAFT" });
+  });
+
   it("rejects bad Origin for non-health requests", async () => {
     const res = await json(base, "GET", "/factory/lanes", undefined, { origin: "https://evil.example" });
     expect(res.status).toBe(400);

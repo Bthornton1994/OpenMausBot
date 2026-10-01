@@ -201,7 +201,7 @@ describe("protect gate: QA is not implementation", () => {
     expectLaneError(() => transition(held.id, "running"), "ineligible", /held by QA in qa_wait \(no QA verdict recorded\); running needs QA FAIL/);
     recordQaDisposition(held.id, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
     expectLaneError(() => transition(held.id, "running"), "ineligible", /\(QA PASS\); running needs QA FAIL/);
-    expect(getLane(held.id)!.evidence).toEqual([...before.evidence, expect.objectContaining({ kind: "qa", note: "PASS" })]);
+    expect(getLane(held.id)!.evidence).toEqual([...before.evidence, expect.objectContaining({ kind: "qa", note: "PASS by qa-bot" })]);
 
     // Meanwhile the manager loop still dispatches disjoint work.
     const next = upsertLane(laneInput("next"));

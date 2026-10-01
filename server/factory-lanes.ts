@@ -413,12 +413,18 @@ const qaHeld = (lane: FactoryLane): string =>
   `lane ${lane.id} is held by QA in qa_wait (${lane.qaDisposition ? `QA ${lane.qaDisposition}` : "no QA verdict recorded"})`;
 
 /** Refuse a change that would take a lane out of its QA hold without a verdict
- * that allows the move, or that would change the tip QA is judging. Lanes
- * outside qa_wait are not held. */
+ * that allows the move, or that would change the tip QA is judging or the
+ * reviewer judging it. Lanes outside qa_wait are not held. */
 function assertQaHold(lane: FactoryLane, phase: FactoryLanePhase, patch: FactoryLanePatch): void {
   if (lane.phase !== "qa_wait") return;
   if (patch.fullSha !== undefined && patch.fullSha.toLowerCase() !== lane.fullSha) {
     throw new FactoryLaneError("ineligible", `${qaHeld(lane)}; its tip is frozen — fullSha is set on entering qa_wait, not while there`);
+  }
+  // t1755u: the assigned reviewer is frozen too, so only the reviewer who held
+  // the lane can release it. A held lane with no reviewer may still be given
+  // one: without one, no verdict — and so no exit — is possible.
+  if (patch.reviewerBotId !== undefined && lane.reviewerBotId !== undefined && patch.reviewerBotId !== lane.reviewerBotId) {
+    throw new FactoryLaneError("ineligible", `${qaHeld(lane)}; its reviewer ${lane.reviewerBotId} is frozen until it leaves qa_wait`);
   }
   if (phase === "qa_wait") return;
   const allowing = QA_HOLD_EXITS[phase];
@@ -628,13 +634,17 @@ export function transition(
       if (conflict) throw new FactoryLaneError("conflict", `lane ${conflict.lane.id} already holds ${conflict.why}`);
       lane.claimedAt = now;
     }
+    // Read before the patch (t1755u): the FAIL came from the reviewer holding
+    // the lane — recordQaDisposition takes no one else's — never from one this
+    // transition assigns.
+    const heldBy = lane.reviewerBotId;
     applyPatch(lane, patch);
     if (allowed) pushGateEvidence(lane, allowed, now);
     const from = lane.phase;
     if (from === "qa_wait" && (phase === "running" || phase === "ready")) {
       // assertQaHold let this through on a recorded FAIL: the rework handoff.
       const verdict = lane.evidence.findLast((entry) => entry.kind === "qa");
-      const by = lane.reviewerBotId || "its reviewer";
+      const by = heldBy || "its reviewer";
       pushEvidence(lane, { kind: "rework", ref: verdict?.ref ?? "qa", note: `QA FAIL by ${by} handed the lane back for rework` }, now);
     }
     lane.phase = phase;
@@ -722,8 +732,9 @@ export function releaseOwnership(laneId: string): FactoryLane {
 }
 
 /** Independent QA verdict. Only the lane's assigned reviewer — never its
- * owner — can record one. A verdict recorded while the lane is in qa_wait
- * decides how it may leave (see QA_HOLD_EXITS); FAIL is the rework handoff. */
+ * owner — can record one, and its `qa` evidence names them. A verdict
+ * recorded while the lane is in qa_wait decides how it may leave (see
+ * QA_HOLD_EXITS); FAIL is the rework handoff. */
 export function recordQaDisposition(
   id: string,
   input: { reviewerBotId: string; disposition: QaDisposition; ref: string; note?: string },
@@ -737,7 +748,8 @@ export function recordQaDisposition(
     }
     const now = Date.now();
     lane.qaDisposition = input.disposition;
-    pushEvidence(lane, { kind: "qa", ref: input.ref, note: `${input.disposition}${input.note ? ` — ${input.note}` : ""}` }, now);
+    const note = `${input.disposition} by ${input.reviewerBotId}${input.note ? ` — ${input.note}` : ""}`;
+    pushEvidence(lane, { kind: "qa", ref: input.ref, note }, now);
     lane.updatedAt = now;
     return structuredClone(lane);
   });
