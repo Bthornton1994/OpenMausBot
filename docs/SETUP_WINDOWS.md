@@ -26,7 +26,8 @@ Names only. Secret values never belong in this file.
 | Name | Purpose |
 | --- | --- |
 | `FACTORY_BRIDGE_TOKEN` | Bearer secret. Without it, every route except `/health` returns 401. |
-| `COS_FACTORY_PROTECT_DIR` | Protect-gate directory, e.g. `C:\Users\Bthor\src\omb-factory-pilot\_cos\protect`. If it is unset, mutating operations fail closed. |
+| `COS_FACTORY_PROTECT_DIR` | Protect-gate directory, e.g. `C:\Users\Bthor\src\omb-factory-pilot\_cos\protect`. Takes precedence over `COS_FACTORY_ROOT`. If neither is set, mutating operations fail closed. |
+| `COS_FACTORY_ROOT` | Alternative to `COS_FACTORY_PROTECT_DIR`: the bridge uses its `protect` subdirectory, e.g. `C:\Users\Bthor\src\omb-factory-pilot\_cos` → `...\_cos\protect`. |
 | `OMB_DATA_DIR` | Data store. Defaults to `~/.openmausbot`; use an isolated directory for testing. |
 | `FACTORY_BRIDGE_PORT` | `8798` |
 | `FACTORY_BRIDGE_LOG` | Path to the access log file. |
@@ -78,25 +79,34 @@ Run this from the worktree root:
 node --experimental-strip-types scripts\factory-bridge.ts
 ```
 
-At startup the bridge prints `protectDir`, `dataDir`, and
-`auth=configured|MISSING`. It never prints the token.
+At startup the bridge prints which variable configured each setting, never the
+path or the token:
 
-## Grok Shell / curl examples
+```text
+protectDir=configured (COS_FACTORY_PROTECT_DIR) | configured (COS_FACTORY_ROOT) | unset — mutating ops fail closed
+dataDir=configured (OMB_DATA_DIR) | default (~/.openmausbot)
+auth=configured | MISSING — non-health requests return 401
+```
+
+## Grok Shell / PowerShell examples
 
 The token always comes from the env var. Never type it literally.
 
-cmd:
-
-```bat
-curl http://127.0.0.1:8798/health
-curl -H "Authorization: Bearer %FACTORY_BRIDGE_TOKEN%" http://127.0.0.1:8798/factory/lanes
-```
-
-PowerShell (use `curl.exe`, not the `curl` alias):
+Use **PowerShell** `Invoke-RestMethod` (or `Invoke-WebRequest`). It builds the
+Authorization header inside the PowerShell process, so the token never becomes
+a command-line argument of another program:
 
 ```powershell
-curl.exe -H "Authorization: Bearer $env:FACTORY_BRIDGE_TOKEN" http://127.0.0.1:8798/factory/lanes
+Invoke-RestMethod http://127.0.0.1:8798/health
+Invoke-RestMethod http://127.0.0.1:8798/factory/lanes `
+  -Headers @{ Authorization = "Bearer $env:FACTORY_BRIDGE_TOKEN" }
 ```
 
-Don't run curl with `-v` or `--trace`, and don't save its output anywhere that
-shows request headers, because the Authorization header would be printed.
+Avoid `curl` / `curl.exe` with an Authorization header. In both cmd
+(`%FACTORY_BRIDGE_TOKEN%`) and PowerShell (`$env:FACTORY_BRIDGE_TOKEN`), the
+shell expands the token into curl's process arguments, where other processes can
+read it from the process list. `/health` needs no token, so
+`curl http://127.0.0.1:8798/health` is fine.
+
+Don't use `-Verbose` or transcripts (`Start-Transcript`) with authorized
+requests, and don't save output anywhere that shows request headers.

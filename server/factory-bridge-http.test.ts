@@ -10,6 +10,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DATA_DIR } from "./config.ts";
 import {
   clientErrorMessage,
+  formatDataDirStatus,
+  formatProtectDirStatus,
   listenFactoryBridge,
   FACTORY_BRIDGE_BODY_DRAIN_MS,
   FACTORY_BRIDGE_BODY_TIMEOUT_MS,
@@ -642,5 +644,31 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     });
     expect(moved.status).toBe(200);
     expect(moved.body.lane.changedFiles).toEqual(["src/c.ts"]);
+  });
+});
+
+describe("factory bridge startup status (t1750u F7)", () => {
+  const PATH = "C:\\secret\\place";
+
+  it("reports protectDir from COS_FACTORY_PROTECT_DIR, COS_FACTORY_ROOT, or unset — never the path", () => {
+    const direct = formatProtectDirStatus({ COS_FACTORY_PROTECT_DIR: PATH, COS_FACTORY_ROOT: "C:\\root" });
+    expect(direct).toBe("configured (COS_FACTORY_PROTECT_DIR)");
+    const root = formatProtectDirStatus({ COS_FACTORY_ROOT: PATH });
+    expect(root).toBe("configured (COS_FACTORY_ROOT)");
+    expect(formatProtectDirStatus({ COS_FACTORY_PROTECT_DIR: "  ", COS_FACTORY_ROOT: PATH })).toBe(
+      "configured (COS_FACTORY_ROOT)",
+    );
+    expect(formatProtectDirStatus({})).toBe("unset — mutating ops fail closed");
+    expect(formatProtectDirStatus({ COS_FACTORY_PROTECT_DIR: " ", COS_FACTORY_ROOT: "" })).toBe(
+      "unset — mutating ops fail closed",
+    );
+    for (const s of [direct, root]) expect(s).not.toContain("secret");
+  });
+
+  it("reports dataDir as configured or default without the path", () => {
+    const configured = formatDataDirStatus({ OMB_DATA_DIR: PATH });
+    expect(configured).toBe("configured (OMB_DATA_DIR)");
+    expect(configured).not.toContain("secret");
+    expect(formatDataDirStatus({})).toBe("default (~/.openmausbot)");
   });
 });

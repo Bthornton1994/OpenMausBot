@@ -124,6 +124,20 @@ function requireAuth(req: IncomingMessage, configured: string | null): void {
   }
 }
 
+/** F7/t1750u: startup status for the protect dir. Names the env var that set
+ * it, never the path. Mirrors resolveProtectDir precedence. */
+export function formatProtectDirStatus(env: NodeJS.ProcessEnv = process.env): string {
+  if (!resolveProtectDir(undefined, env)) return "unset — mutating ops fail closed";
+  return env.COS_FACTORY_PROTECT_DIR?.trim()
+    ? "configured (COS_FACTORY_PROTECT_DIR)"
+    : "configured (COS_FACTORY_ROOT)";
+}
+
+/** F7/t1750u: startup status for the data dir, never the path. Mirrors DATA_DIR's `??`. */
+export function formatDataDirStatus(env: NodeJS.ProcessEnv = process.env): string {
+  return env.OMB_DATA_DIR !== undefined ? "configured (OMB_DATA_DIR)" : "default (~/.openmausbot)";
+}
+
 /** Server-config protect dir only — never from the request body. */
 export function serverProtectDir(): string {
   const dir = resolveProtectDir(undefined, process.env);
