@@ -2,12 +2,19 @@
  * Focused factory bridge HTTP tests (t1742u + t1743u harden).
  */
 import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { connect, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import { clientErrorMessage, listenFactoryBridge, FACTORY_BRIDGE_MAX_BODY_BYTES } from "./factory-bridge-http.ts";
+import {
+  clientErrorMessage,
+  listenFactoryBridge,
+  FACTORY_BRIDGE_BODY_DRAIN_MS,
+  FACTORY_BRIDGE_BODY_TIMEOUT_MS,
+  FACTORY_BRIDGE_MAX_BODY_BYTES,
+} from "./factory-bridge-http.ts";
 import {
   FactoryLaneError,
   listLanes,
@@ -58,6 +65,45 @@ async function json(
     parsed = { raw: text };
   }
   return { status: res.status, body: parsed };
+}
+
+/**
+ * Raw socket POST that keeps streaming (or stalls) per `drive`. Resolves with
+ * the response text once the server closes the connection.
+ */
+function rawPost(
+  base: string,
+  contentLength: number,
+  drive: (socket: Socket) => () => void,
+): Promise<{ response: string; closedAfterMs: number }> {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const socket = connect(Number(port), hostname);
+    let response = "";
+    let stop: () => void = () => {};
+    socket.setEncoding("utf8");
+    socket.on("data", (d) => (response += d));
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      stop();
+      resolve({ response, closedAfterMs: Date.now() - started });
+    });
+    socket.on("connect", () => {
+      socket.write(
+        [
+          "POST /factory/claim HTTP/1.1",
+          `Host: ${hostname}:${port}`,
+          `Authorization: Bearer ${TOKEN}`,
+          "Content-Type: application/json",
+          `Content-Length: ${contentLength}`,
+          "",
+          "",
+        ].join("\r\n"),
+      );
+      stop = drive(socket);
+    });
+  });
 }
 
 describe("factory bridge HTTP (t1742u/t1743u)", () => {
@@ -177,6 +223,49 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     });
     expect(wrongType.status).toBe(400);
   });
+
+  it("F6 exports body timeout and drain constants", () => {
+    expect(FACTORY_BRIDGE_BODY_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(FACTORY_BRIDGE_BODY_DRAIN_MS).toBeGreaterThan(0);
+    expect(FACTORY_BRIDGE_BODY_DRAIN_MS).toBeLessThan(FACTORY_BRIDGE_BODY_TIMEOUT_MS);
+  });
+
+  it("F6 oversize body gets 400 then the socket is cut while the client keeps streaming", async () => {
+    const chunk = "x".repeat(8 * 1024);
+    const { response, closedAfterMs } = await rawPost(base, 100 * 1024 * 1024, (socket) => {
+      socket.write("x".repeat(FACTORY_BRIDGE_MAX_BODY_BYTES + 10));
+      const interval = setInterval(() => {
+        if (!socket.destroyed) socket.write(chunk);
+      }, 50);
+      return () => clearInterval(interval);
+    });
+    expect(response).toMatch(/^HTTP\/1\.1 400/);
+    expect(response).toMatch(/request body exceeds/);
+    expect(closedAfterMs).toBeLessThan(FACTORY_BRIDGE_BODY_DRAIN_MS + 3000);
+  }, 10_000);
+
+  it("F6 stalled body read times out with 400 and the socket is cut", async () => {
+    const { server } = await listenFactoryBridge({
+      port: 0,
+      accessLogPath: join(DATA_DIR, "bridge.log"),
+      token: TOKEN,
+      bodyTimeoutMs: 200,
+      bodyDrainMs: 200,
+    });
+    try {
+      const addr = server.address();
+      if (!addr || typeof addr === "string") throw new Error("expected TCP address");
+      const { response, closedAfterMs } = await rawPost(`http://127.0.0.1:${addr.port}`, 100, (socket) => {
+        socket.write('{"partial":');
+        return () => {};
+      });
+      expect(response).toMatch(/^HTTP\/1\.1 400/);
+      expect(response).toMatch(/request body read timed out/);
+      expect(closedAfterMs).toBeLessThan(3000);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 10_000);
 
   it("F3 requires application/json Content-Type on writes", async () => {
     // A Uint8Array body makes fetch send no Content-Type header at all.

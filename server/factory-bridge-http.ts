@@ -33,6 +33,10 @@ import { loadProtectSoT, resolveProtectDir } from "./factory-protect-gate.ts";
 export const FACTORY_BRIDGE_HOST = "127.0.0.1";
 export const FACTORY_BRIDGE_DEFAULT_PORT = 8798;
 export const FACTORY_BRIDGE_MAX_BODY_BYTES = 64 * 1024;
+/** F6/t1749u: whole-body read deadline; a slow client cannot hold a read open. */
+export const FACTORY_BRIDGE_BODY_TIMEOUT_MS = 10_000;
+/** F6/t1749u: after a rejected body, drain this long so the 400 can flush, then cut the socket. */
+export const FACTORY_BRIDGE_BODY_DRAIN_MS = 1_000;
 export const FACTORY_BRIDGE_TOKEN_ENV = "FACTORY_BRIDGE_TOKEN";
 
 export type FactoryBridgeLog = (line: string) => void;
@@ -44,6 +48,15 @@ export interface FactoryBridgeOptions {
   log?: FactoryBridgeLog;
   /** Test-only token override (never log). Production uses FACTORY_BRIDGE_TOKEN. */
   token?: string;
+  /** Test-only override of FACTORY_BRIDGE_BODY_TIMEOUT_MS. */
+  bodyTimeoutMs?: number;
+  /** Test-only override of FACTORY_BRIDGE_BODY_DRAIN_MS. */
+  bodyDrainMs?: number;
+}
+
+interface BodyLimits {
+  timeoutMs?: number;
+  drainMs?: number;
 }
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -127,35 +140,68 @@ export function serverProtectDir(): string {
   return dir;
 }
 
-function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
+function readBody(req: IncomingMessage, maxBytes: number, limits: BodyLimits = {}): Promise<string> {
+  const timeoutMs = limits.timeoutMs ?? FACTORY_BRIDGE_BODY_TIMEOUT_MS;
+  const drainMs = limits.drainMs ?? FACTORY_BRIDGE_BODY_DRAIN_MS;
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let settled = false;
+    const timer = setTimeout(() => abort(new FactoryLaneError("invalid", "request body read timed out")), timeoutMs);
+    timer.unref();
+
+    // F6/t1749u: never destroy synchronously — the handler must get to send
+    // the 400 (t1743u). Drain for a short window, then cut the socket so a
+    // slow client cannot hold it open.
+    function abort(error: Error): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chunks.length = 0;
+      reject(error);
+      req.resume();
+      const cutoff = setTimeout(() => req.destroy(), drainMs);
+      cutoff.unref();
+      req.once("close", () => clearTimeout(cutoff));
+    }
+
     req.on("data", (c) => {
+      if (settled) return;
       const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
       size += buf.length;
       if (size > maxBytes) {
-        // Do not destroy before the handler can send 400; stop buffering.
-        chunks.length = 0;
-        reject(new FactoryLaneError("invalid", `request body exceeds ${maxBytes} bytes`));
-        req.resume();
+        abort(new FactoryLaneError("invalid", `request body exceeds ${maxBytes} bytes`));
         return;
       }
       chunks.push(buf);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chunks.length = 0;
+      reject(error);
+    });
   });
 }
 
-async function readJsonObject(req: IncomingMessage, { allowEmpty = false } = {}): Promise<Record<string, unknown>> {
+async function readJsonObject(
+  req: IncomingMessage,
+  { allowEmpty = false, limits = {} as BodyLimits } = {},
+): Promise<Record<string, unknown>> {
   // F3/t1746u: a missing Content-Type is rejected too, so a simple
   // cross-origin request cannot reach a mutating route.
   const type = String(req.headers["content-type"] ?? "");
   if (!/^application\/json\b/i.test(type)) {
     throw new FactoryLaneError("invalid", "Content-Type must be application/json");
   }
-  const raw = await readBody(req, FACTORY_BRIDGE_MAX_BODY_BYTES);
+  const raw = await readBody(req, FACTORY_BRIDGE_MAX_BODY_BYTES, limits);
   if (!raw.trim()) {
     if (allowEmpty) return {};
     throw new FactoryLaneError("invalid", "request body must be JSON object");
@@ -238,8 +284,9 @@ const TRANSITION_KEYS = ["phase", "fullSha", "reviewerBotId", "outcome", "nextAc
 export async function handleFactoryBridgeRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  options: { log?: FactoryBridgeLog; token?: string } = {},
+  options: { log?: FactoryBridgeLog; token?: string; bodyTimeoutMs?: number; bodyDrainMs?: number } = {},
 ): Promise<void> {
+  const limits: BodyLimits = { timeoutMs: options.bodyTimeoutMs, drainMs: options.bodyDrainMs };
   const log = options.log ?? ((line: string) => process.stderr.write(`[factory-bridge] ${line}\n`));
   const method = (req.method ?? "GET").toUpperCase();
   const url = new URL(req.url ?? "/", `http://${FACTORY_BRIDGE_HOST}`);
@@ -291,7 +338,7 @@ export async function handleFactoryBridgeRequest(
 
     const wait = path.match(/^\/factory\/lanes\/([^/]+)\/wait$/);
     if (method === "POST" && wait) {
-      const body = await readJsonObject(req, { allowEmpty: true });
+      const body = await readJsonObject(req, { allowEmpty: true, limits });
       assertOnlyKeys(body, WAIT_KEYS);
       const timeoutMs = typeof body.timeoutMs === "number" ? body.timeoutMs : 1_000;
       const pollMs = typeof body.pollMs === "number" ? body.pollMs : 50;
@@ -311,7 +358,7 @@ export async function handleFactoryBridgeRequest(
     const transit = path.match(/^\/factory\/lanes\/([^/]+)\/transition$/);
     if (method === "POST" && transit) {
       const protectDir = serverProtectDir();
-      const body = await readJsonObject(req);
+      const body = await readJsonObject(req, { limits });
       assertOnlyKeys(body, TRANSITION_KEYS);
       const phase = str(body.phase);
       if (!phase || !(FACTORY_LANE_PHASES as readonly string[]).includes(phase)) {
@@ -334,7 +381,7 @@ export async function handleFactoryBridgeRequest(
 
     if (method === "POST" && path === "/factory/claim") {
       const protectDir = serverProtectDir();
-      const body = await readJsonObject(req, { allowEmpty: true });
+      const body = await readJsonObject(req, { allowEmpty: true, limits });
       assertOnlyKeys(body, CLAIM_KEYS);
       const pathClaims = parseStringList(body.pathClaims, "pathClaims");
       if (str(body.laneId) && str(body.ownerBotId) && str(body.repo) && str(body.branch) && str(body.worktreePath)) {
@@ -365,7 +412,7 @@ export async function handleFactoryBridgeRequest(
 
     if (method === "POST" && path === "/factory/lanes") {
       serverProtectDir();
-      const body = await readJsonObject(req);
+      const body = await readJsonObject(req, { limits });
       assertOnlyKeys(body, REGISTER_KEYS);
       const pathClaims = parseStringList(body.pathClaims, "pathClaims");
       const input: FactoryLaneInput = {
@@ -428,9 +475,9 @@ export function createFactoryBridgeServer(options: FactoryBridgeOptions = {}): S
     throw new Error(`factory bridge refuses non-loopback host ${host}`);
   }
   const log = options.log ?? defaultLog(options.accessLogPath);
-  const token = options.token;
+  const { token, bodyTimeoutMs, bodyDrainMs } = options;
   return createServer((req, res) => {
-    void handleFactoryBridgeRequest(req, res, { log, token });
+    void handleFactoryBridgeRequest(req, res, { log, token, bodyTimeoutMs, bodyDrainMs });
   });
 }
 
