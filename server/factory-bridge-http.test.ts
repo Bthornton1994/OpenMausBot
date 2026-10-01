@@ -1,7 +1,5 @@
 /**
- * Focused factory bridge HTTP tests (t1742u).
- * Covers: frozen tips, protected sessions, duplicate claims, invalid input,
- * restart recovery (reload), unauthorized ops. Loopback only.
+ * Focused factory bridge HTTP tests (t1742u + t1743u harden).
  */
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -9,18 +7,20 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import { listenFactoryBridge } from "./factory-bridge-http.ts";
+import { listenFactoryBridge, FACTORY_BRIDGE_MAX_BODY_BYTES } from "./factory-bridge-http.ts";
 import {
   listLanes,
   transition,
   upsertLane,
   _resetFactoryLanes,
+  getLane,
 } from "./factory-lanes.ts";
 
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "t1734u-protect");
 const VA = { repo: "Bthornton1994/Virtual-Assistant", branch: "cos/rr-d1d4-operator-only-19d4f99e" };
 const VA_TIP = "ca813c0dd29e5c38063efa571d809b0dbd5a4bfb";
 const SHA = "c".repeat(40);
+const TOKEN = "t1743u-test-token-not-a-secret-for-prod";
 
 function laneInput(suffix: string, overrides: Partial<Parameters<typeof upsertLane>[0]> = {}) {
   return {
@@ -38,11 +38,16 @@ async function json(
   method: string,
   path: string,
   body?: unknown,
+  headers: Record<string, string> = {},
 ): Promise<{ status: number; body: any }> {
   const res = await fetch(`${base}${path}`, {
     method,
-    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    headers: {
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      authorization: `Bearer ${TOKEN}`,
+      ...headers,
+    },
+    body: body !== undefined ? (typeof body === "string" ? body : JSON.stringify(body)) : undefined,
   });
   const text = await res.text();
   let parsed: any = null;
@@ -54,7 +59,7 @@ async function json(
   return { status: res.status, body: parsed };
 }
 
-describe("factory bridge HTTP (t1742u)", () => {
+describe("factory bridge HTTP (t1742u/t1743u)", () => {
   let base = "";
   let close: () => Promise<void> = async () => {};
 
@@ -67,23 +72,23 @@ describe("factory bridge HTTP (t1742u)", () => {
     }
     _resetFactoryLanes();
     process.env.COS_FACTORY_PROTECT_DIR = FIXTURE;
+    process.env.FACTORY_BRIDGE_TOKEN = TOKEN;
     const { server, url } = await listenFactoryBridge({
-      port: 0 as unknown as number, // overridden below via listen(0)
+      port: 0,
       accessLogPath: join(DATA_DIR, "bridge.log"),
+      token: TOKEN,
     });
-    // listenFactoryBridge with port 0: our impl uses Number â€” fix by re-listen pattern
-    // Actually createServer listen(0) â€” update: we passed port 0 which is fine for ephemeral.
     const addr = server.address();
     if (!addr || typeof addr === "string") throw new Error("expected TCP address");
     base = `http://127.0.0.1:${addr.port}`;
-    close = () =>
-      new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    close = () => new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
     void url;
   });
 
   afterEach(async () => {
     await close();
     delete process.env.COS_FACTORY_PROTECT_DIR;
+    delete process.env.FACTORY_BRIDGE_TOKEN;
     _resetFactoryLanes();
   });
 
@@ -100,6 +105,103 @@ describe("factory bridge HTTP (t1742u)", () => {
     const merge = await json(base, "POST", "/factory/merge", { pr: 1 });
     expect(merge.status).toBe(404);
     expect(merge.body.error.code).toBe("unauthorized_op");
+  });
+
+  it("health is unauthenticated; other routes require auth with no state change", async () => {
+    upsertLane(laneInput("seed", { fullSha: SHA }));
+    const before = listLanes().length;
+    const health = await fetch(`${base}/health`);
+    expect(health.status).toBe(200);
+
+    const noAuth = await fetch(`${base}/factory/lanes`);
+    expect(noAuth.status).toBe(401);
+    const bad = await json(base, "POST", "/factory/claim", {}, { authorization: "Bearer wrong-token" });
+    expect(bad.status).toBe(401);
+    expect(listLanes().length).toBe(before);
+    expect(listLanes().every((l) => l.phase === "ready")).toBe(true);
+  });
+
+  it("cannot override protectDir via request; bad SoT denies mutating ops", async () => {
+    const ready = upsertLane(laneInput("ready", { fullSha: SHA }));
+    const attempt = await json(base, "POST", "/factory/claim", {
+      laneId: ready.id,
+      ownerBotId: ready.ownerBotId,
+      repo: ready.repo,
+      branch: ready.branch,
+      worktreePath: ready.worktreePath,
+      protectDir: "C:\\evil\\protect",
+    });
+    expect(attempt.status).toBe(400);
+    expect(attempt.body.error.message).toMatch(/unsupported fields: protectDir/);
+    expect(getLane(ready.id)?.phase).toBe("ready");
+    expect(getLane(ready.id)?.claimedAt).toBeUndefined();
+
+    delete process.env.COS_FACTORY_PROTECT_DIR;
+    const denied = await json(base, "POST", "/factory/claim", {});
+    expect(denied.status).toBe(403);
+    expect(denied.body.error.code).toBe("ineligible");
+    expect(denied.body.error.message).toMatch(/failing closed/);
+    process.env.COS_FACTORY_PROTECT_DIR = FIXTURE;
+
+    const missing = join(DATA_DIR, "protect-missing");
+    mkdirSync(missing, { recursive: true });
+    process.env.COS_FACTORY_PROTECT_DIR = missing;
+    const badSot = await json(base, "POST", "/factory/lanes", {
+      title: "x",
+      ownerBotId: "o",
+      repo: "r/r",
+      branch: "b",
+      worktreePath: "C:\\w",
+    });
+    expect(badSot.status).toBe(403);
+    expect(badSot.body.error.message).toMatch(/failing closed/);
+    process.env.COS_FACTORY_PROTECT_DIR = FIXTURE;
+  });
+
+  it("rejects oversized, non-JSON, and malformed bodies", async () => {
+    const huge = await json(base, "POST", "/factory/claim", "x".repeat(FACTORY_BRIDGE_MAX_BODY_BYTES + 10));
+    expect(huge.status).toBe(400);
+
+    const badJson = await fetch(`${base}/factory/claim`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+      body: "{not-json",
+    });
+    expect(badJson.status).toBe(400);
+
+    const wrongType = await fetch(`${base}/factory/claim`, {
+      method: "POST",
+      headers: { "content-type": "text/plain", authorization: `Bearer ${TOKEN}` },
+      body: "{}",
+    });
+    expect(wrongType.status).toBe(400);
+  });
+
+  it("register cannot spoof phase, fullSha, or agentSession", async () => {
+    const spoof = await json(base, "POST", "/factory/lanes", {
+      title: "spoof",
+      ownerBotId: "impl",
+      repo: "acme/widgets",
+      branch: "feature/spoof",
+      worktreePath: "C:\\work\\spoof",
+      phase: "done",
+      fullSha: SHA,
+      agentSession: "session_evil",
+    });
+    expect(spoof.status).toBe(400);
+    expect(spoof.body.error.message).toMatch(/unsupported fields/);
+
+    const ok = await json(base, "POST", "/factory/lanes", {
+      title: "ok",
+      ownerBotId: "impl-ok",
+      repo: "acme/widgets",
+      branch: "feature/ok",
+      worktreePath: "C:\\work\\ok",
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.body.lane.phase).toBe("ready");
+    expect(ok.body.lane.fullSha).toBeUndefined();
+    expect(ok.body.lane.agentSession).toBeUndefined();
   });
 
   it("blocks frozen tip and protected session claims", async () => {
@@ -157,29 +259,28 @@ describe("factory bridge HTTP (t1742u)", () => {
     expect(dup.status).toBe(409);
     expect(dup.body.error.code).toBe("conflict");
 
-    transition(ready.id, "ci_wait");
+    const moved = await json(base, "POST", `/factory/lanes/${ready.id}/transition`, {
+      phase: "ci_wait",
+      fullSha: SHA,
+    });
+    expect(moved.status).toBe(200);
+    expect(moved.body.lane.phase).toBe("ci_wait");
+
     const waited = await json(base, "POST", `/factory/lanes/${ready.id}/wait`, { timeoutMs: 100, pollMs: 20 });
     expect(waited.status).toBe(200);
     expect(waited.body.report.phase).toBe("ci_wait");
     expect(waited.body.report.finished).toBe(false);
 
-    transition(ready.id, "done", { outcome: "KEEP_DRAFT" });
+    await json(base, "POST", `/factory/lanes/${ready.id}/transition`, { phase: "done", outcome: "KEEP_DRAFT" });
     const report = await json(base, "GET", `/factory/lanes/${ready.id}/report`);
     expect(report.status).toBe(200);
     expect(report.body.report).toMatchObject({ id: ready.id, phase: "done", finished: true, outcome: "KEEP_DRAFT" });
   });
 
-  it("rejects invalid task input", async () => {
+  it("rejects invalid registration input", async () => {
     const bad = await json(base, "POST", "/factory/lanes", { title: "x" });
     expect(bad.status).toBe(400);
     expect(bad.body.error.code).toBe("invalid");
-
-    const badJson = await fetch(`${base}/factory/claim`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: "{not-json",
-    });
-    expect(badJson.status).toBe(400);
   });
 
   it("recovers lane state after cache reset (restart)", async () => {
@@ -208,5 +309,11 @@ describe("factory bridge HTTP (t1742u)", () => {
     });
     expect(waited.status).toBe(200);
     expect(waited.body.report.finished).toBe(true);
+  });
+
+  it("rejects bad Origin for non-health requests", async () => {
+    const res = await json(base, "GET", "/factory/lanes", undefined, { origin: "https://evil.example" });
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/Origin/);
   });
 });
