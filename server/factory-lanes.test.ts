@@ -427,7 +427,8 @@ describe("factory lanes: verdicts need a real reviewer (t1756u)", () => {
       storedHeld("blank", { ...pass, reviewerBotId: "" }),
       storedHeld("spaces", { ...pass, reviewerBotId: "   " }),
       storedHeld("self", { ...pass, reviewerBotId: "implementer-self" }),
-      storedHeld("valid", { ...pass, reviewerBotId: "qa-bot" }),
+      // With the qa note its reviewer leaves (t1757u R-1: without one it is dropped too).
+      storedHeld("valid", { ...pass, reviewerBotId: "qa-bot", evidence: [{ at: Date.now(), kind: "qa", ref: "_cos/QA_DIGEST.md", note: "PASS by qa-bot" }] }),
       storedHeld("finished", { ...pass, phase: "done" }),
     );
     expect(listLanes().map(({ id, reviewerBotId, qaDisposition }) => ({ id, reviewerBotId, qaDisposition }))).toEqual([
@@ -497,6 +498,103 @@ describe("factory lanes: verdicts need a real reviewer (t1756u)", () => {
     expect(rework.evidence.at(-2)).toMatchObject({ kind: "rework", note: "QA FAIL by qa-bot handed the lane back for rework" });
     // Outside the hold, a blank clears the reviewer, as loading would.
     expect(transition(lane.id, "running", { reviewerBotId: "" }).reviewerBotId).toBeUndefined();
+  });
+});
+
+describe("factory lanes: a held verdict needs its reviewer's qa note from the hold (t1757u R-1)", () => {
+  const qaEntry = (note: string, ref = "_cos/QA_DIGEST.md") => ({ at: Date.now(), kind: "qa", ref, note });
+  const phaseEntry = (ref: string) => ({ at: Date.now(), kind: "phase", ref });
+
+  it("drops a stored PASS its valid reviewer has no matching qa note for, so the lane cannot finish on it", () => {
+    const pass = { reviewerBotId: "qa-bot", qaDisposition: "PASS" };
+    const ids = ["none", "older-tool", "bare", "other-verdict", "other-reviewer"];
+    store(
+      storedHeld("none", pass),
+      storedHeld("older-tool", { ...pass, evidence: [qaEntry("PASS — looks good")] }),
+      storedHeld("bare", { ...pass, evidence: [qaEntry("PASS")] }),
+      storedHeld("other-verdict", { ...pass, evidence: [qaEntry("FAIL by qa-bot")] }),
+      // qa-bot is a prefix of qa-bot-2, not the same reviewer.
+      storedHeld("other-reviewer", { ...pass, evidence: [qaEntry("PASS by qa-bot-2 — looks good")] }),
+    );
+    for (const id of ids) {
+      expect(getLane(id), id).toMatchObject({ phase: "qa_wait", reviewerBotId: "qa-bot" });
+      expect(getLane(id)!.qaDisposition, id).toBeUndefined();
+      expectLaneError(() => transition(id, "done"), "ineligible", /\(no QA verdict recorded\); done needs QA PASS$/);
+    }
+    // The reviewer records it again, and the lane finishes as before.
+    verdict("older-tool", "PASS");
+    expect(transition("older-tool", "done", { outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", qaDisposition: "PASS" });
+  });
+
+  it("drops a stored FAIL recorded under a reviewer the hold no longer has, so rework neither starts on it nor credits the new one", () => {
+    // qa-bot-1 failed the tip; an older tool, with no reviewer freeze, then gave the hold to qa-bot-2.
+    const failBy = (note: string) => ({ reviewerBotId: "qa-bot-2", qaDisposition: "FAIL", evidence: [qaEntry(note, "_cos/QA_DIGEST-1.md")] });
+    store(storedHeld("noted", failBy("FAIL by qa-bot-1 — missing test")), storedHeld("older-tool", failBy("FAIL — missing test")));
+    for (const id of ["noted", "older-tool"]) {
+      expect(getLane(id)!.qaDisposition, id).toBeUndefined();
+      for (const phase of ["running", "ready", "failed"] as const) {
+        expectLaneError(() => transition(id, phase), "ineligible", new RegExp(`\\(no QA verdict recorded\\); ${phase} needs QA FAIL$`));
+      }
+      expect(getLane(id)!.evidence.map((entry) => entry.kind), id).toEqual(["qa"]);
+    }
+    // Only qa-bot-2's own FAIL hands the lane back, and the rework note names it and its ref.
+    recordQaDisposition("noted", { reviewerBotId: "qa-bot-2", disposition: "FAIL", ref: "_cos/QA_DIGEST-2.md" });
+    expect(transition("noted", "running").evidence.at(-2)).toEqual({
+      at: expect.any(Number),
+      kind: "rework",
+      ref: "_cos/QA_DIGEST-2.md",
+      note: "QA FAIL by qa-bot-2 handed the lane back for rework",
+    });
+  });
+
+  it("drops a stored verdict its reviewer recorded before the lane last entered qa_wait", () => {
+    // An older tool did not clear the verdict on entering qa_wait.
+    store(
+      storedHeld("earlier-round", {
+        reviewerBotId: "qa-bot",
+        qaDisposition: "FAIL",
+        evidence: [qaEntry("FAIL by qa-bot", "_cos/QA_DIGEST-1.md"), phaseEntry("qa_wait->running"), phaseEntry("running->qa_wait")],
+      }),
+      storedHeld("before-hold", { reviewerBotId: "qa-bot", qaDisposition: "PASS", evidence: [qaEntry("PASS by qa-bot"), phaseEntry("running->qa_wait")] }),
+    );
+    expect(getLane("earlier-round")!.qaDisposition).toBeUndefined();
+    expectLaneError(() => transition("earlier-round", "running"), "ineligible", /\(no QA verdict recorded\); running needs QA FAIL$/);
+    expect(getLane("before-hold")!.qaDisposition).toBeUndefined();
+    expectLaneError(() => transition("before-hold", "done"), "ineligible", /\(no QA verdict recorded\); done needs QA PASS$/);
+  });
+
+  it("keeps a held verdict whose latest qa note in the hold is that verdict by its reviewer, and the lane leaves as before", () => {
+    store(
+      storedHeld("pass", { reviewerBotId: "qa-bot", qaDisposition: "PASS", evidence: [phaseEntry("running->qa_wait"), qaEntry("PASS by qa-bot")] }),
+      storedHeld("fail", { reviewerBotId: "qa-bot", qaDisposition: "FAIL", evidence: [qaEntry("FAIL by qa-bot — missing test")] }),
+      // The reviewer changed their verdict; the latest note decides.
+      storedHeld("changed", { reviewerBotId: "qa-bot", qaDisposition: "NOT RUN", evidence: [qaEntry("FAIL by qa-bot"), qaEntry("NOT RUN by qa-bot — no runner")] }),
+    );
+    expect(getLane("pass")!.qaDisposition).toBe("PASS");
+    expect(getLane("fail")!.qaDisposition).toBe("FAIL");
+    expect(getLane("changed")!.qaDisposition).toBe("NOT RUN");
+    expect(transition("pass", "done", { outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", qaDisposition: "PASS" });
+    expect(transition("fail", "running").evidence.at(-2)).toMatchObject({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: "QA FAIL by qa-bot handed the lane back for rework" });
+    expect(transition("changed", "cancelled").phase).toBe("cancelled");
+
+    // A verdict recorded through the API survives a restart the same way.
+    const lane = heldByQa("api");
+    recordQaDisposition(lane.id, { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST-api.md", note: "missing test" });
+    _resetFactoryLanes();
+    expect(getLane(lane.id)!.qaDisposition).toBe("FAIL");
+    expect(transition(lane.id, "running").evidence.at(-2)).toMatchObject({ kind: "rework", ref: "_cos/QA_DIGEST-api.md", note: "QA FAIL by qa-bot handed the lane back for rework" });
+  });
+
+  it("fails closed when a later qa entry on a held lane is not its reviewer's verdict: the next load drops it until they record it again", () => {
+    const lane = heldByQa("a");
+    verdict(lane.id, "PASS");
+    appendEvidence(lane.id, { kind: "qa", ref: "_cos/QA_NOTES.md", note: "screenshots attached" });
+    _resetFactoryLanes();
+    expect(getLane(lane.id)!.qaDisposition).toBeUndefined();
+    expectLaneError(() => transition(lane.id, "done"), "ineligible", /\(no QA verdict recorded\); done needs QA PASS$/);
+    verdict(lane.id, "PASS");
+    _resetFactoryLanes();
+    expect(transition(lane.id, "done", { outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", qaDisposition: "PASS" });
   });
 });
 

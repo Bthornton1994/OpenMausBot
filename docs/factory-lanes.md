@@ -159,6 +159,18 @@ is refused with `code: "ineligible"` and writes nothing.
   id that loading drops), and giving a held lane the reviewer it lacked clears
   any verdict in the same change — so the lane leaves only on a verdict that
   reviewer recorded.
+- A valid reviewer is not enough on its own. Loading keeps a held verdict
+  only if the lane's latest `qa` evidence since it last entered `qa_wait` is
+  that verdict by the lane's reviewer, as `recordQaDisposition` writes it:
+  `PASS by qa-bot`, or `PASS by qa-bot — <note>`. Otherwise it drops the
+  verdict and QA is pending again. This fails closed on a store an older tool
+  wrote: its `qa` notes name no reviewer (`FAIL — missing test`), it let a
+  held lane's reviewer change, and it kept a verdict on entering `qa_wait`.
+- So after pointing this code at a `DATA_DIR` an older tool wrote, a held
+  lane whose verdict was dropped stays in `qa_wait` until its assigned
+  reviewer records the verdict again (`POST /factory/lanes/:id/qa`). The
+  same happens at the next load if a `qa` entry that is not the reviewer's
+  verdict is added to a held lane with `appendEvidence`.
 - `releaseOwnership` is refused until a verdict is recorded (the phase keeps
   blocking other writers either way).
 - The implementer claim APIs keep refusing a `qa_wait` lane even after `FAIL`

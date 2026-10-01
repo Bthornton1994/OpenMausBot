@@ -19,6 +19,8 @@
 // configured, protected sessions and frozen tips are refused, fail-closed.
 // A lane in qa_wait is held by independent QA: it leaves only on a verdict
 // its reviewer recorded, and only where that verdict allows (assertQaHold).
+// Loading holds what is on disk to the same rule: a held verdict without its
+// reviewer's `qa` note from that hold is dropped (heldVerdictRecorded).
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { posix, join } from "node:path";
@@ -214,6 +216,24 @@ function isQaDisposition(value: unknown): value is QaDisposition {
   return typeof value === "string" && (QA_DISPOSITIONS as readonly string[]).includes(value);
 }
 
+/** The `qa` evidence note recordQaDisposition writes: "FAIL by qa-bot", or
+ * "FAIL by qa-bot — missing test" with a note. */
+function qaNote(disposition: QaDisposition, reviewerBotId: string, note?: string): string {
+  return `${disposition} by ${reviewerBotId}${note ? ` — ${note}` : ""}`;
+}
+
+/** t1757u R-1: whether a held lane's stored verdict is one its reviewer
+ * recorded in this hold — its latest `qa` entry since it last entered qa_wait
+ * is that verdict's note. Older tools named no reviewer in the note, let a
+ * held lane's reviewer change, and kept a verdict on entering qa_wait. */
+function heldVerdictRecorded(lane: FactoryLane, disposition: QaDisposition): boolean {
+  if (!lane.reviewerBotId) return false;
+  const latest = lane.evidence.findLast((entry) => entry.kind === "qa" || (entry.kind === "phase" && entry.ref.endsWith("->qa_wait")));
+  if (latest?.kind !== "qa" || latest.note === undefined) return false;
+  const recorded = qaNote(disposition, lane.reviewerBotId);
+  return latest.note === recorded || latest.note.startsWith(`${recorded} — `);
+}
+
 /** Rebuild one lane from untrusted JSON, or null if it is not a lane. */
 function parseLane(value: unknown): FactoryLane | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -271,7 +291,9 @@ function parseLane(value: unknown): FactoryLane | null {
   // One stored on a lane with no valid reviewer (an older tool's store, or a
   // self-reviewer or blank id dropped above) is dropped too, so a person
   // assigns a real reviewer and that reviewer records a fresh verdict.
-  if (isQaDisposition(raw.qaDisposition) && (lane.phase !== "qa_wait" || lane.reviewerBotId)) {
+  // t1757u R-1: so is one a valid reviewer left no `qa` note for in this hold
+  // (heldVerdictRecorded): the lane is QA-pending until they record it again.
+  if (isQaDisposition(raw.qaDisposition) && (lane.phase !== "qa_wait" || heldVerdictRecorded(lane, raw.qaDisposition))) {
     lane.qaDisposition = raw.qaDisposition;
   }
   if (Number.isFinite(raw.claimedAt) && !TERMINAL_PHASES.includes(lane.phase)) lane.claimedAt = raw.claimedAt as number;
@@ -769,8 +791,8 @@ export function recordQaDisposition(
     }
     const now = Date.now();
     lane.qaDisposition = input.disposition;
-    const note = `${input.disposition} by ${input.reviewerBotId}${input.note ? ` — ${input.note}` : ""}`;
-    pushEvidence(lane, { kind: "qa", ref: input.ref, note }, now);
+    // Loading keeps a held verdict only next to this note (heldVerdictRecorded).
+    pushEvidence(lane, { kind: "qa", ref: input.ref, note: qaNote(input.disposition, input.reviewerBotId, input.note) }, now);
     lane.updatedAt = now;
     return structuredClone(lane);
   });
