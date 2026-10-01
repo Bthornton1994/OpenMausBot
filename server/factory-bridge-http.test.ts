@@ -20,6 +20,7 @@ import {
 import {
   FactoryLaneError,
   listLanes,
+  recordQaDisposition,
   transition,
   upsertLane,
   _resetFactoryLanes,
@@ -513,6 +514,62 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     expect(swap.body.error.code).toBe("ineligible");
     expect(getLane(lane.id)?.phase).toBe("ci_wait");
     expect(getLane(lane.id)?.fullSha).toBe(SHA);
+  });
+
+  /** A lane that ran and is parked in qa_wait on SHA, reviewed by qa-bot. */
+  function heldByQa(suffix: string) {
+    const lane = upsertLane(laneInput(suffix, { reviewerBotId: "qa-bot" }));
+    transition(lane.id, "running");
+    return transition(lane.id, "qa_wait", { fullSha: SHA });
+  }
+
+  it("t1754u transition route will not resume or finish a qa_wait lane without a matching QA verdict", async () => {
+    const lane = heldByQa("t1754u-held");
+    const before = getLane(lane.id);
+    const move = (phase: string, headers: Record<string, string> = {}) =>
+      json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase }, headers);
+
+    const unauthorized = await move("running", { authorization: "Bearer wrong-token" });
+    expect(unauthorized.status).toBe(401);
+
+    const pending = await move("running");
+    expect(pending.status).toBe(403);
+    expect(pending.body.error.code).toBe("ineligible");
+    expect(pending.body.error.message).toBe(
+      `lane ${lane.id} is held by QA in qa_wait (no QA verdict recorded); running needs QA FAIL`,
+    );
+    for (const phase of ["ready", "ci_wait", "owner_gate", "done", "failed", "cancelled"]) {
+      const res = await move(phase);
+      expect(res.status, phase).toBe(403);
+      expect(res.body.error.code, phase).toBe("ineligible");
+    }
+    expect(getLane(lane.id)).toEqual(before);
+
+    recordQaDisposition(lane.id, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
+    const passed = await move("running");
+    expect(passed.status).toBe(403);
+    expect(passed.body.error.message).toMatch(/\(QA PASS\); running needs QA FAIL$/);
+    expect(getLane(lane.id)?.phase).toBe("qa_wait");
+
+    const done = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "done", outcome: "KEEP_DRAFT" });
+    expect(done.status).toBe(200);
+    expect(done.body.lane).toMatchObject({ phase: "done", qaDisposition: "PASS", outcome: "KEEP_DRAFT" });
+  });
+
+  it("t1754u transition route accepts the QA FAIL rework handoff and logs it", async () => {
+    const lane = heldByQa("t1754u-rework");
+    recordQaDisposition(lane.id, { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST.md", note: "missing test" });
+
+    const rework = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, {
+      phase: "running",
+      nextAction: "fix the QA findings",
+    });
+    expect(rework.status).toBe(200);
+    expect(rework.body.lane).toMatchObject({ phase: "running", nextAction: "fix the QA findings" });
+    expect(rework.body.lane.evidence.slice(-2)).toEqual([
+      expect.objectContaining({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: expect.stringMatching(/QA FAIL by qa-bot/) }),
+      expect.objectContaining({ kind: "phase", ref: "qa_wait->running" }),
+    ]);
   });
 
   it("rejects bad Origin for non-health requests", async () => {

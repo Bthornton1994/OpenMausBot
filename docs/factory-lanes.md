@@ -66,7 +66,10 @@ Entry points:
 - `transition(id, phase, patch?)` — entering a frozen phase without a claim
   runs the same overlap check and takes the claim. Entering `done`/`failed`/
   `cancelled` releases it. Terminal lanes never transition again (`"terminal"`).
-- `releaseOwnership(laneId)` — drops the explicit claim.
+  A lane in `qa_wait` leaves only as its recorded QA verdict allows (see
+  *QA hold*).
+- `releaseOwnership(laneId)` — drops the explicit claim. Refused for a lane in
+  `qa_wait` until QA has recorded a verdict.
 - `upsertLane(input)` — creates (initial phase `ready`, `ci_wait`, `qa_wait` or
   `owner_gate`; never `running` or terminal) or updates descriptive fields.
   Moving a lane that holds ownership to another repo/branch/worktree is refused;
@@ -103,6 +106,41 @@ without waiting. Pass `reload: true` when another process writes the file.
 - `recordQaDisposition(id, { reviewerBotId, disposition, ref, note? })` only
   accepts the lane's assigned reviewer, never its owner, and logs `qa`
   evidence.
+
+### QA hold (`qa_wait`)
+
+A lane in `qa_wait` is held by independent QA. Its tip is frozen, and it does
+not move until its assigned reviewer has recorded a verdict with
+`recordQaDisposition` — and then only where that verdict allows. Anything else
+is refused with `code: "ineligible"` and writes nothing.
+
+| Leaving `qa_wait` for | Needs the recorded verdict |
+| --- | --- |
+| `running` or `ready` — the **rework handoff** | `FAIL` |
+| `failed` | `FAIL` |
+| `done` | `PASS` |
+| `cancelled` | any (`PASS`, `FAIL`, `BLOCKED`, `NOT RUN`, `UNKNOWN`) |
+| `ci_wait`, `owner_gate` | never — from either, `running` is one ungated transition away |
+
+- No verdict means QA is pending: the lane cannot resume implementation,
+  finish, or be released. `PASS`, `BLOCKED`, `NOT RUN` and `UNKNOWN` never
+  hand it back for rework.
+- The rework handoff logs `rework` evidence — the reviewer, and the `ref` of
+  the FAIL's `qa` evidence — just before the `qa_wait->running` (or
+  `qa_wait->ready`) phase entry. Rework still passes the protect gate — on the
+  transition to `running`, or when the manager loop dispatches the `ready`
+  lane — so a FAIL never opens a frozen tip or a protected session.
+- Entering `qa_wait` clears any earlier verdict: one recorded in another
+  phase, or in an earlier round, does not release a new hold.
+- While the lane is in `qa_wait`, neither a transition patch nor `upsertLane`
+  may set or change `fullSha`; record the tip when entering `qa_wait`.
+- `releaseOwnership` is refused until a verdict is recorded (the phase keeps
+  blocking other writers either way).
+- The implementer claim APIs keep refusing a `qa_wait` lane even after `FAIL`
+  (rule `qa_phase`); the handoff goes through `transition`.
+- The loopback bridge (`scripts/factory-bridge.ts`) has no route that records a
+  verdict, so a bridge client cannot move a lane out of `qa_wait` until one is
+  recorded in-process through `recordQaDisposition`.
 
 ## Protect gate (`server/factory-protect-gate.ts`)
 
@@ -157,7 +195,7 @@ Evaluated in order against the ownership being claimed; first DENY wins:
 | Rule | DENY when |
 | --- | --- |
 | `qa_role` | the lane has `role: "qa"` — review work is never claimed through implementer claim APIs (also via `transition → running`) |
-| `qa_phase` | `claimWorktree` on a lane in `qa_wait` — its tip belongs to QA until it moves on |
+| `qa_phase` | `claimWorktree` on a lane in `qa_wait` — its tip belongs to QA until it moves on (moving it on by `transition` is the *QA hold* above, checked before this gate) |
 | `frozen_tip` | same repo+branch as a frozen tip, nested worktree with the tip's `worktreePath`, or the lane's `fullSha` equals the tip SHA |
 | `protected_session` | the lane's `agentSession` (writer target) is a protected session id, or same repo+branch / nested worktree as a protected session |
 | `allow` | none of the above — e.g. disjoint scratch while other lanes sit in `ci_wait`/`qa_wait` |

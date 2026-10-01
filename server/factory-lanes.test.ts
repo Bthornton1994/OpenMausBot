@@ -22,18 +22,20 @@ import {
   waitLane,
   _loadFactoryLanes,
   _resetFactoryLanes,
+  type FactoryLane,
   type FactoryLaneErrorCode,
 } from "./factory-lanes.ts";
 
 const FILE = join(DATA_DIR, "factory-lanes.json");
 const SHA_A = "a".repeat(40);
 
-function expectLaneError(fn: () => unknown, code: FactoryLaneErrorCode): void {
+function expectLaneError(fn: () => unknown, code: FactoryLaneErrorCode, message?: RegExp): void {
   try {
     fn();
   } catch (error) {
     expect(error).toBeInstanceOf(FactoryLaneError);
     expect((error as FactoryLaneError).code).toBe(code);
+    if (message) expect((error as Error).message).toMatch(message);
     return;
   }
   throw new Error(`expected FactoryLaneError(${code})`);
@@ -49,6 +51,17 @@ function laneInput(suffix: string, overrides: Partial<Parameters<typeof upsertLa
     ...overrides,
   };
 }
+
+/** An implementer lane that ran and is now parked in qa_wait on SHA_A,
+ * reviewed by qa-bot. */
+function heldByQa(suffix: string): FactoryLane {
+  const lane = upsertLane(laneInput(suffix, { reviewerBotId: "qa-bot" }));
+  transition(lane.id, "running");
+  return transition(lane.id, "qa_wait", { fullSha: SHA_A });
+}
+
+const verdict = (id: string, disposition: Parameters<typeof recordQaDisposition>[1]["disposition"], ref = "_cos/QA_DIGEST.md") =>
+  recordQaDisposition(id, { reviewerBotId: "qa-bot", disposition, ref });
 
 beforeEach(() => {
   mkdirSync(DATA_DIR, { recursive: true });
@@ -196,6 +209,122 @@ describe("factory lanes: ownership", () => {
     transition(a.id, "done", { outcome: "merged", prUrl: "https://example.test/pr/1" });
     const b = upsertLane(laneInput("b", { branch: a.branch, worktreePath: a.worktreePath }));
     expect(transition(b.id, "running").phase).toBe("running");
+  });
+});
+
+describe("factory lanes: QA hold (t1754u)", () => {
+  it("refuses to resume implementation while QA is pending, and writes nothing", () => {
+    const lane = heldByQa("a");
+    const before = getLane(lane.id)!;
+    for (const phase of ["running", "ready"] as const) {
+      expectLaneError(() => transition(lane.id, phase), "ineligible", new RegExp(`held by QA in qa_wait \\(no QA verdict recorded\\); ${phase} needs QA FAIL`));
+    }
+    expect(getLane(lane.id)).toEqual(before);
+    // Annotating the held lane in place is still fine.
+    expect(transition(lane.id, "qa_wait", { blocker: "QA seat busy" })).toMatchObject({ phase: "qa_wait", blocker: "QA seat busy" });
+  });
+
+  it("does not let PASS, BLOCKED, NOT RUN or UNKNOWN hand a lane back for rework", () => {
+    const lane = heldByQa("a");
+    for (const disposition of ["PASS", "BLOCKED", "NOT RUN", "UNKNOWN"] as const) {
+      verdict(lane.id, disposition);
+      for (const phase of ["running", "ready"] as const) {
+        expectLaneError(() => transition(lane.id, phase), "ineligible", new RegExp(`\\(QA ${disposition}\\); ${phase} needs QA FAIL`));
+      }
+    }
+    expect(getLane(lane.id)!.phase).toBe("qa_wait");
+  });
+
+  it("hands a lane back for rework on its reviewer's recorded FAIL, and logs the handoff", () => {
+    const lane = heldByQa("a");
+    verdict(lane.id, "FAIL", "_cos/QA_DIGEST.md");
+    const rework = transition(lane.id, "running", { nextAction: "fix the QA findings" });
+    expect(rework).toMatchObject({ phase: "running", qaDisposition: "FAIL", claimedAt: lane.claimedAt });
+    expect(rework.evidence.slice(-2)).toEqual([
+      expect.objectContaining({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: expect.stringMatching(/QA FAIL by qa-bot/) }),
+      expect.objectContaining({ kind: "phase", ref: "qa_wait->running" }),
+    ]);
+
+    // The next QA round starts without a verdict: the old FAIL does not carry over.
+    const again = transition(lane.id, "qa_wait", { fullSha: "b".repeat(40) });
+    expect(again.qaDisposition).toBeUndefined();
+    expectLaneError(() => transition(lane.id, "running"), "ineligible", /no QA verdict recorded/);
+
+    // ready is the same handoff, queued for the manager loop.
+    verdict(lane.id, "FAIL");
+    const queued = transition(lane.id, "ready");
+    expect(queued.phase).toBe("ready");
+    expect(queued.evidence.at(-2)).toMatchObject({ kind: "rework" });
+  });
+
+  it("does not carry a verdict recorded outside qa_wait into the hold", () => {
+    const lane = upsertLane(laneInput("a", { reviewerBotId: "qa-bot" }));
+    transition(lane.id, "running");
+    verdict(lane.id, "FAIL", "early.md");
+    expect(transition(lane.id, "qa_wait", { fullSha: SHA_A }).qaDisposition).toBeUndefined();
+    expectLaneError(() => transition(lane.id, "running"), "ineligible", /no QA verdict recorded/);
+  });
+
+  it("lets a held lane finish only on a verdict that fits the outcome", () => {
+    const pending = heldByQa("pending");
+    for (const phase of ["done", "failed", "cancelled"] as const) {
+      expectLaneError(() => transition(pending.id, phase), "ineligible", /no QA verdict recorded/);
+    }
+
+    const passed = heldByQa("pass");
+    verdict(passed.id, "PASS");
+    expectLaneError(() => transition(passed.id, "failed"), "ineligible", /failed needs QA FAIL/);
+    expect(transition(passed.id, "done", { outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", qaDisposition: "PASS" });
+
+    const failed = heldByQa("fail");
+    verdict(failed.id, "FAIL");
+    expectLaneError(() => transition(failed.id, "done"), "ineligible", /done needs QA PASS/);
+    expect(transition(failed.id, "failed").phase).toBe("failed");
+
+    const blocked = heldByQa("blocked");
+    verdict(blocked.id, "BLOCKED");
+    expectLaneError(() => transition(blocked.id, "done"), "ineligible", /done needs QA PASS/);
+    expectLaneError(() => transition(blocked.id, "failed"), "ineligible", /failed needs QA FAIL/);
+    expect(transition(blocked.id, "cancelled").phase).toBe("cancelled");
+
+    // Finishing still releases the tip, as for any lane.
+    const next = upsertLane(laneInput("next", { branch: passed.branch, worktreePath: passed.worktreePath }));
+    expect(transition(next.id, "running").phase).toBe("running");
+  });
+
+  it("never parks a held lane in ci_wait or owner_gate, whatever the verdict", () => {
+    const lane = heldByQa("a");
+    for (const disposition of [undefined, "PASS", "FAIL", "BLOCKED"] as const) {
+      if (disposition) verdict(lane.id, disposition);
+      for (const phase of ["ci_wait", "owner_gate"] as const) {
+        expectLaneError(() => transition(lane.id, phase), "ineligible", new RegExp(`${phase} is not an exit from qa_wait`));
+      }
+    }
+    expect(getLane(lane.id)!.phase).toBe("qa_wait");
+  });
+
+  it("keeps a held lane's claim until QA records a verdict", () => {
+    const lane = heldByQa("a");
+    expectLaneError(() => releaseOwnership(lane.id), "ineligible", /no QA verdict recorded/);
+    expect(getLane(lane.id)!.claimedAt).toBe(lane.claimedAt);
+
+    verdict(lane.id, "BLOCKED");
+    expect(releaseOwnership(lane.id).claimedAt).toBeUndefined();
+    // Released or not, the phase keeps the frozen tip blocked.
+    const rival = upsertLane(laneInput("rival", { branch: lane.branch, worktreePath: "C:\\work\\wt-rival" }));
+    expectLaneError(() => transition(rival.id, "running"), "conflict");
+  });
+
+  it("freezes the tip QA is judging", () => {
+    const lane = heldByQa("a");
+    const other = "b".repeat(40);
+    expectLaneError(() => transition(lane.id, "qa_wait", { fullSha: other }), "ineligible", /tip is frozen/);
+    expectLaneError(() => upsertLane({ ...laneInput("a", { reviewerBotId: "qa-bot" }), id: lane.id, fullSha: other }), "ineligible", /tip is frozen/);
+    verdict(lane.id, "PASS");
+    expectLaneError(() => transition(lane.id, "done", { fullSha: other }), "ineligible", /tip is frozen/);
+    expect(getLane(lane.id)!.fullSha).toBe(SHA_A);
+    // Restating the same tip (any case) is not a change.
+    expect(transition(lane.id, "done", { fullSha: SHA_A.toUpperCase(), outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", fullSha: SHA_A });
   });
 });
 

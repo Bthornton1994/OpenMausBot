@@ -16,6 +16,8 @@
 // Writer claims also pass the protect gate (factory-protect-gate.ts): QA work
 // is never claimed as implementation, and when a CoS protect directory is
 // configured, protected sessions and frozen tips are refused, fail-closed.
+// A lane in qa_wait is held by independent QA: it leaves only on a verdict
+// its reviewer recorded, and only where that verdict allows (assertQaHold).
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { posix, join } from "node:path";
@@ -87,6 +89,8 @@ export interface FactoryLane {
   nextAction?: string;
   prUrl?: string;
   changedFiles?: string[];
+  /** The reviewer's verdict on the current (or last) QA hold. Entering
+   * qa_wait clears it: a new hold needs a new verdict. */
   qaDisposition?: QaDisposition;
   outcome?: string;
   /** Derived from repo + branch + normalized worktreePath. */
@@ -101,8 +105,9 @@ export const FACTORY_LANE_ROLES = ["implementer", "qa"] as const;
 export type FactoryLaneRole = (typeof FACTORY_LANE_ROLES)[number];
 
 /** `ineligible` = the protect gate said DENY (QA work, frozen tip, protected
- * session, or an unavailable protect SoT). `conflict` stays for overlap with
- * another lane's ownership in this store. */
+ * session, or an unavailable protect SoT), or the QA hold refused a lane in
+ * qa_wait. `conflict` stays for overlap with another lane's ownership in this
+ * store. */
 export type FactoryLaneErrorCode = "not_found" | "invalid" | "terminal" | "conflict" | "qa_independence" | "ineligible";
 
 export class FactoryLaneError extends Error {
@@ -388,6 +393,42 @@ function refuse(laneId: string, decision: ProtectDecision): never {
   throw new FactoryLaneError("ineligible", `lane ${laneId} refused by protect gate — ${decision.reason}`);
 }
 
+// ── QA hold ───────────────────────────────────────────────────────────
+
+/** Where a lane in qa_wait may go, and which recorded verdicts allow it.
+ * qa_wait is independent QA's hold on a frozen tip: FAIL hands the lane back
+ * to implementation (running, or ready for the manager loop) — the rework
+ * handoff — or ends it failed; PASS finishes it done; any verdict may cancel
+ * it. No verdict means QA is pending. ci_wait and owner_gate are no way out:
+ * from either, running is one ungated transition away. */
+const QA_HOLD_EXITS: Partial<Record<FactoryLanePhase, readonly QaDisposition[]>> = {
+  running: ["FAIL"],
+  ready: ["FAIL"],
+  failed: ["FAIL"],
+  done: ["PASS"],
+  cancelled: QA_DISPOSITIONS,
+};
+
+const qaHeld = (lane: FactoryLane): string =>
+  `lane ${lane.id} is held by QA in qa_wait (${lane.qaDisposition ? `QA ${lane.qaDisposition}` : "no QA verdict recorded"})`;
+
+/** Refuse a change that would take a lane out of its QA hold without a verdict
+ * that allows the move, or that would change the tip QA is judging. Lanes
+ * outside qa_wait are not held. */
+function assertQaHold(lane: FactoryLane, phase: FactoryLanePhase, patch: FactoryLanePatch): void {
+  if (lane.phase !== "qa_wait") return;
+  if (patch.fullSha !== undefined && patch.fullSha.toLowerCase() !== lane.fullSha) {
+    throw new FactoryLaneError("ineligible", `${qaHeld(lane)}; its tip is frozen — fullSha is set on entering qa_wait, not while there`);
+  }
+  if (phase === "qa_wait") return;
+  const allowing = QA_HOLD_EXITS[phase];
+  if (lane.qaDisposition && allowing?.includes(lane.qaDisposition)) return;
+  const needs = !allowing
+    ? `${phase} is not an exit from qa_wait`
+    : `${phase} needs ${allowing === QA_DISPOSITIONS ? "a recorded QA verdict" : `QA ${allowing.join(" or ")}`}`;
+  throw new FactoryLaneError("ineligible", `${qaHeld(lane)}; ${needs}`);
+}
+
 // ── public API ────────────────────────────────────────────────────────
 
 /** Fields a caller may set through upsert or a transition patch. Phase,
@@ -461,6 +502,7 @@ export function upsertLane(input: FactoryLaneInput): FactoryLane {
       if (existing.ownerBotId !== input.ownerBotId) {
         throw new FactoryLaneError("invalid", `lane ${existing.id} is owned by ${existing.ownerBotId}; ownership is not reassigned by upsert`);
       }
+      assertQaHold(existing, existing.phase, input);
       // Omitted pathClaims means "unchanged", not "drop them".
       const moved =
         laneOwnershipKey(input) !== existing.ownershipKey ||
@@ -542,7 +584,9 @@ export function listLanes(filter: FactoryLaneFilter = {}): FactoryLane[] {
 /** Move a lane to a new phase. Terminal lanes never move again. Entering
  * `running` requires ownership that does not overlap another holder and a
  * protect-gate ALLOW (`ineligible` otherwise); entering a terminal phase
- * releases the lane's claim. */
+ * releases the lane's claim. A lane in qa_wait leaves only as its recorded
+ * QA verdict allows (`ineligible` otherwise); entering qa_wait clears any
+ * earlier verdict. */
 export function transition(
   id: string,
   phase: FactoryLanePhase,
@@ -551,6 +595,8 @@ export function transition(
 ): FactoryLane {
   if (!isPhase(phase)) throw new FactoryLaneError("invalid", `unknown phase ${String(phase)}`);
   const current = all().find((lane) => lane.id === id);
+  // t1754u: before the protect gate, so a refused QA exit writes nothing.
+  if (current) assertQaHold(current, phase, patch);
   let allowed: ProtectDecision | null = null;
   // F2/t1743u: gate entry into ANY frozen phase (running/ci_wait/qa_wait/owner_gate),
   // not only running — otherwise ready→ci_wait can take ownership + fullSha past protect.
@@ -585,7 +631,16 @@ export function transition(
     applyPatch(lane, patch);
     if (allowed) pushGateEvidence(lane, allowed, now);
     const from = lane.phase;
+    if (from === "qa_wait" && (phase === "running" || phase === "ready")) {
+      // assertQaHold let this through on a recorded FAIL: the rework handoff.
+      const verdict = lane.evidence.findLast((entry) => entry.kind === "qa");
+      const by = lane.reviewerBotId || "its reviewer";
+      pushEvidence(lane, { kind: "rework", ref: verdict?.ref ?? "qa", note: `QA FAIL by ${by} handed the lane back for rework` }, now);
+    }
     lane.phase = phase;
+    // A new QA hold starts without a verdict, so one recorded for an earlier
+    // tip or round cannot release it.
+    if (phase === "qa_wait" && from !== "qa_wait") delete lane.qaDisposition;
     if (TERMINAL_PHASES.includes(phase)) delete lane.claimedAt;
     if (from !== phase) pushEvidence(lane, { kind: "phase", ref: `${from}->${phase}` }, now);
     lane.updatedAt = now;
@@ -649,10 +704,14 @@ export function claimWorktree(input: ClaimWorktreeInput): FactoryLane {
 }
 
 /** Drop a lane's explicit claim. A lane still in a frozen phase keeps
- * blocking by phase alone — releasing never unfreezes a tip under review. */
+ * blocking by phase alone — releasing never unfreezes a tip under review. A
+ * lane in qa_wait is not released at all until QA has recorded a verdict. */
 export function releaseOwnership(laneId: string): FactoryLane {
   return commit((draft) => {
     const lane = mustFind(draft, laneId);
+    if (lane.phase === "qa_wait" && !lane.qaDisposition) {
+      throw new FactoryLaneError("ineligible", `${qaHeld(lane)}; it is not released before QA records a verdict`);
+    }
     if (lane.claimedAt === undefined) return structuredClone(lane);
     const now = Date.now();
     delete lane.claimedAt;
@@ -663,7 +722,8 @@ export function releaseOwnership(laneId: string): FactoryLane {
 }
 
 /** Independent QA verdict. Only the lane's assigned reviewer — never its
- * owner — can record one. */
+ * owner — can record one. A verdict recorded while the lane is in qa_wait
+ * decides how it may leave (see QA_HOLD_EXITS); FAIL is the rework handoff. */
 export function recordQaDisposition(
   id: string,
   input: { reviewerBotId: string; disposition: QaDisposition; ref: string; note?: string },

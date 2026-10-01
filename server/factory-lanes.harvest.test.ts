@@ -192,6 +192,45 @@ describe("protect gate: QA is not implementation", () => {
     const writer = upsertLane(laneInput("writer", { ...VA, worktreePath: "C:\\work\\va-writer" }));
     expectLaneError(() => claimOwn(writer), "ineligible", /frozen tip/);
   });
+
+  it("t1754u: a transition cannot take a qa_wait lane back to running without QA FAIL, even where the gate would allow it", () => {
+    const held = upsertLane(laneInput("held", { reviewerBotId: "qa-bot" }));
+    transition(held.id, "running");
+    transition(held.id, "qa_wait", { fullSha: "e".repeat(40) });
+    const before = getLane(held.id)!;
+    expectLaneError(() => transition(held.id, "running"), "ineligible", /held by QA in qa_wait \(no QA verdict recorded\); running needs QA FAIL/);
+    recordQaDisposition(held.id, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
+    expectLaneError(() => transition(held.id, "running"), "ineligible", /\(QA PASS\); running needs QA FAIL/);
+    expect(getLane(held.id)!.evidence).toEqual([...before.evidence, expect.objectContaining({ kind: "qa", note: "PASS" })]);
+
+    // Meanwhile the manager loop still dispatches disjoint work.
+    const next = upsertLane(laneInput("next"));
+    expect(claimNextEligible()?.id).toBe(next.id);
+
+    // FAIL is the rework handoff. Implementer claims stay refused even then;
+    // the handoff goes through transition, and through the gate.
+    recordQaDisposition(held.id, { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST.md", note: "missing test" });
+    expectLaneError(() => claimOwn(held), "ineligible", /qa_wait/);
+    const rework = transition(held.id, "running");
+    expect(rework.phase).toBe("running");
+    expect(rework.evidence.slice(-3)).toEqual([
+      expect.objectContaining({ kind: "protect", note: expect.stringMatching(/^ALLOW allow:/) }),
+      expect.objectContaining({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: expect.stringMatching(/QA FAIL by qa-bot/) }),
+      expect.objectContaining({ kind: "phase", ref: "qa_wait->running" }),
+    ]);
+  });
+
+  it("t1754u: a QA FAIL does not let rework onto a frozen tip or protected session", () => {
+    const onTip = upsertLane(laneInput("va", { ...VA, phase: "qa_wait", reviewerBotId: "qa-bot", fullSha: VA_TIP }));
+    recordQaDisposition(onTip.id, { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST.md" });
+    expectLaneError(() => transition(onTip.id, "running"), "ineligible", /frozen tip/);
+    expect(getLane(onTip.id)!.phase).toBe("qa_wait");
+
+    const onSession = upsertLane(laneInput("sess", { phase: "qa_wait", reviewerBotId: "qa-bot", worktreePath: "C:\\fixture\\react-doctor-wt" }));
+    recordQaDisposition(onSession.id, { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST.md" });
+    expectLaneError(() => transition(onSession.id, "running"), "ineligible", /protected session/);
+    expect(getLane(onSession.id)!.phase).toBe("qa_wait");
+  });
 });
 
 describe("protect gate: no double start, completion and recovery", () => {

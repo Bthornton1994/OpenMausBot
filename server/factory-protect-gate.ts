@@ -51,7 +51,8 @@ export type ProtectLoadResult = { ok: true; sot: ProtectSoT } | { ok: false; dir
 
 /** Which dispatch path is asking. `claim` covers claimWorktree and
  * claimNextEligible — the implementer claim APIs. `transition` is an owner
- * moving their own lane back to running (e.g. rework after QA FAIL). */
+ * moving their own lane back to running (e.g. rework after QA FAIL; the lane
+ * store's QA hold has already required that recorded FAIL). */
 export type ProtectGateVia = "claim" | "transition";
 
 export interface ProtectCandidate {
@@ -230,7 +231,8 @@ const deny = (rule: ProtectRule, reason: string, dir?: string): ProtectDecision 
 
 /** The QA rules. They need no SoT, so they apply even with the gate off:
  * a QA lane is never claimed as implementation work, and a lane parked in
- * qa_wait is QA's work until it moves on. */
+ * qa_wait is QA's work until it moves on. Moving it on is the QA hold in
+ * factory-lanes.ts (assertQaHold), which runs before this gate. */
 export function decideQaRole(candidate: ProtectCandidate, via: ProtectGateVia): ProtectDecision | null {
   if (candidate.role === "qa") {
     return deny("qa_role", `lane ${candidate.laneId} is QA work (role qa); implementer claim APIs cannot take it`);
