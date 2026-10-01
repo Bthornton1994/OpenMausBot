@@ -1,18 +1,31 @@
-// Factory task patterns — the canonical, versioned registry of reusable
-// factory task briefs (eligibility check, implementer brief, independent QA
-// brief, digest harvest, completion report).
+// Factory task patterns — the canonical, versioned catalog of reusable
+// factory task briefs. The catalog is exactly three patterns (t1752u):
+// implementer-brief, independent-qa-brief, and completion-report.
 //
 // The idea is borrowed from Fabric's "patterns": a reusable prompt with a
 // clear identity, steps, and output. Only the idea — no Fabric code, no
 // model provider, no routing. A pattern is data; this module validates it
 // and renders it to brief text.
 //
+// Each pattern declares:
+//   id + version          — identity
+//   objective             — purpose
+//   inputs                — required (and optional) inputs
+//   expectedArtifact      — expected output
+//   verificationEvidence  — evidence requirements
+//   role, permittedTools, permittedActions, forbiddenActions — role/tool scope
+//   stopConditions        — when to stop and report
+// plus steps, the ordered procedure between them.
+//
 // Source of truth, in order:
-//   1. BUILT_IN_PATTERNS below.
+//   1. BUILT_IN_PATTERNS below — the whole catalog.
 //   2. Optional overlay: $COS_FACTORY_ROOT/patterns/<id>.json, read fresh on
-//      every call. Same validator. An overlay pattern that reuses a built-in
-//      id may only narrow it: its permitted actions must be a subset of the
-//      built-in's and its forbidden actions a superset.
+//      every call. Same validator. An overlay may only narrow one of the
+//      built-ins: same role, permitted actions a subset of the built-in's,
+//      forbidden actions a superset. An overlay cannot add a pattern.
+//
+// Patterns are not wired into the bridge or lanes; runtime eligibility,
+// protect, and auth decisions stay in their own code.
 //
 // Everything fails closed. Unknown id, malformed pattern, unknown or
 // forbidden action, an unreadable overlay, or prose that tries to grant
@@ -71,7 +84,6 @@ export const HARD_FORBIDDEN_ACTIONS = [
 export const PERMITTABLE_ACTIONS = [
   "read-repo",
   "read-lane",
-  "read-protect-sot",
   "run-tests",
   "run-typecheck",
   "edit-files",
@@ -86,13 +98,12 @@ export const PERMITTABLE_ACTIONS = [
 export type ForbiddenAction = (typeof HARD_FORBIDDEN_ACTIONS)[number];
 export type PermittableAction = (typeof PERMITTABLE_ACTIONS)[number];
 
-export const PATTERN_ROLES = ["manager", "implementer", "qa", "reporter"] as const;
+export const PATTERN_ROLES = ["implementer", "qa", "reporter"] as const;
 export type PatternRole = (typeof PATTERN_ROLES)[number];
 
 /** The most a role may ever be permitted. QA stays independent (no edits,
- * commits, or pushes); managers and reporters only read and record. */
+ * commits, or pushes); reporters only read and record. */
 const ROLE_CEILING: Record<PatternRole, readonly PermittableAction[]> = {
-  manager: ["read-repo", "read-lane", "read-protect-sot", "append-evidence", "report-status"],
   implementer: [
     "read-repo",
     "read-lane",
@@ -389,42 +400,6 @@ const FORBIDDEN = [...HARD_FORBIDDEN_ACTIONS];
 
 const RAW_BUILT_INS: unknown[] = [
   {
-    id: "eligibility-check",
-    version: 1,
-    role: "manager",
-    objective:
-      "Report whether lane {{laneId}} ({{repo}}@{{branch}}, worktree {{worktreePath}}) may be claimed, using the decision the factory protect gate returns.",
-    inputs: [
-      { name: "laneId", description: "Factory lane id.", required: true },
-      { name: "repo", description: "owner/name of the lane repository.", required: true },
-      { name: "branch", description: "Lane branch.", required: true },
-      { name: "worktreePath", description: "Absolute worktree path the lane writes.", required: true },
-      { name: "writerTarget", description: "Session the claim would write into, if any.", required: false },
-    ],
-    steps: [
-      "Read the lane record and confirm repo, branch, and worktree match the inputs.",
-      "Ask the factory protect gate for its decision on this candidate; do not compute one by hand.",
-      "Record the decision, rule, and reason as lane evidence.",
-      "Report the decision unchanged.",
-    ],
-    permittedTools: ["factory-lanes getLane", "factory-protect-gate evaluateProtectGate", "git status (read-only)"],
-    permittedActions: ["read-lane", "read-protect-sot", "read-repo", "append-evidence", "report-status"],
-    forbiddenActions: FORBIDDEN,
-    expectedArtifact: {
-      kind: "eligibility-decision",
-      description: "One record: laneId, decision (ALLOW or DENY), rule, reason, and the protect directory consulted.",
-    },
-    verificationEvidence: [
-      "The gate decision object, quoted verbatim.",
-      "The lane id and ownership key the decision was made for.",
-    ],
-    stopConditions: [
-      "The gate returns DENY: report it and stop.",
-      "The protect SoT is unavailable: report DENY and stop.",
-      "The lane record does not match the inputs.",
-    ],
-  },
-  {
     id: "implementer-brief",
     version: 1,
     role: "implementer",
@@ -468,6 +443,7 @@ const RAW_BUILT_INS: unknown[] = [
       "Test output with pass/fail counts.",
       "Typecheck result.",
       "Changed-file list inside the lane's path claims.",
+      "Assumptions table, each row labelled verified, inferred, or unknown with its evidence.",
     ],
     stopConditions: [
       "The worktree is not at {{baseSha}}.",
@@ -507,32 +483,8 @@ const RAW_BUILT_INS: unknown[] = [
       "The checkout is not {{tipSha}}.",
       "The reviewer is the implementer.",
       "The tip moves during review: stop and report NOT RUN.",
+      "A finding can only be confirmed by editing, committing, or pushing: report it unconfirmed instead.",
     ],
-  },
-  {
-    id: "digest-harvest",
-    version: 1,
-    role: "manager",
-    objective: "Harvest implementation and QA digests for lane {{laneId}} into lane evidence without changing the lane's code.",
-    inputs: [
-      { name: "laneId", description: "Factory lane id.", required: true },
-      { name: "digestPaths", description: "Digest files to read.", required: true },
-    ],
-    steps: [
-      "Read each digest in {{digestPaths}}.",
-      "Check that SHAs in the digests match the lane's fullSha.",
-      "Append one evidence entry per digest (kind commit, ci, or qa) with its reference.",
-      "Report lanes whose digests disagree with the lane record.",
-    ],
-    permittedTools: ["factory-lanes getLane", "factory-lanes appendEvidence", "file read"],
-    permittedActions: ["read-repo", "read-lane", "append-evidence", "report-status"],
-    forbiddenActions: FORBIDDEN,
-    expectedArtifact: {
-      kind: "harvest-summary",
-      description: "Per digest: path, SHA, kind, and whether it matched the lane record.",
-    },
-    verificationEvidence: ["Lane evidence entries appended, with references.", "Mismatches listed explicitly."],
-    stopConditions: ["A digest names a different SHA than the lane.", "A digest is missing or unreadable."],
   },
   {
     id: "completion-report",
@@ -557,18 +509,33 @@ const RAW_BUILT_INS: unknown[] = [
       description: "Outcome, final SHA, changed files, test counts, QA disposition, PR link ({{prUrl}}), and open items.",
     },
     verificationEvidence: ["Every claim cites a lane evidence entry.", "Final SHA matches the lane's fullSha."],
-    stopConditions: ["The lane has no QA disposition.", "Evidence and lane record disagree."],
+    stopConditions: [
+      "The lane has no QA disposition.",
+      "Evidence and lane record disagree.",
+      "The final SHA differs from the lane's fullSha.",
+    ],
   },
 ];
 
+/** The whole catalog (t1752u). Nothing else is a factory task pattern. */
+export const CATALOG_PATTERN_IDS = ["implementer-brief", "independent-qa-brief", "completion-report"] as const;
+export type CatalogPatternId = (typeof CATALOG_PATTERN_IDS)[number];
+
 /** The validated built-ins, keyed by id. Validated at import: a bad
- * built-in is a startup error, not a runtime surprise. */
+ * built-in, or a built-in set that is not exactly the catalog, is a startup
+ * error, not a runtime surprise. */
 export const BUILT_IN_PATTERNS: ReadonlyMap<string, FactoryTaskPattern> = new Map(
   RAW_BUILT_INS.map((raw) => {
     const pattern = validatePattern(raw);
     return [pattern.id, pattern] as const;
   }),
 );
+if (
+  BUILT_IN_PATTERNS.size !== CATALOG_PATTERN_IDS.length ||
+  !CATALOG_PATTERN_IDS.every((id) => BUILT_IN_PATTERNS.has(id))
+) {
+  fail("invalid_pattern", `built-in patterns must be exactly ${CATALOG_PATTERN_IDS.join(", ")}`);
+}
 
 // ── overlay + lookup ──────────────────────────────────────────────────
 
@@ -594,8 +561,9 @@ function assertNarrows(overlay: FactoryTaskPattern, base: FactoryTaskPattern, fi
   if (dropped.length) fail("action_denied", `${file} drops forbidden actions ${dropped.join(", ")} from ${base.id}`);
 }
 
-/** Built-ins plus the overlay, read fresh. A missing patterns directory means
- * no overlay; any other read or validation failure throws. */
+/** The built-ins, each possibly narrowed by the overlay, read fresh. A missing
+ * patterns directory means no overlay; an overlay id outside the catalog, or
+ * any other read or validation failure, throws. */
 export function loadPatterns(options: PatternLookupOptions = {}): ReadonlyMap<string, FactoryTaskPattern> {
   const dir = resolvePatternOverlayDir(options);
   if (!dir) return BUILT_IN_PATTERNS;
@@ -625,7 +593,8 @@ export function loadPatterns(options: PatternLookupOptions = {}): ReadonlyMap<st
     }
     if (`${pattern.id}.json` !== name) fail("invalid_pattern", `overlay ${name} must be named ${pattern.id}.json`);
     const base = BUILT_IN_PATTERNS.get(pattern.id);
-    if (base) assertNarrows(pattern, base, `overlay ${name}`);
+    if (!base) fail("unknown_pattern", `overlay ${name} is not in the pattern catalog; overlays may only narrow a built-in`);
+    assertNarrows(pattern, base as FactoryTaskPattern, `overlay ${name}`);
     merged.set(pattern.id, pattern);
   }
   return merged;

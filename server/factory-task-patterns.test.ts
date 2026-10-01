@@ -10,6 +10,7 @@ import {
   assertActionsAllowed,
   BUILT_IN_PATTERNS,
   BRIEF_GUARDRAILS,
+  CATALOG_PATTERN_IDS,
   FactoryPatternError,
   findOverrideAttempts,
   getPattern,
@@ -48,18 +49,49 @@ const implementerVars = {
 };
 
 describe("built-in patterns", () => {
-  it("seeds the five factory patterns and each validates", () => {
-    expect(listPatternIds(NO_OVERLAY)).toEqual([
-      "completion-report",
-      "digest-harvest",
-      "eligibility-check",
-      "implementer-brief",
-      "independent-qa-brief",
-    ]);
+  it("the catalog is exactly implementer, QA, and completion, and each validates", () => {
+    expect(listPatternIds(NO_OVERLAY)).toEqual(["completion-report", "implementer-brief", "independent-qa-brief"]);
+    expect([...BUILT_IN_PATTERNS.keys()].sort()).toEqual([...CATALOG_PATTERN_IDS].sort());
     for (const pattern of BUILT_IN_PATTERNS.values()) {
       expect(validatePattern(structuredClone(pattern))).toEqual(pattern);
       expect(pattern.version).toBe(1);
       for (const action of HARD_FORBIDDEN_ACTIONS) expect(pattern.forbiddenActions).toContain(action);
+    }
+  });
+
+  it.each(["eligibility-check", "digest-harvest"])("the removed %s pattern is unknown", (id) => {
+    expectCode(() => getPattern(id, NO_OVERLAY), "unknown_pattern");
+  });
+
+  it("each pattern declares purpose, required inputs, output, evidence, scope, and stop conditions", () => {
+    const roles = { "implementer-brief": "implementer", "independent-qa-brief": "qa", "completion-report": "reporter" };
+    for (const id of CATALOG_PATTERN_IDS) {
+      const pattern = getPattern(id, NO_OVERLAY);
+      expect(pattern.role).toBe(roles[id]);
+      expect(pattern.objective).not.toBe("");
+      expect(pattern.inputs.some((input) => input.required)).toBe(true);
+      expect(pattern.expectedArtifact.kind).not.toBe("");
+      expect(pattern.verificationEvidence.length).toBeGreaterThan(0);
+      expect(pattern.permittedTools.length).toBeGreaterThan(0);
+      expect(pattern.permittedActions.length).toBeGreaterThan(0);
+      expect(pattern.stopConditions.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("keeps the required hard-forbidden actions", () => {
+    for (const action of [
+      "grant-permissions",
+      "clear-project-gates",
+      "override-eligibility",
+      "override-protect",
+      "merge",
+      "undraft",
+      "install-fabric",
+      "add-model-provider",
+      "change-routing",
+      "print-secrets",
+    ]) {
+      expect(HARD_FORBIDDEN_ACTIONS).toContain(action);
     }
   });
 
@@ -166,7 +198,7 @@ describe("unauthorized and forbidden actions fail closed", () => {
   });
 
   it("unknown actions and actions above the role ceiling are rejected", () => {
-    const unknown = copyOf("digest-harvest");
+    const unknown = copyOf("completion-report");
     unknown.permittedActions = ["read-lane", "deploy-prod"];
     expectCode(() => validatePattern(unknown), "action_denied");
 
@@ -174,9 +206,14 @@ describe("unauthorized and forbidden actions fail closed", () => {
     qaWrites.permittedActions = [...(qaWrites.permittedActions as string[]), "commit"];
     expectCode(() => validatePattern(qaWrites), "action_denied");
 
-    const managerPushes = copyOf("eligibility-check");
-    managerPushes.permittedActions = ["read-lane", "push-fork"];
-    expectCode(() => validatePattern(managerPushes), "action_denied");
+    const reporterPushes = copyOf("completion-report");
+    reporterPushes.permittedActions = ["read-lane", "push-fork"];
+    expectCode(() => validatePattern(reporterPushes), "action_denied");
+
+    // Removed with eligibility-check (t1752u): no role may read the protect SoT.
+    const protectReader = copyOf("implementer-brief");
+    protectReader.permittedActions = ["read-lane", "read-protect-sot"];
+    expectCode(() => validatePattern(protectReader), "action_denied");
   });
 
   it("assertActionsAllowed allows permitted actions and denies everything else", () => {
@@ -273,42 +310,46 @@ describe("COS_FACTORY_ROOT overlay", () => {
   }
 
   it("no root or no patterns directory → built-ins only", () => {
-    expect(listPatternIds({ env: {} })).toHaveLength(5);
+    expect(listPatternIds({ env: {} })).toHaveLength(3);
     const root = mkdtempSync(join(tmpdir(), "omb-patterns-"));
     roots.push(root);
-    expect(listPatternIds({ root })).toHaveLength(5);
+    expect(listPatternIds({ root })).toHaveLength(3);
   });
 
-  it("adds a valid new pattern, read from env COS_FACTORY_ROOT", () => {
+  it("cannot add a pattern outside the catalog, including the removed ones", () => {
     const extra = { ...copyOf("completion-report"), id: "weekly-report" };
-    const root = overlay({ "weekly-report.json": `\uFEFF${JSON.stringify(extra)}` });
-    expect(getPattern("weekly-report", { env: { COS_FACTORY_ROOT: root } }).id).toBe("weekly-report");
-    expectCode(() => getPattern("weekly-report", NO_OVERLAY), "unknown_pattern");
+    const root = overlay({ "weekly-report.json": extra });
+    expectCode(() => getPattern("weekly-report", { env: { COS_FACTORY_ROOT: root } }), "unknown_pattern");
+    expectCode(() => getPattern("completion-report", { env: { COS_FACTORY_ROOT: root } }), "unknown_pattern");
+
+    const revived = { ...copyOf("completion-report"), id: "digest-harvest" };
+    expectCode(() => listPatternIds({ root: overlay({ "digest-harvest.json": revived }) }), "unknown_pattern");
   });
 
-  it("may narrow a built-in", () => {
+  it("may narrow a built-in, read from env COS_FACTORY_ROOT", () => {
     const narrowed = { ...copyOf("implementer-brief"), permittedActions: ["read-repo", "run-tests"] };
-    const root = overlay({ "implementer-brief.json": narrowed });
-    expect(getPattern("implementer-brief", { root }).permittedActions).toEqual(["read-repo", "run-tests"]);
+    const root = overlay({ "implementer-brief.json": `﻿${JSON.stringify(narrowed)}` });
+    expect(getPattern("implementer-brief", { env: { COS_FACTORY_ROOT: root } }).permittedActions).toEqual(["read-repo", "run-tests"]);
+    expect(listPatternIds({ root })).toEqual(["completion-report", "implementer-brief", "independent-qa-brief"]);
   });
 
   it("cannot widen a built-in, change its role, or drop its forbidden actions", () => {
-    const widened = copyOf("digest-harvest");
-    widened.permittedActions = [...(widened.permittedActions as string[]), "read-protect-sot"];
-    expectCode(() => getPattern("digest-harvest", { root: overlay({ "digest-harvest.json": widened }) }), "action_denied");
+    const widened = copyOf("completion-report");
+    widened.permittedActions = [...(widened.permittedActions as string[]), "append-evidence"];
+    expectCode(() => getPattern("completion-report", { root: overlay({ "completion-report.json": widened }) }), "action_denied");
 
     const recast = { ...copyOf("completion-report"), role: "implementer" };
     expectCode(() => getPattern("completion-report", { root: overlay({ "completion-report.json": recast }) }), "action_denied");
 
-    const base = copyOf("eligibility-check");
+    const base = copyOf("independent-qa-brief");
     const loosened = { ...base, forbiddenActions: (base.forbiddenActions as string[]).filter((a) => a !== "override-protect") };
-    expectCode(() => getPattern("eligibility-check", { root: overlay({ "eligibility-check.json": loosened }) }), "action_denied");
+    expectCode(() => getPattern("independent-qa-brief", { root: overlay({ "independent-qa-brief.json": loosened }) }), "action_denied");
 
     // Forbidding more is narrowing, and allowed.
     const stricter = { ...base, forbiddenActions: [...(base.forbiddenActions as string[]), "edit-files"] };
-    expect(getPattern("eligibility-check", { root: overlay({ "eligibility-check.json": stricter }) }).forbiddenActions).toContain(
-      "edit-files",
-    );
+    expect(
+      getPattern("independent-qa-brief", { root: overlay({ "independent-qa-brief.json": stricter }) }).forbiddenActions,
+    ).toContain("edit-files");
   });
 
   it("any bad overlay file fails the whole lookup closed", () => {

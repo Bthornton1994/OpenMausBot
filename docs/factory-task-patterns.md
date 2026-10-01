@@ -1,14 +1,29 @@
 # Factory task patterns
 
 `server/factory-task-patterns.ts` is the **single source of truth** for
-reusable factory task briefs: eligibility check, implementer brief,
-independent QA brief, digest harvest, and completion report. Do not keep a
-second copy elsewhere (for example under portfolio coordination); extend this
-module or the overlay below.
+reusable factory task briefs. Do not keep a second copy elsewhere (for
+example under portfolio coordination); change this module.
 
-It is a pure server module: no HTTP route, MCP tool, model provider, or
-routing change. Callers import it and get validated pattern objects or
-rendered brief text.
+## Catalog (t1752u)
+
+The catalog is **exactly three** patterns (`CATALOG_PATTERN_IDS`):
+
+| Id | Brief | Role |
+| --- | --- | --- |
+| `implementer-brief` | Implementer task brief | `implementer` |
+| `independent-qa-brief` | Independent QA brief | `qa` |
+| `completion-report` | Completion report | `reporter` |
+
+The earlier `eligibility-check` and `digest-harvest` patterns were removed in
+t1752u; their ids are unknown and fail closed. Eligibility and digest
+harvesting stay in their own code (e.g. `server/factory-protect-gate.ts`), not in
+pattern text. The module checks at import that the built-ins are exactly the
+catalog.
+
+It is a pure, declarative server module: no HTTP route, MCP tool, model
+provider, or routing change, and it is not wired into the factory bridge or
+lanes. Callers import it and get validated pattern objects or rendered brief
+text.
 
 The idea comes from [Fabric](https://github.com/danielmiessler/fabric)'s
 *patterns*: a reusable prompt with a clear identity, steps, and output.
@@ -17,36 +32,37 @@ none of its code is used.
 
 ## Where patterns live
 
-1. **Built-ins** — `BUILT_IN_PATTERNS` in the module. Validated at import, so
-   a bad built-in fails at startup.
-2. **Overlay (optional)** — when `COS_FACTORY_ROOT` is set (or a caller passes
-   `root`), every `$COS_FACTORY_ROOT/patterns/<id>.json` is read fresh on each
-   lookup and run through the same validator.
+1. **Built-ins** — `BUILT_IN_PATTERNS` in the module: the whole catalog.
+   Validated at import, so a bad built-in fails at startup.
+2. **Overlay (optional, narrow-only)** — when `COS_FACTORY_ROOT` is set (or a
+   caller passes `root`), every `$COS_FACTORY_ROOT/patterns/<id>.json` is read
+   fresh on each lookup and run through the same validator.
    - The file name must be `<id>.json`.
-   - A new id is added as long as it validates.
-   - An overlay that reuses a built-in id may only **narrow** it: same role,
-     permitted actions a subset of the built-in's, forbidden actions a
-     superset.
+   - The id must be one of the three catalog ids. An overlay cannot add a
+     pattern; any other id fails the lookup with `unknown_pattern`.
+   - An overlay may only **narrow** its built-in: same role, permitted
+     actions a subset of the built-in's, forbidden actions a superset.
    - No `patterns` directory means no overlay. Any other failure (unreadable
-     directory, bad JSON, invalid pattern) fails the whole lookup. A broken
-     overlay is never treated as "use the built-ins".
+     directory, bad JSON, invalid pattern, id outside the catalog) fails the
+     whole lookup. A broken overlay is never treated as "use the built-ins".
 
 ## Format (version 1)
 
-| Field | Required | Notes |
-| --- | --- | --- |
-| `id` | yes | kebab-case |
-| `version` | yes | must be `1` (the format version) |
-| `role` | yes | `manager`, `implementer`, `qa`, or `reporter` |
-| `objective` | yes | one-line identity/purpose; may use `{{input}}` placeholders |
-| `inputs` | yes | `[{ name, description, required }]`; may be empty |
-| `steps` | yes | non-empty ordered list |
-| `permittedTools` | yes | non-empty list of tool descriptions |
-| `permittedActions` | yes | non-empty; ids from `PERMITTABLE_ACTIONS`, within the role's ceiling |
-| `forbiddenActions` | yes | must include every id in `HARD_FORBIDDEN_ACTIONS` |
-| `expectedArtifact` | yes | `{ kind, description }` |
-| `verificationEvidence` | yes | non-empty list |
-| `stopConditions` | yes | non-empty list |
+Every pattern declares the same things:
+
+| Declaration | Field(s) | Required | Notes |
+| --- | --- | --- | --- |
+| Identity | `id`, `version` | yes | kebab-case id; `version` must be `1` (the format version) |
+| Purpose | `objective` | yes | one line; may use `{{input}}` placeholders |
+| Required inputs | `inputs` | yes | `[{ name, description, required }]` |
+| Procedure | `steps` | yes | non-empty ordered list |
+| Expected output | `expectedArtifact` | yes | `{ kind, description }` |
+| Evidence requirements | `verificationEvidence` | yes | non-empty list |
+| Role/tool scope | `role` | yes | `implementer`, `qa`, or `reporter` |
+| | `permittedTools` | yes | non-empty list of tool descriptions |
+| | `permittedActions` | yes | non-empty; ids from `PERMITTABLE_ACTIONS`, within the role's ceiling |
+| | `forbiddenActions` | yes | must include every id in `HARD_FORBIDDEN_ACTIONS` |
+| Stop conditions | `stopConditions` | yes | non-empty list |
 
 Unknown fields are rejected. Text fields are capped at 2,000 characters and
 lists at 32 entries. Placeholders must name a declared input.
@@ -56,17 +72,17 @@ Hard-forbidden actions: `grant-permissions`, `clear-project-gates`,
 `push-upstream`, `install-fabric`, `add-model-provider`, `change-routing`,
 `print-secrets`.
 
-Role ceilings: `qa` may read, run tests/typecheck, record a disposition,
-append evidence, and write a digest — never edit, commit, or push. `manager`
-and `reporter` only read and record. `implementer` may edit, commit, and push
-to the fork.
+Role ceilings: `implementer` may read, edit, run tests/typecheck, commit,
+push to the fork, append evidence, and write a digest. `qa` may read, run
+tests/typecheck, record a disposition, append evidence, and write a digest —
+never edit, commit, or push. `reporter` only reads and records.
 
 ## API
 
 | Function | Fails closed when |
 | --- | --- |
-| `getPattern(id, { root?, env? })` | id unknown or not kebab-case; overlay bad |
-| `listPatternIds(options)` / `loadPatterns(options)` | overlay bad |
+| `getPattern(id, { root?, env? })` | id unknown, not in the catalog, or not kebab-case; overlay bad |
+| `listPatternIds(options)` / `loadPatterns(options)` | overlay bad or adds an id outside the catalog |
 | `validatePattern(raw)` | field missing/malformed/unknown, wrong version or role, forbidden/unknown/over-ceiling action, missing hard-forbidden entry, undeclared placeholder, override wording |
 | `assertActionsAllowed(pattern, actions)` | pattern invalid (re-validated), or any action not permitted or on a deny list |
 | `renderBrief(pattern, vars)` | pattern invalid; unknown, missing-required, non-string, or `{{…}}`-containing vars; override wording in any var or in the assembled prose |
