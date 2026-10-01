@@ -1,0 +1,43 @@
+name: t1746u Ubuntu full pnpm test
+
+# Verifies exact tip 6a5c4bcfdfd0b55c2a775c87bc3b61a88600e53e (F3/F8)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [cos/t1746u-ubuntu-verify]
+
+permissions:
+  contents: read
+
+jobs:
+  full-pnpm-test:
+    name: pnpm test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact t1746u F3/F8 tip
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 6a5c4bcfdfd0b55c2a775c87bc3b61a88600e53e
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Record environment
+        run: |
+          set -eux
+          node -v
+          pnpm -v
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "6a5c4bcfdfd0b55c2a775c87bc3b61a88600e53e"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Full pnpm test
+        run: pnpm test
