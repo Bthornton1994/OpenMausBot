@@ -482,4 +482,76 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
       "lane acme/widgets in ci_wait/qa_wait; Content-Type must be application/json",
     );
   });
+
+  it("F4 register rejects non-string pathClaims instead of coercing", async () => {
+    const reg = (suffix: string, pathClaims: unknown) =>
+      json(base, "POST", "/factory/lanes", { ...laneInput(`f4-${suffix}`), id: `f4-${suffix}`, pathClaims });
+
+    for (const [suffix, claims] of [
+      ["obj", [{}]],
+      ["null", [null]],
+      ["kv", [{ a: 1 }]],
+      ["num", [1]],
+      ["empty", ["  "]],
+      ["mixed", ["src/a.ts", {}]],
+      ["str", "foo"],
+      ["bare", {}],
+    ] as const) {
+      const res = await reg(suffix, claims);
+      expect(res.status, suffix).toBe(400);
+      expect(res.body.error.code).toBe("invalid");
+      expect(res.body.error.message).toMatch(/^pathClaims must be an array of/);
+      expect(getLane(`f4-${suffix}`)).toBeNull();
+    }
+    expect(listLanes({ includeTerminal: true })).toHaveLength(0);
+
+    const ok = await reg("ok", ["src/a.ts", "src/b.ts"]);
+    expect(ok.status).toBe(200);
+    expect(ok.body.lane.pathClaims).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(getLane("f4-ok")?.pathClaims).toEqual(["src/a.ts", "src/b.ts"]);
+  });
+
+  it("F4 claim pathClaims and transition changedFiles reject object entries", async () => {
+    const lane = upsertLane(laneInput("f4-claim", { fullSha: SHA }));
+    const claimBody = {
+      laneId: lane.id,
+      ownerBotId: lane.ownerBotId,
+      repo: lane.repo,
+      branch: lane.branch,
+      worktreePath: lane.worktreePath,
+    };
+    const badClaim = await json(base, "POST", "/factory/claim", { ...claimBody, pathClaims: [{ a: 1 }] });
+    expect(badClaim.status).toBe(400);
+    expect(badClaim.body.error.message).toMatch(/^pathClaims must be an array of/);
+    expect(getLane(lane.id)?.phase).toBe("ready");
+
+    const notArray = await json(base, "POST", "/factory/claim", { pathClaims: "src/a.ts" });
+    expect(notArray.status).toBe(400);
+    expect(getLane(lane.id)?.phase).toBe("ready");
+
+    const claimed = await json(base, "POST", "/factory/claim", { ...claimBody, pathClaims: ["src/c.ts"] });
+    expect(claimed.status).toBe(200);
+    expect(claimed.body.lane.pathClaims).toEqual(["src/c.ts"]);
+
+    const badMove = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, {
+      phase: "running",
+      changedFiles: ["src/c.ts", { a: 1 }],
+    });
+    expect(badMove.status).toBe(400);
+    expect(badMove.body.error.message).toMatch(/^changedFiles must be an array of/);
+    expect(getLane(lane.id)?.changedFiles).toBeUndefined();
+
+    const badShape = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, {
+      phase: "running",
+      changedFiles: { "src/c.ts": true },
+    });
+    expect(badShape.status).toBe(400);
+
+    const moved = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, {
+      phase: "running",
+      changedFiles: ["src/c.ts"],
+    });
+    expect(moved.status).toBe(200);
+    expect(moved.body.lane.changedFiles).toEqual(["src/c.ts"]);
+  });
 });

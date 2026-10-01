@@ -203,6 +203,18 @@ function str(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+// F4: reject non-string entries rather than String()-coercing them ("[object Object]").
+function parseStringList(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new FactoryLaneError("invalid", `${field} must be an array of strings`);
+  return value.map((entry) => {
+    if (typeof entry !== "string" || !entry.trim()) {
+      throw new FactoryLaneError("invalid", `${field} must be an array of non-empty strings`);
+    }
+    return entry.trim();
+  });
+}
+
 function assertOnlyKeys(body: Record<string, unknown>, allowed: readonly string[]): void {
   const bad = Object.keys(body).filter((k) => !allowed.includes(k));
   if (bad.length) throw new FactoryLaneError("invalid", `unsupported fields: ${bad.sort().join(", ")}`);
@@ -312,7 +324,8 @@ export async function handleFactoryBridgeRequest(
       if (body.nextAction !== undefined) patch.nextAction = str(body.nextAction) ?? null;
       if (body.blocker !== undefined) patch.blocker = str(body.blocker) ?? null;
       if (str(body.prUrl)) patch.prUrl = str(body.prUrl);
-      if (Array.isArray(body.changedFiles)) patch.changedFiles = body.changedFiles.map(String);
+      const changedFiles = parseStringList(body.changedFiles, "changedFiles");
+      if (changedFiles) patch.changedFiles = changedFiles;
       const lane = transition(decodeURIComponent(transit[1]!), phase as FactoryLanePhase, patch, { protectDir });
       log(`TRANSITION lane=${lane.id} phase=${lane.phase}`);
       send(res, 200, { lane });
@@ -323,6 +336,7 @@ export async function handleFactoryBridgeRequest(
       const protectDir = serverProtectDir();
       const body = await readJsonObject(req, { allowEmpty: true });
       assertOnlyKeys(body, CLAIM_KEYS);
+      const pathClaims = parseStringList(body.pathClaims, "pathClaims");
       if (str(body.laneId) && str(body.ownerBotId) && str(body.repo) && str(body.branch) && str(body.worktreePath)) {
         const lane = claimWorktree({
           laneId: body.laneId as string,
@@ -330,7 +344,7 @@ export async function handleFactoryBridgeRequest(
           repo: body.repo as string,
           branch: body.branch as string,
           worktreePath: body.worktreePath as string,
-          pathClaims: Array.isArray(body.pathClaims) ? body.pathClaims.map(String) : undefined,
+          pathClaims,
           protectDir,
         });
         log(`CLAIM worktree lane=${lane.id} owner=${lane.ownerBotId} phase=${lane.phase}`);
@@ -353,6 +367,7 @@ export async function handleFactoryBridgeRequest(
       serverProtectDir();
       const body = await readJsonObject(req);
       assertOnlyKeys(body, REGISTER_KEYS);
+      const pathClaims = parseStringList(body.pathClaims, "pathClaims");
       const input: FactoryLaneInput = {
         title: str(body.title) ?? "",
         ownerBotId: str(body.ownerBotId) ?? "",
@@ -367,7 +382,7 @@ export async function handleFactoryBridgeRequest(
       }
       if (str(body.role) === "qa" || str(body.role) === "implementer") input.role = str(body.role) as "qa" | "implementer";
       if (str(body.reviewerBotId)) input.reviewerBotId = str(body.reviewerBotId);
-      if (Array.isArray(body.pathClaims)) input.pathClaims = body.pathClaims.map(String);
+      if (pathClaims) input.pathClaims = pathClaims;
       // Intentionally omit phase / fullSha / agentSession — callers use /transition.
       const lane = upsertLane(input);
       log(`REGISTER lane=${lane.id} phase=${lane.phase}`);
