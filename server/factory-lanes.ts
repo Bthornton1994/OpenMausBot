@@ -552,7 +552,9 @@ export function transition(
   if (!isPhase(phase)) throw new FactoryLaneError("invalid", `unknown phase ${String(phase)}`);
   const current = all().find((lane) => lane.id === id);
   let allowed: ProtectDecision | null = null;
-  if (phase === "running" && current && current.phase !== "running" && !TERMINAL_PHASES.includes(current.phase)) {
+  // F2/t1743u: gate entry into ANY frozen phase (running/ci_wait/qa_wait/owner_gate),
+  // not only running — otherwise ready→ci_wait can take ownership + fullSha past protect.
+  if (FROZEN_PHASES.includes(phase) && current && current.phase !== phase && !TERMINAL_PHASES.includes(current.phase)) {
     // Gate what the lane will be after the patch, so a patch cannot slip a
     // protected writer session or a frozen SHA past the check.
     const after: FactoryLane = {

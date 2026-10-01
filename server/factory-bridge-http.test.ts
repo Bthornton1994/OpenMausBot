@@ -311,6 +311,78 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     expect(waited.body.report.finished).toBe(true);
   });
 
+
+  it("F1 register refuses existing id (no update)", async () => {
+    const created = await json(base, "POST", "/factory/lanes", {
+      id: "fixed-lane-id-f1",
+      title: "first",
+      ownerBotId: "impl-f1",
+      repo: "acme/widgets",
+      branch: "feature/f1",
+      worktreePath: "C:\\work\\f1",
+    });
+    expect(created.status).toBe(200);
+    expect(created.body.lane.id).toBe("fixed-lane-id-f1");
+    expect(created.body.lane.title).toBe("first");
+
+    const again = await json(base, "POST", "/factory/lanes", {
+      id: "fixed-lane-id-f1",
+      title: "second-should-fail",
+      ownerBotId: "impl-f1",
+      repo: "acme/widgets",
+      branch: "feature/f1-moved",
+      worktreePath: "C:\\work\\f1-moved",
+    });
+    expect(again.status).toBe(409);
+    expect(again.body.error.code).toBe("conflict");
+    expect(getLane("fixed-lane-id-f1")?.title).toBe("first");
+    expect(getLane("fixed-lane-id-f1")?.branch).toBe("feature/f1");
+  });
+
+  it("F2 transition into ci_wait/qa_wait/owner_gate is protect-gated", async () => {
+    const frozen = upsertLane(
+      laneInput("f2-frozen", {
+        repo: VA.repo,
+        branch: VA.branch,
+        worktreePath: "C:\\fixture\\f2-frozen-wt",
+        fullSha: VA_TIP,
+      }),
+    );
+    // Ready → ci_wait would take ownership + keep frozen SHA without F2 gate.
+    const toCi = await json(base, "POST", `/factory/lanes/${frozen.id}/transition`, {
+      phase: "ci_wait",
+      fullSha: VA_TIP,
+    });
+    expect(toCi.status).toBe(403);
+    expect(toCi.body.error.code).toBe("ineligible");
+    expect(getLane(frozen.id)?.phase).toBe("ready");
+    expect(getLane(frozen.id)?.claimedAt).toBeUndefined();
+
+    const toQa = await json(base, "POST", `/factory/lanes/${frozen.id}/transition`, {
+      phase: "qa_wait",
+      reviewerBotId: "qa-bot-f2",
+      fullSha: VA_TIP,
+    });
+    expect(toQa.status).toBe(403);
+    expect(getLane(frozen.id)?.phase).toBe("ready");
+
+    const toGate = await json(base, "POST", `/factory/lanes/${frozen.id}/transition`, {
+      phase: "owner_gate",
+      fullSha: VA_TIP,
+    });
+    expect(toGate.status).toBe(403);
+    expect(getLane(frozen.id)?.phase).toBe("ready");
+
+    // Disjoint lane can still enter ci_wait under protect ALLOW.
+    const ok = upsertLane(laneInput("f2-ok", { fullSha: SHA }));
+    const okCi = await json(base, "POST", `/factory/lanes/${ok.id}/transition`, {
+      phase: "ci_wait",
+      fullSha: SHA,
+    });
+    expect(okCi.status).toBe(200);
+    expect(okCi.body.lane.phase).toBe("ci_wait");
+  });
+
   it("rejects bad Origin for non-health requests", async () => {
     const res = await json(base, "GET", "/factory/lanes", undefined, { origin: "https://evil.example" });
     expect(res.status).toBe(400);

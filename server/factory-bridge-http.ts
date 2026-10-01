@@ -359,6 +359,10 @@ export async function handleFactoryBridgeRequest(
         worktreePath: str(body.worktreePath) ?? "",
       };
       if (str(body.id)) input.id = str(body.id);
+      // F1: register is create-only — never update an existing lane via upsert.
+      if (input.id && getLane(input.id)) {
+        throw new FactoryLaneError("conflict", `lane ${input.id} already exists; register cannot update`);
+      }
       if (str(body.role) === "qa" || str(body.role) === "implementer") input.role = str(body.role) as "qa" | "implementer";
       if (str(body.reviewerBotId)) input.reviewerBotId = str(body.reviewerBotId);
       if (Array.isArray(body.pathClaims)) input.pathClaims = body.pathClaims.map(String);
