@@ -5,8 +5,9 @@ plus the one scheduling rule a manager loop needs: **while a lane waits on CI
 or QA, start another lane only if it cannot touch the waiting lane's branch,
 worktree, or files.**
 
-It is a pure server module. No HTTP route, MCP tool, or UI calls it yet, and
-it changes no model routing, approvals, or engine behavior.
+It is a server module with no MCP tool or UI. Outside tests, its only caller
+is the loopback bridge (`scripts/factory-bridge.ts`; see *Storage* and *QA
+hold*). It changes no model routing, approvals, or engine behavior.
 
 ## Storage
 
@@ -21,7 +22,10 @@ it changes no model routing, approvals, or engine behavior.
   processes writing the same `DATA_DIR` lose each other's changes. While the
   bridge (`scripts/factory-bridge.ts`) runs, make every change through it, QA
   verdicts included; other processes read through it, or with
-  `waitLane(…, { reload: true })`.
+  `waitLane(…, { reload: true })`. The bridge has no route for
+  `releaseOwnership`, `appendEvidence`, or updating a lane (its register route
+  only creates), so those are in-process calls: stop the bridge first, and
+  restart it afterwards so it reloads the file.
 - Missing file → empty. Unparseable file → empty, and the bad file is first
   copied to `factory-lanes.json.corrupt-<epoch ms>` so the next save cannot
   destroy it. Individual invalid lanes are dropped on load.
@@ -109,9 +113,14 @@ without waiting. Pass `reload: true` when another process writes the file.
 - `reviewerBotId === ownerBotId` is rejected everywhere it can be set
   (`upsertLane`, transition patches) with `code: "qa_independence"`; a stored
   self-reviewer is dropped on load.
+- A blank or whitespace-only `reviewerBotId` names no reviewer. Set through
+  `upsertLane` or a transition patch, it leaves the lane with none, clearing
+  any it had — except on a held lane, whose reviewer is frozen (see *QA hold*).
 - `recordQaDisposition(id, { reviewerBotId, disposition, ref, note? })` only
-  accepts the lane's assigned reviewer, never its owner, and logs `qa`
-  evidence that names the reviewer (`FAIL by qa-bot — missing test`).
+  accepts the lane's assigned reviewer, never its owner or a blank id, and
+  logs `qa` evidence that names the reviewer (`FAIL by qa-bot — missing
+  test`). A finished lane keeps the verdict it finished on: a verdict on one is
+  refused (`code: "terminal"`), so record late QA with `appendEvidence`.
 
 ### QA hold (`qa_wait`)
 
@@ -145,6 +154,11 @@ is refused with `code: "ineligible"` and writes nothing.
   that releases the lane comes from the reviewer who held it. Restating it is
   fine, and a held lane with no reviewer may be given one — without one, no
   verdict, and so no exit, is possible.
+- A held lane with no valid reviewer carries no verdict. Loading drops one
+  stored on such a lane (by an older tool, or next to a self-reviewer or blank
+  id that loading drops), and giving a held lane the reviewer it lacked clears
+  any verdict in the same change — so the lane leaves only on a verdict that
+  reviewer recorded.
 - `releaseOwnership` is refused until a verdict is recorded (the phase keeps
   blocking other writers either way).
 - The implementer claim APIs keep refusing a `qa_wait` lane even after `FAIL`
@@ -244,16 +258,18 @@ and rule order match before relying on both together.
 - It does not write the protect list. With no protect directory configured it
   does not know about protected sessions (see *Protect gate*).
 
-## Calling it later (not wired yet)
+## Not wired yet
 
-The intended next steps, each a separate, reviewable change:
+The loopback bridge is the only caller so far. The intended next steps, each a
+separate, reviewable change:
 
 1. A read-only MCP tool (`list_factory_lanes`, `get_factory_lane`) following
    the bounded-read pattern in `docs/mcp-server.md`.
-2. Guarded write tools (`upsert_factory_lane`, `claim_next_factory_lane`) or a
-   loopback HTTP route, so a CoS routine can run one manager-loop step per
-   wake: harvest CI/QA evidence → `appendEvidence`/`transition` →
-   `claimNextEligible` → hand the returned lane's `worktreePath` to the owner
-   bot as its task `cwd`.
-3. Until then, server-side code can import the module directly; tests do so in
-   `server/factory-lanes.test.ts` and `server/factory-lanes.harvest.test.ts`.
+2. Guarded write tools (`upsert_factory_lane`, `claim_next_factory_lane`), or
+   bridge routes for what it lacks (`appendEvidence`, lane updates), so a CoS
+   routine can run one manager-loop step per wake: harvest CI/QA evidence →
+   `appendEvidence`/`transition` → `claimNextEligible` → hand the returned
+   lane's `worktreePath` to the owner bot as its task `cwd`.
+3. Until then, server-side code can import the module directly, one writer at
+   a time (see *Storage*); tests do so in `server/factory-lanes.test.ts` and
+   `server/factory-lanes.harvest.test.ts`.

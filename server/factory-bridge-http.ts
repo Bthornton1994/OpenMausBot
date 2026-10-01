@@ -399,7 +399,8 @@ export async function handleFactoryBridgeRequest(
 
     // t1755u: QA verdicts go through the bridge too, so a bridge client never
     // needs a second process writing the lane file. recordQaDisposition owns
-    // the rules (known disposition, independent and assigned reviewer).
+    // the rules (known disposition, independent and assigned reviewer, a lane
+    // that has not finished).
     const verdict = path.match(/^\/factory\/lanes\/([^/]+)\/qa$/);
     if (method === "POST" && verdict) {
       serverProtectDir();

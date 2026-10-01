@@ -6,10 +6,11 @@
 // which other lane can safely start?" without ever putting a second writer on
 // A's frozen branch, worktree, or files.
 //
-// This is a pure module: no HTTP route or MCP tool calls it yet (see
-// docs/factory-lanes.md). It persists to DATA_DIR/factory-lanes.json with the
-// same atomic-write / corrupt-file-means-empty rules as delegations.ts, except
-// that a corrupt file is copied aside before the next save replaces it.
+// No MCP tool or UI calls it; outside tests its only caller is the loopback
+// bridge (factory-bridge-http.ts; see docs/factory-lanes.md). It persists to
+// DATA_DIR/factory-lanes.json with the same atomic-write /
+// corrupt-file-means-empty rules as delegations.ts, except that a corrupt
+// file is copied aside before the next save replaces it.
 //
 // Ownership is fail-closed: paths and branch names compare case-insensitively
 // and nested worktree paths overlap, so a doubtful pair counts as a conflict.
@@ -266,7 +267,13 @@ function parseLane(value: unknown): FactoryLane | null {
   }
   const changedFiles = stringList(raw.changedFiles);
   if (changedFiles) lane.changedFiles = changedFiles;
-  if (isQaDisposition(raw.qaDisposition)) lane.qaDisposition = raw.qaDisposition;
+  // t1756u F-1/F-2: a held lane's verdict counts only from its own reviewer.
+  // One stored on a lane with no valid reviewer (an older tool's store, or a
+  // self-reviewer or blank id dropped above) is dropped too, so a person
+  // assigns a real reviewer and that reviewer records a fresh verdict.
+  if (isQaDisposition(raw.qaDisposition) && (lane.phase !== "qa_wait" || lane.reviewerBotId)) {
+    lane.qaDisposition = raw.qaDisposition;
+  }
   if (Number.isFinite(raw.claimedAt) && !TERMINAL_PHASES.includes(lane.phase)) lane.claimedAt = raw.claimedAt as number;
   return lane;
 }
@@ -475,8 +482,18 @@ function applyPatch(lane: FactoryLane, patch: FactoryLanePatch): void {
     lane.title = title;
   }
   if (patch.reviewerBotId !== undefined) {
-    assertIndependentReviewer(lane.ownerBotId, patch.reviewerBotId);
-    lane.reviewerBotId = patch.reviewerBotId;
+    // t1756u F-4: a blank id names no reviewer. Like an empty field below,
+    // and like loading, it leaves the lane without one.
+    const reviewerBotId = text(patch.reviewerBotId);
+    if (!reviewerBotId) {
+      delete lane.reviewerBotId;
+    } else {
+      assertIndependentReviewer(lane.ownerBotId, reviewerBotId);
+      // t1756u F-1: a held lane given a reviewer it lacked starts from no
+      // verdict, since none it holds came from them.
+      if (lane.phase === "qa_wait" && lane.reviewerBotId === undefined) delete lane.qaDisposition;
+      lane.reviewerBotId = reviewerBotId;
+    }
   }
   if (patch.fullSha !== undefined) {
     if (!FULL_SHA.test(patch.fullSha)) throw new FactoryLaneError("invalid", "fullSha must be a full 40-character hex SHA");
@@ -734,14 +751,18 @@ export function releaseOwnership(laneId: string): FactoryLane {
 /** Independent QA verdict. Only the lane's assigned reviewer — never its
  * owner — can record one, and its `qa` evidence names them. A verdict
  * recorded while the lane is in qa_wait decides how it may leave (see
- * QA_HOLD_EXITS); FAIL is the rework handoff. */
+ * QA_HOLD_EXITS); FAIL is the rework handoff. A finished lane keeps the
+ * verdict it finished on (t1756u F-3): late QA goes in with appendEvidence. */
 export function recordQaDisposition(
   id: string,
   input: { reviewerBotId: string; disposition: QaDisposition; ref: string; note?: string },
 ): FactoryLane {
   if (!isQaDisposition(input.disposition)) throw new FactoryLaneError("invalid", `unknown QA disposition ${String(input.disposition)}`);
+  // t1756u F-4: a blank id names no reviewer, so it can record no verdict.
+  if (!text(input.reviewerBotId)) throw new FactoryLaneError("invalid", "reviewerBotId is required");
   return commit((draft) => {
     const lane = mustFind(draft, id);
+    assertNotTerminal(lane);
     assertIndependentReviewer(lane.ownerBotId, input.reviewerBotId);
     if (lane.reviewerBotId !== input.reviewerBotId) {
       throw new FactoryLaneError("qa_independence", `lane ${lane.id} is reviewed by ${lane.reviewerBotId ?? "nobody yet"}, not ${input.reviewerBotId}`);

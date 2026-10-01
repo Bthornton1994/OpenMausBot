@@ -63,6 +63,14 @@ function heldByQa(suffix: string): FactoryLane {
 const verdict = (id: string, disposition: Parameters<typeof recordQaDisposition>[1]["disposition"], ref = "_cos/QA_DIGEST.md") =>
   recordQaDisposition(id, { reviewerBotId: "qa-bot", disposition, ref });
 
+/** A lane as stored on disk (say, by an older tool), parked in qa_wait on SHA_A. */
+function storedHeld(id: string, fields: Record<string, unknown> = {}) {
+  const now = Date.now();
+  return { ...laneInput(id), id, phase: "qa_wait", fullSha: SHA_A, evidence: [], createdAt: now, updatedAt: now, ...fields };
+}
+
+const store = (...stored: Record<string, unknown>[]) => writeFileSync(FILE, JSON.stringify({ version: 1, lanes: stored }));
+
 beforeEach(() => {
   mkdirSync(DATA_DIR, { recursive: true });
   for (const name of readdirSync(DATA_DIR)) {
@@ -390,22 +398,105 @@ describe("factory lanes: QA hold freezes the reviewer (t1755u)", () => {
   });
 
   it("never credits a reviewer assigned on the handoff with a FAIL recorded before them", () => {
-    // A stored lane (say, written by an older tool) holding a FAIL but no reviewer.
-    const now = Date.now();
-    const stored = {
-      ...laneInput("a"),
-      id: "a",
-      phase: "qa_wait",
-      fullSha: SHA_A,
-      qaDisposition: "FAIL",
-      evidence: [{ at: now, kind: "qa", ref: "_cos/QA_DIGEST.md", note: "FAIL" }],
-      createdAt: now,
-      updatedAt: now,
-    };
-    writeFileSync(FILE, JSON.stringify({ version: 1, lanes: [stored] }));
-    const rework = transition("a", "running", { reviewerBotId: "qa-bot-2" });
+    // Stored lanes (say, written by an older tool) holding a FAIL but no
+    // reviewer. t1756u F-1: no reviewer recorded that FAIL, so it counts for nothing.
+    const fail = { qaDisposition: "FAIL", evidence: [{ at: Date.now(), kind: "qa", ref: "_cos/QA_DIGEST.md", note: "FAIL" }] };
+    store(storedHeld("a", fail), storedHeld("b", fail));
+    // A reviewer given to such a hold starts from no verdict…
+    const assigned = upsertLane({ ...laneInput("b"), id: "b", reviewerBotId: "qa-bot-2" });
+    expect(assigned).toMatchObject({ phase: "qa_wait", reviewerBotId: "qa-bot-2" });
+    expect(assigned.qaDisposition).toBeUndefined();
+    // …and the stored FAIL neither releases the hold nor credits one assigned on the way out.
+    expect(getLane("a")!.qaDisposition).toBeUndefined();
+    expectLaneError(() => transition("a", "running", { reviewerBotId: "qa-bot-2" }), "ineligible", /no QA verdict recorded/);
+    expect(transition("a", "qa_wait", { reviewerBotId: "qa-bot-2" }).qaDisposition).toBeUndefined();
+    expectLaneError(() => transition("a", "running"), "ineligible", /no QA verdict recorded/);
+    // The lane leaves only on the new reviewer's own FAIL, which the rework note names.
+    recordQaDisposition("a", { reviewerBotId: "qa-bot-2", disposition: "FAIL", ref: "_cos/QA_DIGEST-2.md" });
+    const rework = transition("a", "running");
     expect(rework).toMatchObject({ phase: "running", reviewerBotId: "qa-bot-2" });
-    expect(rework.evidence.at(-2)).toMatchObject({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: "QA FAIL by its reviewer handed the lane back for rework" });
+    expect(rework.evidence.at(-2)).toMatchObject({ kind: "rework", ref: "_cos/QA_DIGEST-2.md", note: "QA FAIL by qa-bot-2 handed the lane back for rework" });
+  });
+});
+
+describe("factory lanes: verdicts need a real reviewer (t1756u)", () => {
+  it("F-1/F-2: on load, keeps a held lane's verdict only when it has a valid independent reviewer", () => {
+    const pass = { qaDisposition: "PASS" };
+    store(
+      storedHeld("none", pass),
+      storedHeld("blank", { ...pass, reviewerBotId: "" }),
+      storedHeld("spaces", { ...pass, reviewerBotId: "   " }),
+      storedHeld("self", { ...pass, reviewerBotId: "implementer-self" }),
+      storedHeld("valid", { ...pass, reviewerBotId: "qa-bot" }),
+      storedHeld("finished", { ...pass, phase: "done" }),
+    );
+    expect(listLanes().map(({ id, reviewerBotId, qaDisposition }) => ({ id, reviewerBotId, qaDisposition }))).toEqual([
+      { id: "none" },
+      { id: "blank" },
+      { id: "spaces" },
+      { id: "self" },
+      { id: "valid", reviewerBotId: "qa-bot", qaDisposition: "PASS" },
+      // A finished lane never moves again; it keeps the verdict it finished on.
+      { id: "finished", qaDisposition: "PASS" },
+    ]);
+  });
+
+  it("F-2: drops a stored self-review with its reviewer, so a held lane cannot finish on it", () => {
+    store(
+      storedHeld("a", {
+        reviewerBotId: "implementer-a",
+        qaDisposition: "PASS",
+        evidence: [{ at: Date.now(), kind: "qa", ref: "_cos/QA_DIGEST.md", note: "PASS by implementer-a" }],
+      }),
+    );
+    const loaded = getLane("a")!;
+    expect(loaded.reviewerBotId).toBeUndefined();
+    expect(loaded.qaDisposition).toBeUndefined();
+    expectLaneError(() => transition("a", "done"), "ineligible", /no QA verdict recorded/);
+    transition("a", "qa_wait", { reviewerBotId: "qa-bot" });
+    expectLaneError(() => transition("a", "done"), "ineligible", /no QA verdict recorded/);
+    verdict("a", "PASS");
+    // A verdict from the lane's own reviewer survives a restart.
+    _resetFactoryLanes();
+    expect(getLane("a")).toMatchObject({ reviewerBotId: "qa-bot", qaDisposition: "PASS" });
+    expect(transition("a", "done", { outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", reviewerBotId: "qa-bot", qaDisposition: "PASS" });
+  });
+
+  it("F-3: refuses a QA verdict on a finished lane, which keeps the verdict it finished on", () => {
+    for (const [phase, recorded, late] of [
+      ["done", "PASS", "FAIL"],
+      ["failed", "FAIL", "PASS"],
+      ["cancelled", "BLOCKED", "PASS"],
+    ] as const) {
+      const lane = heldByQa(phase);
+      verdict(lane.id, recorded);
+      transition(lane.id, phase);
+      const onDisk = readFileSync(FILE, "utf8");
+      expectLaneError(() => verdict(lane.id, late), "terminal");
+      expect(readFileSync(FILE, "utf8")).toBe(onDisk);
+      expect(getLane(lane.id)).toMatchObject({ phase, qaDisposition: recorded });
+      // Late QA still reaches the audit trail, as evidence rather than a verdict.
+      expect(appendEvidence(lane.id, { kind: "qa", ref: "_cos/LATE_QA.md", note: `${late} by qa-bot` })).toMatchObject({ phase, qaDisposition: recorded });
+    }
+  });
+
+  it("F-4: treats a blank reviewer id as none, so it neither freezes a hold nor records a verdict", () => {
+    const lane = upsertLane(laneInput("a", { phase: "qa_wait", fullSha: SHA_A, reviewerBotId: "   " }));
+    expect(lane.reviewerBotId).toBeUndefined();
+    for (const blank of ["", "   "]) {
+      expect(transition(lane.id, "qa_wait", { reviewerBotId: blank }).reviewerBotId).toBeUndefined();
+      expect(upsertLane({ ...laneInput("a"), id: lane.id, reviewerBotId: blank }).reviewerBotId).toBeUndefined();
+      expectLaneError(() => recordQaDisposition(lane.id, { reviewerBotId: blank, disposition: "FAIL", ref: "_cos/QA_DIGEST.md" }), "invalid");
+    }
+    expect(getLane(lane.id)).toMatchObject({ phase: "qa_wait", evidence: [] });
+    expectLaneError(() => transition(lane.id, "running"), "ineligible", /no QA verdict recorded/);
+    // A real reviewer can still be given the hold, and only their verdict releases it.
+    expect(transition(lane.id, "qa_wait", { reviewerBotId: "qa-bot" }).reviewerBotId).toBe("qa-bot");
+    verdict(lane.id, "FAIL");
+    const rework = transition(lane.id, "running");
+    expect(rework.evidence.at(-2)).toMatchObject({ kind: "rework", note: "QA FAIL by qa-bot handed the lane back for rework" });
+    // Outside the hold, a blank clears the reviewer, as loading would.
+    expect(transition(lane.id, "running", { reviewerBotId: "" }).reviewerBotId).toBeUndefined();
   });
 });
 
