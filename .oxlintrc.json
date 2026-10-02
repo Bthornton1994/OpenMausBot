@@ -1,4 +1,7 @@
 {
+  "rules": {
+    "oxc/no-accumulating-spread": "error"
+  },
   "ignorePatterns": [
     ".agent/**",
     ".agents/**",

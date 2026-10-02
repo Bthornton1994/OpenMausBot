@@ -1,0 +1,16 @@
+{
+  "$schema": "../../../node_modules/oxlint/configuration_schema.json",
+  "jsPlugins": [
+    "./index.ts"
+  ],
+  "categories": {
+    "correctness": "off"
+  },
+  "rules": {
+    "anti-slop/no-chained-type-assertions": "warn",
+    "anti-slop/no-reduce-accumulator-copy": "warn",
+    "anti-slop/no-unsafe-dictionary-type": ["warn", { "allow": ["unknown"] }],
+    "anti-slop/no-widen-then-assert": "warn",
+    "anti-slop/require-safety-comment-for-type-assertion": "warn"
+  }
+}
