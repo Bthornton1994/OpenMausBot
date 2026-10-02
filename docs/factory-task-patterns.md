@@ -42,6 +42,11 @@ none of its code is used.
      pattern; any other id fails the lookup with `unknown_pattern`.
    - An overlay may only **narrow** its built-in: same role, permitted
      actions a subset of the built-in's, forbidden actions a superset.
+   - An overlay that sets `stopConditions` or `verificationEvidence` must
+     supply a superset of the built-in list (every built-in entry remains;
+     entries may only be added), and omitting either field inherits the
+     built-in list, while dropping or replacing an entry fails closed with
+     `overlay_not_narrow`.
    - No `patterns` directory means no overlay. Any other failure (unreadable
      directory, bad JSON, invalid pattern, id outside the catalog) fails the
      whole lookup. A broken overlay is never treated as "use the built-ins".
@@ -88,8 +93,8 @@ never edit, commit, or push. `reporter` only reads and records.
 | `renderBrief(pattern, vars)` | pattern invalid; unknown, missing-required, non-string, or `{{…}}`-containing vars; override wording in any var or in the assembled prose |
 
 All failures throw `FactoryPatternError` with a `code`: `unknown_pattern`,
-`invalid_pattern`, `action_denied`, `override_attempt`, `invalid_vars`, or
-`overlay_unavailable`. Returned patterns are deeply frozen.
+`invalid_pattern`, `action_denied`, `override_attempt`, `invalid_vars`,
+`overlay_unavailable`, or `overlay_not_narrow`. Returned patterns are deeply frozen.
 
 ## Briefs carry no authority
 

@@ -22,7 +22,10 @@
 //   2. Optional overlay: $COS_FACTORY_ROOT/patterns/<id>.json, read fresh on
 //      every call. Same validator. An overlay may only narrow one of the
 //      built-ins: same role, permitted actions a subset of the built-in's,
-//      forbidden actions a superset. An overlay cannot add a pattern.
+//      forbidden actions a superset. stopConditions and verificationEvidence,
+//      when the overlay sets them, must be supersets of the built-in lists
+//      (t1759u); omitting either field inherits the built-in. An overlay
+//      cannot add a pattern.
 //
 // Patterns are not wired into the bridge or lanes; runtime eligibility,
 // protect, and auth decisions stay in their own code.
@@ -46,7 +49,8 @@ export type FactoryPatternErrorCode =
   | "action_denied"
   | "override_attempt"
   | "invalid_vars"
-  | "overlay_unavailable";
+  | "overlay_unavailable"
+  | "overlay_not_narrow";
 
 export class FactoryPatternError extends Error {
   constructor(
@@ -552,6 +556,18 @@ export function resolvePatternOverlayDir(options: PatternLookupOptions = {}): st
   return root ? join(root, "patterns") : null;
 }
 
+/** Built-in entries missing from `overlay`, counting duplicates. */
+function droppedEntries(base: readonly string[], overlay: readonly string[]): string[] {
+  const pool = [...overlay];
+  const dropped: string[] = [];
+  for (const entry of base) {
+    const at = pool.indexOf(entry);
+    if (at < 0) dropped.push(entry);
+    else pool.splice(at, 1);
+  }
+  return dropped;
+}
+
 /** An overlay pattern reusing a built-in id may only narrow it. */
 function assertNarrows(overlay: FactoryTaskPattern, base: FactoryTaskPattern, file: string): void {
   if (overlay.role !== base.role) fail("action_denied", `${file} changes the role of built-in ${base.id}`);
@@ -559,6 +575,31 @@ function assertNarrows(overlay: FactoryTaskPattern, base: FactoryTaskPattern, fi
   if (widened.length) fail("action_denied", `${file} widens built-in ${base.id} with ${widened.join(", ")}`);
   const dropped = base.forbiddenActions.filter((action) => !overlay.forbiddenActions.includes(action));
   if (dropped.length) fail("action_denied", `${file} drops forbidden actions ${dropped.join(", ")} from ${base.id}`);
+  for (const field of ["stopConditions", "verificationEvidence"] as const) {
+    const missing = droppedEntries(base[field], overlay[field]);
+    if (missing.length) {
+      fail(
+        "overlay_not_narrow",
+        `${file} ${field} must keep every built-in entry for ${base.id}; dropped: ${missing.join(" | ")}`,
+      );
+    }
+  }
+}
+
+/** Overlay JSON may omit stop/evidence lists; those inherit the built-in.
+ * A present value, including null or a shorter list, is left for validation
+ * and the superset check. Unknown ids are not filled in. */
+function inheritOmittedNarrowLists(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.id !== "string") return raw;
+  const base = BUILT_IN_PATTERNS.get(obj.id);
+  if (!base) return raw;
+  const inherited: Partial<Pick<FactoryTaskPattern, "stopConditions" | "verificationEvidence">> = {};
+  for (const field of ["stopConditions", "verificationEvidence"] as const) {
+    if (!Object.hasOwn(obj, field)) inherited[field] = [...base[field]];
+  }
+  return Object.keys(inherited).length ? { ...obj, ...inherited } : raw;
 }
 
 /** The built-ins, each possibly narrowed by the overlay, read fresh. A missing
@@ -586,7 +627,7 @@ export function loadPatterns(options: PatternLookupOptions = {}): ReadonlyMap<st
     }
     let pattern: FactoryTaskPattern;
     try {
-      pattern = validatePattern(raw);
+      pattern = validatePattern(inheritOmittedNarrowLists(raw));
     } catch (error) {
       if (error instanceof FactoryPatternError) throw new FactoryPatternError(error.code, `overlay ${name}: ${error.message}`);
       throw error;

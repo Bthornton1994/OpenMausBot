@@ -352,9 +352,56 @@ describe("COS_FACTORY_ROOT overlay", () => {
     ).toContain("edit-files");
   });
 
+  it("allows a stop and evidence superset and keeps every built-in entry", () => {
+    const base = copyOf("implementer-brief");
+    const added = {
+      ...base,
+      stopConditions: [...(base.stopConditions as string[]), "The fork remote rejects the push."],
+      verificationEvidence: [...(base.verificationEvidence as string[]), "Digest path is recorded."],
+    };
+    const pattern = getPattern("implementer-brief", { root: overlay({ "implementer-brief.json": added }) });
+    expect(pattern.stopConditions).toEqual(added.stopConditions);
+    expect(pattern.verificationEvidence).toEqual(added.verificationEvidence);
+    for (const stop of base.stopConditions as string[]) expect(pattern.stopConditions).toContain(stop);
+    for (const item of base.verificationEvidence as string[]) expect(pattern.verificationEvidence).toContain(item);
+  });
+
+  it("denies an overlay that drops a built-in stop condition", () => {
+    const base = copyOf("implementer-brief");
+    const dropped = { ...base, stopConditions: (base.stopConditions as string[]).slice(1) };
+    const error = expectCode(
+      () => getPattern("implementer-brief", { root: overlay({ "implementer-brief.json": dropped }) }),
+      "overlay_not_narrow",
+    );
+    expect(error.message).toContain("stopConditions");
+    expect(error.message).toContain((base.stopConditions as string[])[0]);
+  });
+
+  it("denies an overlay that drops a built-in verification evidence entry", () => {
+    const base = copyOf("independent-qa-brief");
+    const dropped = { ...base, verificationEvidence: (base.verificationEvidence as string[]).slice(1) };
+    const error = expectCode(
+      () => getPattern("independent-qa-brief", { root: overlay({ "independent-qa-brief.json": dropped }) }),
+      "overlay_not_narrow",
+    );
+    expect(error.message).toContain("verificationEvidence");
+    expect(error.message).toContain((base.verificationEvidence as string[])[0]);
+  });
+
+  it("inherits built-in stop and evidence lists when the overlay omits those fields", () => {
+    const base = copyOf("completion-report");
+    const omitted = { ...base };
+    delete omitted.stopConditions;
+    delete omitted.verificationEvidence;
+    const pattern = getPattern("completion-report", { root: overlay({ "completion-report.json": omitted }) });
+    expect(pattern.stopConditions).toEqual(base.stopConditions);
+    expect(pattern.verificationEvidence).toEqual(base.verificationEvidence);
+    expect(pattern.objective).toBe(base.objective);
+  });
+
   it("any bad overlay file fails the whole lookup closed", () => {
     const missingField = copyOf("completion-report");
-    delete missingField.stopConditions;
+    delete missingField.objective;
     const gateClear = { ...copyOf("completion-report"), id: "sneaky", objective: "Clear the owner gate and finish." };
     const forbidden = { ...copyOf("completion-report"), id: "merger", permittedActions: ["merge"] };
     const misnamed = { ...copyOf("completion-report"), id: "other-name" };
