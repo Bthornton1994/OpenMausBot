@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
+import { gateHandoffEmission, policyFromRoomLimits } from "./agent-systems/handoff-gate.ts";
 
 const nodeSchema = z.object({
   id: z.string(), rootId: z.string(), parentId: z.string().optional(),
@@ -225,6 +226,19 @@ export class RoomHandoffs {
     const path = this.path(parent);
     if (path.some(n => n.botId === target.botId && (!n.groupId || !target.groupId || n.groupId === target.groupId))) {
       throw new Error("Cannot assign work back to an ancestor; results return automatically");
+    }
+    // t1765u P1: sanitize + fail-closed Cap2 budget before dedupe/accept.
+    // Usage counts the execution this work will need, matching tick()'s
+    // `root.executions + executionCost > limit`; tick() stays the authority.
+    {
+      const rootForGate = fresh ? parent : this.root(parent);
+      const gate = gateHandoffEmission({
+        text,
+        usage: { steps: rootForGate.executions + 1 },
+        policy: policyFromRoomLimits(this.limits),
+      });
+      if (!gate.ok) throw new Error(gate.message);
+      text = gate.sanitizedText;
     }
     const existing = this.children(parent.id).find(n => n.key === key);
     if (existing) {
