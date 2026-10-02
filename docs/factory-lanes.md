@@ -23,9 +23,15 @@ hold*). It changes no model routing, approvals, or engine behavior.
   bridge (`scripts/factory-bridge.ts`) runs, make every change through it, QA
   verdicts included; other processes read through it, or with
   `waitLane(…, { reload: true })`. The bridge has no route for
-  `releaseOwnership`, `appendEvidence`, or updating a lane (its register route
-  only creates), so those are in-process calls: stop the bridge first, and
-  restart it afterwards so it reloads the file.
+  `releaseOwnership`, `appendEvidence`, or updating a lane the way
+  `upsertLane` does (title, `agentSession`, a repo/branch/worktree move,
+  `pathClaims`; its register route only creates), so those are in-process
+  calls: stop the bridge first, and restart it afterwards so it reloads the
+  file.
+- A same-phase `POST /factory/lanes/:id/transition` does update the fields
+  that route accepts: `outcome`, `nextAction`, `blocker`, `prUrl`,
+  `changedFiles`, and — where the QA hold allows — `fullSha` and
+  `reviewerBotId`.
 - Missing file → empty. Unparseable file → empty, and the bad file is first
   copied to `factory-lanes.json.corrupt-<epoch ms>` so the next save cannot
   destroy it. Individual invalid lanes are dropped on load.
@@ -48,6 +54,7 @@ hold*). It changes no model routing, approvals, or engine behavior.
 | `evidence[]` | `{ at, kind, ref, note? }` — commit, ci, qa, pr, claim, phase, … |
 | `blocker?`, `nextAction?`, `prUrl?`, `changedFiles?`, `outcome?` | `outcome` is free text (e.g. `KEEP_DRAFT`, `CLEAR`, `merged`) |
 | `qaDisposition?` | `PASS` `FAIL` `BLOCKED` `NOT RUN` `UNKNOWN` |
+| `qaRecordedBy?` | the reviewer who recorded `qaDisposition`; set by `recordQaDisposition`, cleared with the verdict (see *QA hold*) |
 | `claimedAt?` | set while the lane holds an explicit claim |
 | `createdAt`, `updatedAt` | epoch ms |
 
@@ -114,8 +121,16 @@ without waiting. Pass `reload: true` when another process writes the file.
   (`upsertLane`, transition patches) with `code: "qa_independence"`; a stored
   self-reviewer is dropped on load.
 - A blank or whitespace-only `reviewerBotId` names no reviewer. Set through
-  `upsertLane` or a transition patch, it leaves the lane with none, clearing
-  any it had — except on a held lane, whose reviewer is frozen (see *QA hold*).
+  `upsertLane` or a transition patch in-process, it leaves the lane with none,
+  clearing any it had — except on a held lane, whose reviewer is frozen (see
+  *QA hold*). The bridge's `POST /factory/lanes/:id/transition` ignores a
+  blank or `null` reviewer, so a bridge client cannot clear one.
+- In-process calls, the bridge and loading all read a reviewer id the same
+  way. It is trimmed, so a padded id names the same reviewer, and it is
+  compared with the trimmed `ownerBotId`. An id that, once trimmed, still
+  contains a character that does not print — a zero-width space, a control or
+  format character, a space other than U+0020 — is refused with
+  `code: "invalid"`; loading drops a stored one, as it drops a self-reviewer.
 - `recordQaDisposition(id, { reviewerBotId, disposition, ref, note? })` only
   accepts the lane's assigned reviewer, never its owner or a blank id, and
   logs `qa` evidence that names the reviewer (`FAIL by qa-bot — missing
@@ -154,7 +169,8 @@ is refused with `code: "ineligible"` and writes nothing.
   that releases the lane comes from the reviewer who held it. Restating it is
   fine, and a held lane with no reviewer may be given one — without one, no
   verdict, and so no exit, is possible.
-- A held lane with no valid reviewer carries no verdict. Loading drops one
+- A held lane with no valid reviewer carries no verdict, so none releases it
+  — not even in the transition that gives it a reviewer. Loading drops one
   stored on such a lane (by an older tool, or next to a self-reviewer or blank
   id that loading drops), and giving a held lane the reviewer it lacked clears
   any verdict in the same change — so the lane leaves only on a verdict that
@@ -166,11 +182,22 @@ is refused with `code: "ineligible"` and writes nothing.
   verdict and QA is pending again. This fails closed on a store an older tool
   wrote: its `qa` notes name no reviewer (`FAIL — missing test`), it let a
   held lane's reviewer change, and it kept a verdict on entering `qa_wait`.
+- `recordQaDisposition` also stores who recorded the verdict, as
+  `qaRecordedBy`; entering `qa_wait` clears it with the verdict. Where it is
+  stored, a held verdict counts only while it names the lane's assigned
+  reviewer: loading drops a verdict whose stored `qaRecordedBy` names anyone
+  else (or no one), even beside that reviewer's note, and a lane never leaves
+  `qa_wait` on one.
+- A verdict stored before `qaRecordedBy` existed has only its note. Loading
+  keeps it on the note rule above without adding the field. To leave
+  `qa_wait` on it, the note must still pass that rule. The field is set the
+  next time the reviewer records a verdict.
 - So after pointing this code at a `DATA_DIR` an older tool wrote, a held
   lane whose verdict was dropped stays in `qa_wait` until its assigned
-  reviewer records the verdict again (`POST /factory/lanes/:id/qa`). The
-  same happens at the next load if a `qa` entry that is not the reviewer's
-  verdict is added to a held lane with `appendEvidence`.
+  reviewer records the verdict again (`POST /factory/lanes/:id/qa`). If a
+  `qa` entry that is not the reviewer's verdict is added to a held lane with
+  `appendEvidence`, the same happens at the next load — and at once for a
+  verdict from before `qaRecordedBy`, which only its note attributes.
 - `releaseOwnership` is refused until a verdict is recorded (the phase keeps
   blocking other writers either way).
 - The implementer claim APIs keep refusing a `qa_wait` lane even after `FAIL`
@@ -278,10 +305,10 @@ separate, reviewable change:
 1. A read-only MCP tool (`list_factory_lanes`, `get_factory_lane`) following
    the bounded-read pattern in `docs/mcp-server.md`.
 2. Guarded write tools (`upsert_factory_lane`, `claim_next_factory_lane`), or
-   bridge routes for what it lacks (`appendEvidence`, lane updates), so a CoS
-   routine can run one manager-loop step per wake: harvest CI/QA evidence →
-   `appendEvidence`/`transition` → `claimNextEligible` → hand the returned
-   lane's `worktreePath` to the owner bot as its task `cwd`.
+   bridge routes for what it lacks (`appendEvidence`, `releaseOwnership`, lane
+   updates), so a CoS routine can run one manager-loop step per wake: harvest
+   CI/QA evidence → `appendEvidence`/`transition` → `claimNextEligible` → hand
+   the returned lane's `worktreePath` to the owner bot as its task `cwd`.
 3. Until then, server-side code can import the module directly, one writer at
    a time (see *Storage*); tests do so in `server/factory-lanes.test.ts` and
    `server/factory-lanes.harvest.test.ts`.

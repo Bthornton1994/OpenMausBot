@@ -20,7 +20,8 @@
 // A lane in qa_wait is held by independent QA: it leaves only on a verdict
 // its reviewer recorded, and only where that verdict allows (assertQaHold).
 // Loading holds what is on disk to the same rule: a held verdict without its
-// reviewer's `qa` note from that hold is dropped (heldVerdictRecorded).
+// reviewer's `qa` note from that hold (heldVerdictRecorded), or whose
+// qaRecordedBy names someone else, is dropped.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { posix, join } from "node:path";
@@ -95,6 +96,9 @@ export interface FactoryLane {
   /** The reviewer's verdict on the current (or last) QA hold. Entering
    * qa_wait clears it: a new hold needs a new verdict. */
   qaDisposition?: QaDisposition;
+  /** The reviewer who recorded qaDisposition; set and cleared with it. A
+   * verdict stored before this field existed has none (see heldVerdict). */
+  qaRecordedBy?: string;
   outcome?: string;
   /** Derived from repo + branch + normalized worktreePath. */
   ownershipKey: string;
@@ -202,6 +206,29 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.slice(0, MAX_TEXT) : undefined;
 }
 
+/** What does not print: Unicode's "other" and separator categories (control,
+ * format, surrogate, private-use and unassigned code points; every space but
+ * U+0020), plus the default-ignorable code points that render as nothing. */
+const NON_PRINTING = /(?! )[\p{C}\p{Z}\p{Default_Ignorable_Code_Point}]/u;
+
+/** t1758u I-3: a reviewer id as callers, the bridge (whose routes trim too)
+ * and loading all read it, so all of them name the same reviewer. Trimmed;
+ * blank names no reviewer (undefined); null when a character in it does not
+ * print, such as a zero-width space. */
+function readReviewerId(value: unknown): string | null | undefined {
+  const id = typeof value === "string" ? value.trim() : "";
+  if (!id) return undefined;
+  return NON_PRINTING.test(id) ? null : id.slice(0, MAX_TEXT);
+}
+
+/** A caller's reviewer id: one that does not print is refused, never stored
+ * or compared, since nobody reading the lane could see who it names. */
+function reviewerId(value: unknown): string | undefined {
+  const id = readReviewerId(value);
+  if (id === null) throw new FactoryLaneError("invalid", "reviewerBotId must be printable (no zero-width, control or format characters)");
+  return id;
+}
+
 function stringList(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const list = value.filter((item): item is string => typeof item === "string" && item.trim() !== "");
@@ -272,10 +299,11 @@ function parseLane(value: unknown): FactoryLane | null {
     createdAt: raw.createdAt as number,
     updatedAt: raw.updatedAt as number,
   };
-  const reviewerBotId = text(raw.reviewerBotId);
   // A stored lane whose reviewer is its own owner is not independent QA; keep
-  // the lane, drop the reviewer, so a person has to assign a real one.
-  if (reviewerBotId && reviewerBotId !== ownerBotId) lane.reviewerBotId = reviewerBotId;
+  // the lane, drop the reviewer, so a person has to assign a real one. The
+  // same goes for a reviewer id that does not print (t1758u I-3).
+  const reviewerBotId = readReviewerId(raw.reviewerBotId);
+  if (reviewerBotId && reviewerBotId !== ownerBotId.trim()) lane.reviewerBotId = reviewerBotId;
   if (raw.role === "qa") lane.role = "qa";
   const pathClaims = stringList(raw.pathClaims);
   if (pathClaims) lane.pathClaims = pathClaims;
@@ -293,8 +321,16 @@ function parseLane(value: unknown): FactoryLane | null {
   // assigns a real reviewer and that reviewer records a fresh verdict.
   // t1757u R-1: so is one a valid reviewer left no `qa` note for in this hold
   // (heldVerdictRecorded): the lane is QA-pending until they record it again.
-  if (isQaDisposition(raw.qaDisposition) && (lane.phase !== "qa_wait" || heldVerdictRecorded(lane, raw.qaDisposition))) {
-    lane.qaDisposition = raw.qaDisposition;
+  // t1758u: and so is one whose stored qaRecordedBy is anyone but that
+  // reviewer. A verdict stored before the field existed has only its note to
+  // go by; it gets the field when its reviewer next records a verdict.
+  if (isQaDisposition(raw.qaDisposition)) {
+    const recordedBy = readReviewerId(raw.qaRecordedBy);
+    const held = lane.phase === "qa_wait";
+    if (!held || (heldVerdictRecorded(lane, raw.qaDisposition) && (raw.qaRecordedBy === undefined || recordedBy === lane.reviewerBotId))) {
+      lane.qaDisposition = raw.qaDisposition;
+      if (recordedBy) lane.qaRecordedBy = recordedBy;
+    }
   }
   if (Number.isFinite(raw.claimedAt) && !TERMINAL_PHASES.includes(lane.phase)) lane.claimedAt = raw.claimedAt as number;
   return lane;
@@ -356,8 +392,11 @@ function assertNotTerminal(lane: FactoryLane): void {
   }
 }
 
+/** Takes a reviewer id already read by reviewerId. The owner id is stored as
+ * given, so it is compared trimmed too: padding never makes a bot its own
+ * reviewer. */
 function assertIndependentReviewer(ownerBotId: string, reviewerBotId: string | undefined): void {
-  if (reviewerBotId !== undefined && reviewerBotId === ownerBotId) {
+  if (reviewerBotId !== undefined && reviewerBotId === ownerBotId.trim()) {
     throw new FactoryLaneError("qa_independence", "reviewerBotId must differ from ownerBotId (independent QA)");
   }
 }
@@ -438,8 +477,23 @@ const QA_HOLD_EXITS: Partial<Record<FactoryLanePhase, readonly QaDisposition[]>>
   cancelled: QA_DISPOSITIONS,
 };
 
-const qaHeld = (lane: FactoryLane): string =>
-  `lane ${lane.id} is held by QA in qa_wait (${lane.qaDisposition ? `QA ${lane.qaDisposition}` : "no QA verdict recorded"})`;
+/** The verdict that can release a held lane: one its assigned reviewer
+ * recorded. t1758u: qaRecordedBy says who that was. A verdict loaded from a
+ * store older than the field has only its `qa` note (heldVerdictRecorded),
+ * checked again here because evidence can be appended after loading. I-1: a
+ * lane with no reviewer has no verdict, so a change that gives it one cannot
+ * also leave on a verdict nobody it names recorded. */
+function heldVerdict(lane: FactoryLane): QaDisposition | undefined {
+  const { qaDisposition, qaRecordedBy, reviewerBotId } = lane;
+  if (!qaDisposition || !reviewerBotId) return undefined;
+  const recorded = qaRecordedBy === undefined ? heldVerdictRecorded(lane, qaDisposition) : qaRecordedBy === reviewerBotId;
+  return recorded ? qaDisposition : undefined;
+}
+
+const qaHeld = (lane: FactoryLane): string => {
+  const verdict = heldVerdict(lane);
+  return `lane ${lane.id} is held by QA in qa_wait (${verdict ? `QA ${verdict}` : "no QA verdict recorded"})`;
+};
 
 /** Refuse a change that would take a lane out of its QA hold without a verdict
  * that allows the move, or that would change the tip QA is judging or the
@@ -452,12 +506,13 @@ function assertQaHold(lane: FactoryLane, phase: FactoryLanePhase, patch: Factory
   // t1755u: the assigned reviewer is frozen too, so only the reviewer who held
   // the lane can release it. A held lane with no reviewer may still be given
   // one: without one, no verdict — and so no exit — is possible.
-  if (patch.reviewerBotId !== undefined && lane.reviewerBotId !== undefined && patch.reviewerBotId !== lane.reviewerBotId) {
+  if (patch.reviewerBotId !== undefined && lane.reviewerBotId !== undefined && reviewerId(patch.reviewerBotId) !== lane.reviewerBotId) {
     throw new FactoryLaneError("ineligible", `${qaHeld(lane)}; its reviewer ${lane.reviewerBotId} is frozen until it leaves qa_wait`);
   }
   if (phase === "qa_wait") return;
   const allowing = QA_HOLD_EXITS[phase];
-  if (lane.qaDisposition && allowing?.includes(lane.qaDisposition)) return;
+  const verdict = heldVerdict(lane);
+  if (verdict && allowing?.includes(verdict)) return;
   const needs = !allowing
     ? `${phase} is not an exit from qa_wait`
     : `${phase} needs ${allowing === QA_DISPOSITIONS ? "a recorded QA verdict" : `QA ${allowing.join(" or ")}`}`;
@@ -506,14 +561,17 @@ function applyPatch(lane: FactoryLane, patch: FactoryLanePatch): void {
   if (patch.reviewerBotId !== undefined) {
     // t1756u F-4: a blank id names no reviewer. Like an empty field below,
     // and like loading, it leaves the lane without one.
-    const reviewerBotId = text(patch.reviewerBotId);
+    const reviewerBotId = reviewerId(patch.reviewerBotId);
     if (!reviewerBotId) {
       delete lane.reviewerBotId;
     } else {
       assertIndependentReviewer(lane.ownerBotId, reviewerBotId);
       // t1756u F-1: a held lane given a reviewer it lacked starts from no
       // verdict, since none it holds came from them.
-      if (lane.phase === "qa_wait" && lane.reviewerBotId === undefined) delete lane.qaDisposition;
+      if (lane.phase === "qa_wait" && lane.reviewerBotId === undefined) {
+        delete lane.qaDisposition;
+        delete lane.qaRecordedBy;
+      }
       lane.reviewerBotId = reviewerBotId;
     }
   }
@@ -535,7 +593,7 @@ function applyPatch(lane: FactoryLane, patch: FactoryLanePatch): void {
  * lane's repo/branch/worktree/pathClaims while it holds ownership is refused:
  * release first, then re-claim. */
 export function upsertLane(input: FactoryLaneInput): FactoryLane {
-  assertIndependentReviewer(input.ownerBotId, input.reviewerBotId);
+  assertIndependentReviewer(input.ownerBotId, reviewerId(input.reviewerBotId));
   for (const key of ["title", "ownerBotId", "repo", "branch", "worktreePath"] as const) {
     if (!text(input[key])) throw new FactoryLaneError("invalid", `${key} is required`);
   }
@@ -689,7 +747,10 @@ export function transition(
     lane.phase = phase;
     // A new QA hold starts without a verdict, so one recorded for an earlier
     // tip or round cannot release it.
-    if (phase === "qa_wait" && from !== "qa_wait") delete lane.qaDisposition;
+    if (phase === "qa_wait" && from !== "qa_wait") {
+      delete lane.qaDisposition;
+      delete lane.qaRecordedBy;
+    }
     if (TERMINAL_PHASES.includes(phase)) delete lane.claimedAt;
     if (from !== phase) pushEvidence(lane, { kind: "phase", ref: `${from}->${phase}` }, now);
     lane.updatedAt = now;
@@ -758,7 +819,7 @@ export function claimWorktree(input: ClaimWorktreeInput): FactoryLane {
 export function releaseOwnership(laneId: string): FactoryLane {
   return commit((draft) => {
     const lane = mustFind(draft, laneId);
-    if (lane.phase === "qa_wait" && !lane.qaDisposition) {
+    if (lane.phase === "qa_wait" && !heldVerdict(lane)) {
       throw new FactoryLaneError("ineligible", `${qaHeld(lane)}; it is not released before QA records a verdict`);
     }
     if (lane.claimedAt === undefined) return structuredClone(lane);
@@ -771,8 +832,8 @@ export function releaseOwnership(laneId: string): FactoryLane {
 }
 
 /** Independent QA verdict. Only the lane's assigned reviewer — never its
- * owner — can record one, and its `qa` evidence names them. A verdict
- * recorded while the lane is in qa_wait decides how it may leave (see
+ * owner — can record one; qaRecordedBy and its `qa` evidence name them. A
+ * verdict recorded while the lane is in qa_wait decides how it may leave (see
  * QA_HOLD_EXITS); FAIL is the rework handoff. A finished lane keeps the
  * verdict it finished on (t1756u F-3): late QA goes in with appendEvidence. */
 export function recordQaDisposition(
@@ -781,18 +842,21 @@ export function recordQaDisposition(
 ): FactoryLane {
   if (!isQaDisposition(input.disposition)) throw new FactoryLaneError("invalid", `unknown QA disposition ${String(input.disposition)}`);
   // t1756u F-4: a blank id names no reviewer, so it can record no verdict.
-  if (!text(input.reviewerBotId)) throw new FactoryLaneError("invalid", "reviewerBotId is required");
+  const reviewerBotId = reviewerId(input.reviewerBotId);
+  if (!reviewerBotId) throw new FactoryLaneError("invalid", "reviewerBotId is required");
   return commit((draft) => {
     const lane = mustFind(draft, id);
     assertNotTerminal(lane);
-    assertIndependentReviewer(lane.ownerBotId, input.reviewerBotId);
-    if (lane.reviewerBotId !== input.reviewerBotId) {
-      throw new FactoryLaneError("qa_independence", `lane ${lane.id} is reviewed by ${lane.reviewerBotId ?? "nobody yet"}, not ${input.reviewerBotId}`);
+    assertIndependentReviewer(lane.ownerBotId, reviewerBotId);
+    if (lane.reviewerBotId !== reviewerBotId) {
+      throw new FactoryLaneError("qa_independence", `lane ${lane.id} is reviewed by ${lane.reviewerBotId ?? "nobody yet"}, not ${reviewerBotId}`);
     }
     const now = Date.now();
     lane.qaDisposition = input.disposition;
-    // Loading keeps a held verdict only next to this note (heldVerdictRecorded).
-    pushEvidence(lane, { kind: "qa", ref: input.ref, note: qaNote(input.disposition, input.reviewerBotId, input.note) }, now);
+    lane.qaRecordedBy = reviewerBotId;
+    // Loading keeps a held verdict only beside this note (heldVerdictRecorded),
+    // and only while qaRecordedBy names the lane's reviewer.
+    pushEvidence(lane, { kind: "qa", ref: input.ref, note: qaNote(input.disposition, reviewerBotId, input.note) }, now);
     lane.updatedAt = now;
     return structuredClone(lane);
   });

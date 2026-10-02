@@ -794,6 +794,69 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     ]);
   });
 
+  it("t1758u the QA route records who recorded the verdict; after a restart one recorded by anyone else releases nothing", async () => {
+    const lane = heldByQa("t1758u-recorder");
+    const recorded = await json(base, "POST", `/factory/lanes/${lane.id}/qa`, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
+    expect(recorded.status).toBe(200);
+    expect(recorded.body.lane).toMatchObject({ phase: "qa_wait", qaDisposition: "PASS", qaRecordedBy: "qa-bot" });
+
+    const now = Date.now();
+    const held = (id: string, fields: Record<string, unknown>) => ({
+      ...laneInput(id),
+      id,
+      phase: "qa_wait",
+      fullSha: SHA,
+      reviewerBotId: "qa-bot",
+      qaDisposition: "PASS",
+      evidence: [{ at: now, kind: "qa", ref: "_cos/QA_DIGEST.md", note: "PASS by qa-bot" }],
+      createdAt: now,
+      updatedAt: now,
+      ...fields,
+    });
+    writeFileSync(
+      join(DATA_DIR, "factory-lanes.json"),
+      JSON.stringify({
+        version: 1,
+        lanes: [
+          // The note names the reviewer, but the recorder on file is someone else.
+          held("c-other", { qaRecordedBy: "qa-bot-2" }),
+          // Stored before the field existed: the note alone attributes it.
+          held("c-legacy", {}),
+        ],
+      }),
+    );
+    _resetFactoryLanes();
+    const finish = (id: string) => json(base, "POST", `/factory/lanes/${id}/transition`, { phase: "done", outcome: "KEEP_DRAFT" });
+
+    const other = await finish("c-other");
+    expect(other.status).toBe(403);
+    expect(other.body.error).toEqual({ code: "ineligible", message: "lane c-other is held by QA in qa_wait (no QA verdict recorded); done needs QA PASS" });
+    const legacy = await finish("c-legacy");
+    expect(legacy.status).toBe(200);
+    expect(legacy.body.lane).toMatchObject({ phase: "done", qaDisposition: "PASS" });
+    expect(legacy.body.lane.qaRecordedBy).toBeUndefined();
+  });
+
+  it("t1758u I-3 refuses a reviewer id that does not print on every route that takes one, and writes nothing", async () => {
+    const held = heldByQa("t1758u-i3-held");
+    const ready = upsertLane(laneInput("t1758u-i3-ready"));
+    const file = join(DATA_DIR, "factory-lanes.json");
+    const before = readFileSync(file, "utf8");
+    for (const reviewerBotId of ["​", "qa-bot​", "qa⁠bot"]) {
+      const label = JSON.stringify(reviewerBotId);
+      for (const res of [
+        await json(base, "POST", "/factory/lanes", { ...laneInput("t1758u-i3-new"), reviewerBotId }),
+        await json(base, "POST", `/factory/lanes/${ready.id}/transition`, { phase: "ready", reviewerBotId }),
+        await json(base, "POST", `/factory/lanes/${held.id}/transition`, { phase: "qa_wait", reviewerBotId }),
+        await json(base, "POST", `/factory/lanes/${held.id}/qa`, { reviewerBotId, disposition: "FAIL", ref: "_cos/QA_DIGEST.md" }),
+      ]) {
+        expect(res.status, label).toBe(400);
+        expect(res.body.error.code, label).toBe("invalid");
+      }
+    }
+    expect(readFileSync(file, "utf8")).toBe(before);
+  });
+
   it("rejects bad Origin for non-health requests", async () => {
     const res = await json(base, "GET", "/factory/lanes", undefined, { origin: "https://evil.example" });
     expect(res.status).toBe(400);

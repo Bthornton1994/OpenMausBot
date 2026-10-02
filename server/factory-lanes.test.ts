@@ -598,6 +598,155 @@ describe("factory lanes: a held verdict needs its reviewer's qa note from the ho
   });
 });
 
+describe("factory lanes: a held verdict names who recorded it (t1758u qaRecordedBy)", () => {
+  const qaEntry = (note: string, ref = "_cos/QA_DIGEST.md") => ({ at: Date.now(), kind: "qa", ref, note });
+  const onDisk = (id: string): Record<string, unknown> => JSON.parse(readFileSync(FILE, "utf8")).lanes.find((lane: { id: string }) => lane.id === id);
+
+  it("stores who recorded a verdict beside it, and clears both when the lane next enters qa_wait", () => {
+    const lane = heldByQa("a");
+    expect(verdict(lane.id, "FAIL")).toMatchObject({ qaDisposition: "FAIL", qaRecordedBy: "qa-bot" });
+    expect(onDisk(lane.id)).toMatchObject({ qaDisposition: "FAIL", qaRecordedBy: "qa-bot" });
+    // Outside the hold both stay as history, even when the reviewer changes.
+    transition(lane.id, "running");
+    expect(transition(lane.id, "running", { reviewerBotId: "qa-bot-2" })).toMatchObject({ reviewerBotId: "qa-bot-2", qaDisposition: "FAIL", qaRecordedBy: "qa-bot" });
+    // A new hold starts with neither, and only its reviewer's verdict names them.
+    const again = transition(lane.id, "qa_wait", { fullSha: "b".repeat(40) });
+    expect(again.qaDisposition).toBeUndefined();
+    expect(again.qaRecordedBy).toBeUndefined();
+    expect(onDisk(lane.id)).not.toHaveProperty("qaRecordedBy");
+    expect(recordQaDisposition(lane.id, { reviewerBotId: "qa-bot-2", disposition: "PASS", ref: "_cos/QA_DIGEST-2.md" })).toMatchObject({
+      qaDisposition: "PASS",
+      qaRecordedBy: "qa-bot-2",
+    });
+  });
+
+  it("drops a held verdict whose qaRecordedBy is not its reviewer, even beside that reviewer's qa note", () => {
+    const recorders: Record<string, unknown> = { other: "qa-bot-2", blank: "", spaces: "   ", invisible: "qa-bot​", number: 42, null: null };
+    store(
+      ...Object.entries(recorders).map(([id, qaRecordedBy]) =>
+        storedHeld(id, { reviewerBotId: "qa-bot", qaDisposition: "PASS", qaRecordedBy, evidence: [qaEntry("PASS by qa-bot")] }),
+      ),
+      storedHeld("fail", { reviewerBotId: "qa-bot", qaDisposition: "FAIL", qaRecordedBy: "qa-bot-1", evidence: [qaEntry("FAIL by qa-bot — missing test")] }),
+    );
+    for (const id of Object.keys(recorders)) {
+      const loaded = getLane(id)!;
+      expect(loaded, id).toMatchObject({ phase: "qa_wait", reviewerBotId: "qa-bot" });
+      expect(loaded.qaDisposition, id).toBeUndefined();
+      expect(loaded.qaRecordedBy, id).toBeUndefined();
+      expectLaneError(() => transition(id, "done"), "ineligible", /\(no QA verdict recorded\); done needs QA PASS$/);
+    }
+    for (const phase of ["running", "ready", "failed"] as const) {
+      expectLaneError(() => transition("fail", phase), "ineligible", new RegExp(`\\(no QA verdict recorded\\); ${phase} needs QA FAIL$`));
+    }
+    // The reviewer records it again, and the lane leaves as before.
+    verdict("fail", "FAIL");
+    expect(transition("fail", "running").evidence.at(-2)).toMatchObject({ kind: "rework", note: "QA FAIL by qa-bot handed the lane back for rework" });
+  });
+
+  it("keeps a held verdict whose qaRecordedBy is its reviewer and whose qa note is that verdict, and the lane leaves as before", () => {
+    store(
+      storedHeld("pass", { reviewerBotId: "qa-bot", qaDisposition: "PASS", qaRecordedBy: "qa-bot", evidence: [qaEntry("PASS by qa-bot")] }),
+      // Read as every reviewer id is: trimmed.
+      storedHeld("padded", { reviewerBotId: "qa-bot", qaDisposition: "FAIL", qaRecordedBy: " qa-bot ", evidence: [qaEntry("FAIL by qa-bot — missing test")] }),
+      // The field does not stand in for the note (t1757u R-1).
+      storedHeld("no-note", { reviewerBotId: "qa-bot", qaDisposition: "PASS", qaRecordedBy: "qa-bot" }),
+    );
+    expect(getLane("pass")).toMatchObject({ qaDisposition: "PASS", qaRecordedBy: "qa-bot" });
+    expect(getLane("padded")).toMatchObject({ qaDisposition: "FAIL", qaRecordedBy: "qa-bot" });
+    expect(getLane("no-note")!.qaDisposition).toBeUndefined();
+    expect(transition("pass", "done", { outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", qaDisposition: "PASS", qaRecordedBy: "qa-bot" });
+    expect(transition("padded", "running").evidence.at(-2)).toMatchObject({ kind: "rework", note: "QA FAIL by qa-bot handed the lane back for rework" });
+    expectLaneError(() => transition("no-note", "done"), "ineligible", /\(no QA verdict recorded\); done needs QA PASS$/);
+
+    // A verdict recorded through the API survives a restart with its recorder.
+    const lane = heldByQa("api");
+    verdict(lane.id, "PASS");
+    _resetFactoryLanes();
+    expect(getLane(lane.id)).toMatchObject({ qaDisposition: "PASS", qaRecordedBy: "qa-bot" });
+    expect(transition(lane.id, "done", { outcome: "KEEP_DRAFT" }).phase).toBe("done");
+  });
+
+  it("migrates a held verdict stored before the field on its qa note alone, and records the field with the reviewer's next verdict", () => {
+    store(storedHeld("legacy", { reviewerBotId: "qa-bot", qaDisposition: "PASS", evidence: [qaEntry("PASS by qa-bot")] }));
+    const loaded = getLane("legacy")!;
+    expect(loaded.qaDisposition).toBe("PASS");
+    // Neither loading nor the next save makes up who recorded it.
+    expect(loaded).not.toHaveProperty("qaRecordedBy");
+    transition("legacy", "qa_wait", { nextAction: "await owner" });
+    expect(onDisk("legacy")).toMatchObject({ qaDisposition: "PASS" });
+    expect(onDisk("legacy")).not.toHaveProperty("qaRecordedBy");
+
+    // With no recorder on file, its note is all that attributes it, at the exit
+    // too: a later qa entry that is not the verdict leaves QA pending.
+    appendEvidence("legacy", { kind: "qa", ref: "_cos/QA_NOTES.md", note: "screenshots attached" });
+    expectLaneError(() => transition("legacy", "done"), "ineligible", /\(no QA verdict recorded\); done needs QA PASS$/);
+    expectLaneError(() => releaseOwnership("legacy"), "ineligible", /no QA verdict recorded/);
+
+    // The reviewer's next verdict records them, and from then on the field
+    // attributes it (the next load still wants the note as well).
+    expect(verdict("legacy", "PASS")).toMatchObject({ qaDisposition: "PASS", qaRecordedBy: "qa-bot" });
+    appendEvidence("legacy", { kind: "qa", ref: "_cos/QA_NOTES.md", note: "screenshots attached" });
+    expect(transition("legacy", "done", { outcome: "KEEP_DRAFT" })).toMatchObject({ phase: "done", qaDisposition: "PASS", qaRecordedBy: "qa-bot" });
+  });
+});
+
+describe("factory lanes: one reading of a reviewer id (t1758u I-3)", () => {
+  const INVISIBLE = ["​", "qa​bot", "qa-bot⁠", "‮qa-bot", "qa bot", "qa\tbot", "qa\u0000bot"];
+
+  it("refuses a reviewer id with a character that does not print, wherever one is given, and writes nothing", () => {
+    const ready = upsertLane(laneInput("ready"));
+    const held = heldByQa("held");
+    const before = readFileSync(FILE, "utf8");
+    for (const id of INVISIBLE) {
+      const label = JSON.stringify(id);
+      expectLaneError(() => upsertLane(laneInput("new", { reviewerBotId: id })), "invalid", /reviewerBotId/);
+      expectLaneError(() => upsertLane({ ...laneInput("ready"), id: ready.id, reviewerBotId: id }), "invalid", /reviewerBotId/);
+      expectLaneError(() => transition(ready.id, "ready", { reviewerBotId: id }), "invalid", /reviewerBotId/);
+      expectLaneError(() => transition(held.id, "qa_wait", { reviewerBotId: id }), "invalid", /reviewerBotId/);
+      expectLaneError(() => recordQaDisposition(held.id, { reviewerBotId: id, disposition: "FAIL", ref: "_cos/QA_DIGEST.md" }), "invalid", /reviewerBotId/);
+      expect(readFileSync(FILE, "utf8"), label).toBe(before);
+    }
+    expect(listLanes().map((lane) => lane.id)).toEqual([ready.id, held.id]);
+  });
+
+  it("trims a padded reviewer id, so it names the same reviewer in-process as through the bridge", () => {
+    const lane = upsertLane(laneInput("a", { reviewerBotId: "  qa-bot " }));
+    expect(lane.reviewerBotId).toBe("qa-bot");
+    transition(lane.id, "running");
+    transition(lane.id, "qa_wait", { fullSha: SHA_A });
+    // Restating the frozen reviewer with padding is not a swap.
+    expect(transition(lane.id, "qa_wait", { reviewerBotId: " qa-bot", nextAction: "await QA" })).toMatchObject({ reviewerBotId: "qa-bot", nextAction: "await QA" });
+    const recorded = recordQaDisposition(lane.id, { reviewerBotId: "qa-bot  ", disposition: "FAIL", ref: "_cos/QA_DIGEST.md" });
+    expect(recorded).toMatchObject({ qaDisposition: "FAIL", qaRecordedBy: "qa-bot" });
+    expect(recorded.evidence.at(-1)).toMatchObject({ kind: "qa", note: "FAIL by qa-bot" });
+    _resetFactoryLanes();
+    expect(transition(lane.id, "running").evidence.at(-2)).toMatchObject({ kind: "rework", note: "QA FAIL by qa-bot handed the lane back for rework" });
+  });
+
+  it("does not let padding make a bot its own reviewer", () => {
+    expectLaneError(() => upsertLane(laneInput("a", { reviewerBotId: " implementer-a " })), "qa_independence");
+    const padded = { ownerBotId: " implementer-b " };
+    expectLaneError(() => upsertLane(laneInput("b", { ...padded, reviewerBotId: " implementer-b " })), "qa_independence");
+    const lane = upsertLane(laneInput("b", padded));
+    expectLaneError(() => transition(lane.id, "ready", { reviewerBotId: "implementer-b" }), "qa_independence");
+    expectLaneError(() => recordQaDisposition(lane.id, { reviewerBotId: "implementer-b", disposition: "PASS", ref: "_cos/QA_DIGEST.md" }), "qa_independence");
+  });
+
+  it("reads stored reviewer ids the same way: trimmed, and one that does not print names no reviewer", () => {
+    const pass = { qaDisposition: "PASS", evidence: [{ at: Date.now(), kind: "qa", ref: "_cos/QA_DIGEST.md", note: "PASS by qa-bot​" }] };
+    store(
+      storedHeld("padded", { reviewerBotId: " qa-bot " }),
+      storedHeld("invisible", { ...pass, reviewerBotId: "qa-bot​" }),
+      storedHeld("self", { ownerBotId: " implementer-self ", reviewerBotId: "implementer-self" }),
+    );
+    expect(getLane("padded")!.reviewerBotId).toBe("qa-bot");
+    expect(getLane("invisible")!.reviewerBotId).toBeUndefined();
+    expect(getLane("invisible")!.qaDisposition).toBeUndefined();
+    expectLaneError(() => transition("invisible", "done"), "ineligible", /\(no QA verdict recorded\); done needs QA PASS$/);
+    expect(getLane("self")!.reviewerBotId).toBeUndefined();
+  });
+});
+
 describe("factory lanes: lifecycle and persistence", () => {
   it("refuses transitions out of terminal phases but still accepts late evidence", () => {
     for (const terminal of ["done", "failed", "cancelled"] as const) {
