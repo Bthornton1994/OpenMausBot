@@ -1,0 +1,5 @@
+agent-systems-p1 v1
+source: t1765u portfolio agent-systems program
+canonical: portfolio-coordination/standards/agent-systems/
+omb-adapter: server/agent-systems/ (vendored copy; do not symlink across repos)
+scope: Cap1 sanitize + Cap2 fail-closed budget gate at room handoff enqueue
