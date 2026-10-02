@@ -1,5 +1,8 @@
-agent-systems-p1 v1
+agent-systems-p1 v1.1
 source: t1765u portfolio agent-systems program
 canonical: portfolio-coordination/standards/agent-systems/
 omb-adapter: server/agent-systems/ (vendored copy; do not symlink across repos)
 scope: Cap1 sanitize + Cap2 fail-closed budget gate at room handoff enqueue
+content-hash: sanitize.mjs sha256=ca127d5aaaab0d0b
+vendored-as: sanitize.ts (TypeScript port of canonical lib/sanitize.mjs; same patterns, order and behavior)
+remediation: R1 Cap1 patterns sk-ant/sk-proj/github_pat/gh[opsu]/xox/AKIA + Bearer length (t1765u PR3)

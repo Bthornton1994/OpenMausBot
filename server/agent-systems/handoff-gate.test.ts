@@ -26,6 +26,53 @@ describe("agent-systems Cap1 sanitize (OMB vendor)", () => {
     if (r.ok) return;
     expect(r.reason).toBe("unsanitizable");
   });
+
+  // Fixtures are assembled at runtime so no token-shaped literal sits in the
+  // source; GitHub push protection flags those (as in server/redact.test.ts).
+  const alpha = "abcdefghijklmnopqrstuvwxyz0123456789";
+  it.each([
+    ["an Anthropic key", "sk_ant", `sk-ant-api03-${alpha}`],
+    ["an OpenAI project key", "sk_proj", `sk-proj-${alpha}`],
+    ["a generic sk- key", "sk_like", `sk-${alpha}`],
+    ["a GitHub fine-grained PAT", "github_pat", `${"github_" + "pat_"}11ABCDEFG0${alpha}`],
+    ["a GitHub classic PAT (ghp_)", "gh_fine", `${"gh" + "p_"}${alpha}`],
+    ["a GitHub OAuth token (gho_)", "gh_fine", `${"gh" + "o_"}${alpha}`],
+    ["a GitHub server token (ghs_)", "gh_fine", `${"gh" + "s_"}${alpha}`],
+    ["a GitHub user token (ghu_)", "gh_fine", `${"gh" + "u_"}${alpha}`],
+    ["a Slack bot token", "xox", `${"xox" + "b-"}123456789012-${alpha.slice(0, 24)}`],
+    ["an AWS access key ID", "akia", "AKIA" + "IOSFODNN7EXAMPLE"],
+    ["an xAI key", "xai", `xai-${alpha}`],
+    ["a Bearer token", "bearer", `Bearer ${alpha}`],
+  ] as const)("redacts %s in brief text and flags it when raw", (_label, pattern, secret) => {
+    const brief = `Call the API with ${secret} and report back`;
+    expect(assertNoRawSecrets(brief)).toMatchObject({ ok: false, pattern });
+    const r = sanitizeHandoff({ text: brief });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const text = (r.sanitized as { text: string }).text;
+    expect(text).toBe(`Call the API with «redacted ${secret.length} chars» and report back`);
+    expect(r.stripped).toEqual([`content:${pattern}`]);
+    expect(assertNoRawSecrets(text).ok).toBe(true);
+  });
+
+  it("redacts a PEM private key block", () => {
+    const pem = ["-----BEGIN " + "PRIVATE KEY-----", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "-----END " + "PRIVATE KEY-----"].join("\n");
+    const r = sanitizeHandoff({ text: `Install this key:\n${pem}\nthen restart` });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect((r.sanitized as { text: string }).text).toBe(`Install this key:\n«redacted ${pem.length} chars»\nthen restart`);
+    expect(r.stripped).toEqual(["content:pem"]);
+  });
+
+  it("leaves ordinary prose alone, including the word bearer", () => {
+    const prose = [
+      "Tell the bearer of this note to wait for the review.",
+      "Bearer of good news: the risk-assessment task-list is done.",
+      "Use a Bearer token from the vault; never paste it here.",
+    ].join("\n");
+    expect(sanitizeHandoff({ text: prose })).toEqual({ ok: true, sanitized: { text: prose }, stripped: [] });
+    expect(assertNoRawSecrets(prose).ok).toBe(true);
+  });
 });
 
 describe("agent-systems Cap2 budgets (OMB vendor)", () => {
@@ -55,12 +102,14 @@ describe("handoff-gate at room enqueue", () => {
     expect(r.message).toMatch(/budget gate refused/);
   });
 
-  it("refuses when execution budget already exceeded", () => {
+  it("refuses once the root has used every execution, allows while one remains", () => {
     const policy = policyFromRoomLimits({ executions: 48 });
-    const r = gateHandoffEmission({ text: "build it", usage: { steps: 49 }, policy });
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.reason).toBe("budget_exceeded:maxSteps");
+    // Enqueue counts the execution the new work needs: steps = root.executions + 1.
+    const spent = gateHandoffEmission({ text: "build it", usage: { steps: 48 + 1 }, policy });
+    expect(spent.ok).toBe(false);
+    if (!spent.ok) expect(spent.reason).toBe("budget_exceeded:maxSteps");
+    const lastOne = gateHandoffEmission({ text: "build it", usage: { steps: 47 + 1 }, policy });
+    expect(lastOne.ok).toBe(true);
   });
 
   it("sanitizes secret-shaped text and allows under budget", () => {

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -823,4 +823,38 @@ describe("shared room request display", () => {
     expect(() => engine.enqueue(addr("A"), "turn", undefined, { ...addr("B"), botId: "different" }, "one:different", "Changed", false, false, "", "one")).toThrow("different room work");
     expect(() => engine.enqueue(addr("A"), "turn", undefined, { ...addr("B"), threadId: "new", botId: "different" }, "one:different", "Review", false, false, "", "one")).toThrow("different room work");
   }));
+});
+
+describe("room handoff enqueue gate (t1765u Cap1 + Cap2)", () => {
+  it("stores a brief carrying a credential only in redacted form, in memory and on disk", () => fixture((engine, _hooks, file) => {
+    // Assembled at runtime so no token-shaped literal sits in the source.
+    const key = `sk-ant-api03-${"FAKEfake0123".repeat(3)}`;
+    const brief = `Deploy with ${key} and report back`;
+    const { node } = engine.enqueue(addr("A"), "turn", undefined, addr("B"), "deploy", brief);
+    expect(node.text).toBe(`Deploy with «redacted ${key.length} chars» and report back`);
+    const saved = readFileSync(file, "utf8");
+    expect(saved).not.toContain("sk-ant-");
+    expect((JSON.parse(saved) as Array<{ id: string; text: string }>).find(n => n.id === node.id)?.text).toBe(node.text);
+    // A retry of the same brief is matched against the redacted text it stored.
+    expect(engine.enqueue(addr("A"), "turn", undefined, addr("B"), "deploy", brief).duplicate).toBe(true);
+  }));
+  it("refuses every handoff when the execution budget is not configured, storing nothing", () => fixture((engine, _hooks, file) => {
+    expect(() => engine.enqueue(addr("A"), "turn", undefined, addr("B"), "work", "build"))
+      .toThrow("Room handoff budget gate refused: budget_undefined");
+    expect(engine.nodes.size).toBe(0);
+    expect(existsSync(file)).toBe(false);
+  }, Date.now, { executions: undefined }));
+  it("refuses new work once the root has used its whole execution budget", () => fixture(async (engine, _hooks, file) => {
+    engine.enqueue(addr("A"), "turn", undefined, addr("B"), "first", "build");
+    engine.tick(); await flush();
+    // One execution left: still accepted.
+    engine.enqueue(addr("A"), "turn", undefined, addr("C"), "second", "review");
+    engine.tick(); await flush();
+    expect(engine.nodes.get("turn")?.executions).toBe(2);
+    const before = readFileSync(file, "utf8");
+    expect(() => engine.enqueue(addr("A"), "turn", undefined, addr("D"), "third", "more"))
+      .toThrow("Room handoff budget gate refused: budget_exceeded:maxSteps");
+    expect(engine.children("turn").map(n => n.botId)).toEqual(["B-bot", "C-bot"]);
+    expect(readFileSync(file, "utf8")).toBe(before);
+  }, Date.now, { executions: 2 }));
 });

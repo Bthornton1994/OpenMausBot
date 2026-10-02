@@ -228,11 +228,13 @@ export class RoomHandoffs {
       throw new Error("Cannot assign work back to an ancestor; results return automatically");
     }
     // t1765u P1: sanitize + fail-closed Cap2 budget before dedupe/accept.
+    // Usage counts the execution this work will need, matching tick()'s
+    // `root.executions + executionCost > limit`; tick() stays the authority.
     {
       const rootForGate = fresh ? parent : this.root(parent);
       const gate = gateHandoffEmission({
         text,
-        usage: { steps: rootForGate.executions },
+        usage: { steps: rootForGate.executions + 1 },
         policy: policyFromRoomLimits(this.limits),
       });
       if (!gate.ok) throw new Error(gate.message);

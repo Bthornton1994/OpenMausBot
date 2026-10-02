@@ -16,10 +16,21 @@ const SECRET_KEY_PARTS = [
   "client_secret",
 ];
 
+/**
+ * Content patterns — Cap1 listed formats only.
+ * Order matters for overlapping prefixes (more specific before generic sk-).
+ * Bearer is case-sensitive "Bearer" + token-like length (>=16) to avoid prose (P3-1).
+ */
 const CONTENT_PATTERNS: { name: string; re: RegExp }[] = [
-  { name: "bearer", re: /\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi },
+  { name: "bearer", re: /\bBearer\s+[A-Za-z0-9\-._~+/]{16,}={0,2}\b/g },
+  { name: "sk_ant", re: /\bsk-ant-[A-Za-z0-9\-_]{16,}\b/g },
+  { name: "sk_proj", re: /\bsk-proj-[A-Za-z0-9\-_]{16,}\b/g },
   { name: "sk_like", re: /\bsk-[A-Za-z0-9]{16,}\b/g },
+  { name: "github_pat", re: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g },
+  { name: "gh_fine", re: /\bgh[opsu]_[A-Za-z0-9]{20,}\b/g },
   { name: "ghp", re: /\bghp_[A-Za-z0-9]{20,}\b/g },
+  { name: "xox", re: /\bxox[abp]-[A-Za-z0-9-]{10,}\b/g },
+  { name: "akia", re: /\bAKIA[0-9A-Z]{16}\b/g },
   { name: "xai", re: /\bxai-[A-Za-z0-9]{20,}\b/g },
   { name: "pem", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g },
 ];
@@ -41,6 +52,7 @@ function redactText(text: string, stripped: string[]): string {
     re.lastIndex = 0;
     if (re.test(out)) {
       stripped.push(`content:${name}`);
+      re.lastIndex = 0;
       out = out.replace(re, (m) => mask(m));
     }
   }
@@ -99,12 +111,20 @@ export function sanitizeHandoff(
   }
 }
 
-export function assertNoRawSecrets(serialized: string): { ok: true } | { ok: false; pattern: string } {
+export function assertNoRawSecrets(
+  serialized: string,
+): { ok: true } | { ok: false; pattern: string; sample: string } {
   const s = String(serialized);
-  if (/\bsk-[A-Za-z0-9]{16,}\b/.test(s) && !s.includes("«redacted")) return { ok: false, pattern: "sk_like" };
-  if (/\bghp_[A-Za-z0-9]{20,}\b/.test(s)) return { ok: false, pattern: "ghp" };
-  if (/\bBearer\s+[A-Za-z0-9\-._~+/]{8,}/i.test(s) && !/Bearer\s+«redacted/i.test(s)) {
-    return { ok: false, pattern: "bearer" };
+  for (const { name, re } of CONTENT_PATTERNS) {
+    if (name === "pem") continue; // multi-line; covered by sanitize path
+    const clone = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
+    const matches = s.match(clone);
+    if (!matches) continue;
+    for (const m of matches) {
+      if (!m.includes("«redacted")) {
+        return { ok: false, pattern: name, sample: m.slice(0, 12) + "…" };
+      }
+    }
   }
   return { ok: true };
 }
