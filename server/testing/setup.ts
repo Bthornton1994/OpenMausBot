@@ -17,6 +17,10 @@ process.env.USERPROFILE = home;
 delete process.env.OMB_DATA_DIR;
 // Do not let a developer's Hermes global config path leak into per-test homes.
 delete process.env.HERMES_HOME;
+// Nor the CoS box's live protect list: factory-lane tests that exercise the
+// protect gate point it at a fixture directory explicitly.
+delete process.env.COS_FACTORY_PROTECT_DIR;
+delete process.env.COS_FACTORY_ROOT;
 // The companion keeps its paired devices in its own directory, and resolves
 // it from homedir() the same way — so the redirect above already covers it.
 // Named explicitly all the same: the device tests delete this directory
