@@ -7,7 +7,9 @@ Implementer only. F-6 stays an accepted residual and was not touched.
 | | SHA |
 | --- | --- |
 | before | `367822cd3a5c8c9dc3ed9c16c2e32cb5c446a495` |
-| after | tip of `cos/t1759u-catalog-n1` (the commit that adds this digest). Confirm with `git rev-parse HEAD`. Parent must be the before SHA. |
+| after | `e65cb3fc2d00bcf3d25406891c603b25215fe02d` |
+
+`e65cb3fc2d00bcf3d25406891c603b25215fe02d` is the implementation commit (parent = before). This digest line is recorded in the child of that commit, so `git rev-parse HEAD` is the branch tip and `git rev-parse HEAD^` is the after SHA above.
 
 PR #1 (`cos/t1753u-omb-main-integrate`, draft) was still `367822cd3a5c8c9dc3ed9c16c2e32cb5c446a495` immediately before this commit. This branch does not update that ref.
 
