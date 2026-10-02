@@ -24,6 +24,8 @@
     "clean": "node scripts/clean.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
     "lint": "oxlint --deny-warnings .",
+    "lint:anti-slop": "node tools/oxlint/anti-slop/lint.mjs",
+    "test:anti-slop": "tsc -p tools/oxlint/anti-slop && node --test \"tools/oxlint/anti-slop/**/*.test.ts\"",
     "check:contrast": "node scripts/check-skin-contrast.mjs",
     "i18n:check": "node scripts/generate-locale.mjs --check",
     "dev": "vite",
@@ -113,6 +115,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@oxlint/plugins": "1.80.0",
     "@tailwindcss/vite": "^4.1.11",
     "@types/node": "^26.2.0",
     "@types/qrcode-terminal": "0.12.2",
