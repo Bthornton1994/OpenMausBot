@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "tips": [
+    {
+      "repo": "Bthornton1994/Virtual-Assistant",
+      "branch": "cos/rr-d1d4-operator-only-19d4f99e",
+      "tipSha": "ca813c0dd29e5c38063efa571d809b0dbd5a4bfb",
+      "worktreePath": "C:\\fixture\\va-rr-d1d4-wt",
+      "reason": "fixture: VA #127 tip frozen for QA"
+    }
+  ]
+}

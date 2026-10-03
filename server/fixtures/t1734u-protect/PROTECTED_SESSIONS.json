@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "sessions": [
+    {
+      "sessionId": "session_fixture_rr_ir",
+      "repo": "fixture/rr-ir",
+      "branch": "cos/rr-ir-review",
+      "reason": "fixture: IR review in progress — do not re-seat"
+    },
+    {
+      "sessionId": "session_fixture_react_doctor",
+      "worktreePath": "C:\\fixture\\react-doctor-wt",
+      "reason": "fixture: running session — do not write into its worktree"
+    }
+  ]
+}
