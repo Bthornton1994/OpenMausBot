@@ -445,7 +445,11 @@ function worktreeMatches(task: FactoryTask): boolean {
 }
 
 function holdsWriterLock(task: FactoryTask): boolean {
-  return task.role === "implementer" && HOLDS_LOCK.includes(task.status);
+  if (task.role !== "implementer") return false;
+  // A stale-SHA block keeps the canonical worktree. Dropping it would let a
+  // second writer start before this session ends and the seat moves.
+  if (task.status === "blocked" && task.writerLock === "implementer") return true;
+  return HOLDS_LOCK.includes(task.status);
 }
 
 function mutate(id: string, change: (task: FactoryTask) => void): FactoryTask {
@@ -1030,7 +1034,7 @@ function writerHeadUncertain(row: FactoryTask, head: string, sessionEnded: boole
   if (!sessionEnded || row.status === "running" || row.status === "launch_intent") {
     return "blocked: writer session has not ended";
   }
-  if (row.writerLock !== "implementer") return "blocked: task does not own the worktree lock";
+  if (row.writerLock !== "implementer" || !holdsWriterLock(row)) return "blocked: task does not own the worktree lock";
   if (!row.writerSessionId || !row.writerShaAtAssign || !row.baseSha) return "blocked: latest writer assignment was not recorded";
   if (row.sessionId !== row.writerSessionId || row.specialistId !== row.implementerId) {
     return "blocked: seated session is not the latest assigned writer";

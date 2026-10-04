@@ -10,6 +10,7 @@ import {
   REVIEWER_ID,
   completeFactoryTurn,
   createFactoryTask,
+  FactoryDispatchError,
   harvestFactoryTask,
   launchFactoryTask,
   noteFactorySession,
@@ -307,5 +308,44 @@ describe("server-owned factory lifecycle", () => {
     const row = file.tasks.find((item: { id: string }) => item.id === task.id);
     const writers = row.threads.filter((item: { specialistId: string }) => item.specialistId === IMPLEMENTER_ID);
     expect(writers).toHaveLength(1);
+  });
+
+  it("keeps the worktree lock while a stale SHA is blocked", async () => {
+    const { repo, sha } = initRepo();
+    const deps = local();
+    const task = createFactoryTask({
+      objective: "Add a harmless line",
+      specialistId: IMPLEMENTER_ID,
+      model: "claude-opus-5-5",
+      permissions: "auto",
+      repo,
+      baseSha: sha,
+      acceptance: "README contains fixed",
+      dependencies: [],
+      requiredEvidence: ["commit"],
+      owner: "Bryant Thornton",
+      authority: "lifecycle proof",
+    }, deps).task;
+    await launchFactoryTask(task.id, { start: () => {} });
+    const blocked = harvestFactoryTask(task.id, {
+      sessionId: task.sessionId,
+      worktree: task.worktree,
+      resultSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      evidence: [{ kind: "commit", ref: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", note: "stale" }],
+    });
+    expect(blocked.status).toBe("blocked");
+    expect(() => createFactoryTask({
+      objective: "A second writer must not start",
+      specialistId: IMPLEMENTER_ID,
+      model: "claude-opus-5-5",
+      permissions: "auto",
+      repo,
+      baseSha: sha,
+      acceptance: "none",
+      dependencies: [],
+      requiredEvidence: ["commit"],
+      owner: "Bryant Thornton",
+      authority: "lifecycle proof",
+    }, deps)).toThrow(FactoryDispatchError);
   });
 });
