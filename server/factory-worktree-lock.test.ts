@@ -208,6 +208,17 @@ describe("review worktree read-only lock", () => {
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
     expect(execFileSync("git", ["ls-files", "-s", "gradlew"], { cwd: repo, encoding: "utf8" })).toMatch(/^100755 /);
 
+    const snapshotParent = mkdtempSync(join(tmpdir(), "omb-lock-snapshot-"));
+    const snapshot = join(snapshotParent, "checkout");
+    execFileSync("git", ["-C", repo, "worktree", "add", "--detach", snapshot, head]);
+    const snapshotBytes = {
+      readme: readFileSync(join(snapshot, "README")),
+      gradlew: readFileSync(join(snapshot, "gradlew")),
+      realfile: readFileSync(join(snapshot, "realfile")),
+      nestedFile: readFileSync(join(snapshot, "nested", "file")),
+    };
+    execFileSync("git", ["-C", repo, "worktree", "remove", "--force", snapshot]);
+
     const task = review(repo, sha, head);
     const worktree = task.worktree!;
     try {
@@ -226,17 +237,17 @@ describe("review worktree read-only lock", () => {
       expect(lstatSync(join(worktree, "alias")).isSymbolicLink()).toBe(true);
       expect(lstatSync(join(worktree, "dirlink")).isSymbolicLink()).toBe(true);
       expect(lstatSync(join(worktree, "nested", "up")).isSymbolicLink()).toBe(true);
-      expect(readFileSync(join(worktree, "README"), "utf8")).toBe("base\n");
-      expect(readFileSync(join(worktree, "gradlew"), "utf8")).toBe("#!/bin/sh\necho ok\n");
-      expect(readFileSync(join(worktree, "realfile"), "utf8")).toBe("inside\n");
-      expect(readFileSync(join(worktree, "nested", "file"), "utf8")).toBe("nested\n");
+      expect(readFileSync(join(worktree, "README"))).toEqual(snapshotBytes.readme);
+      expect(readFileSync(join(worktree, "gradlew"))).toEqual(snapshotBytes.gradlew);
+      expect(readFileSync(join(worktree, "realfile"))).toEqual(snapshotBytes.realfile);
+      expect(readFileSync(join(worktree, "nested", "file"))).toEqual(snapshotBytes.nestedFile);
       expect(() => accessSync(join(worktree, "README"), constants.W_OK)).toThrow();
       expect(() => writeFileSync(join(worktree, "README"), "changed\n")).toThrow();
       expect(() => writeFileSync(join(worktree, "brand-new"), "x\n")).toThrow();
       expect(() => writeFileSync(join(worktree, "gradlew"), "nope\n")).toThrow();
       expect(() => writeFileSync(join(worktree, "nested", "file"), "nope\n")).toThrow();
       expect(() => writeFileSync(join(worktree, "nested", "new-file"), "x\n")).toThrow();
-      expect(readFileSync(join(worktree, "README"), "utf8")).toBe("base\n");
+      expect(readFileSync(join(worktree, "README"))).toEqual(snapshotBytes.readme);
       expect(enforceFactoryTool({
         role: task.role,
         worktree,
