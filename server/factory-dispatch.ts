@@ -6,7 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
@@ -55,6 +55,14 @@ export interface FactoryRevision {
   findings: string[];
   nextAction: string;
   disposition?: QaEvidenceDisposition;
+  createdAt: number;
+}
+
+export interface FactoryQaAttempt {
+  sessionId: string;
+  /** The SHA this attempt was started against. Never the rejected submission. */
+  sha: string;
+  handoffId?: string;
   createdAt: number;
 }
 
@@ -161,6 +169,13 @@ export interface FactoryTask {
   /** Session that last received the writer lock, and HEAD at that moment. */
   writerSessionId?: string;
   writerShaAtAssign?: string;
+  /** QA-only review: no implementer task. The worktree is the exact head SHA. */
+  qaOnly?: boolean;
+  /** Checkout mode 0555/0444. Git metadata stays in the common dir. */
+  readOnlyWorktree?: boolean;
+  prUrl?: string;
+  /** One record per QA session. A rejected submission is not rewritten here. */
+  qaAttempts?: FactoryQaAttempt[];
   createdAt: number;
   updatedAt: number;
 }
@@ -205,6 +220,10 @@ export interface FactoryView {
   branch: string | null;
   headSha: string | null;
   revisions: FactoryRevision[];
+  prUrl: string | null;
+  qaOnly: boolean;
+  readOnlyWorktree: boolean;
+  qaAttempts: FactoryQaAttempt[];
   createdAt: number;
   updatedAt: number;
 }
@@ -262,9 +281,12 @@ export interface FactoryLaunchDeps {
   now?: () => number;
   /** Called only after session id and worktree are durable. */
   start: (task: FactoryTask) => Promise<void> | void;
+  /** Current PR head. Required before launch when the task has a prUrl. */
+  prHead?: (prUrl: string) => string | null | Promise<string | null>;
 }
 
 const SHA = /^[0-9a-f]{40}$/i;
+const PR_URL = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)\/?$/;
 const UNSUPPORTED_PERMISSIONS = new Set([
   "bypass",
   "bypasspermissions",
@@ -346,6 +368,10 @@ export function viewTask(task: FactoryTask): FactoryView {
     branch: task.branch ?? null,
     headSha: task.headSha ?? null,
     revisions: task.revisions ?? [],
+    prUrl: task.prUrl ?? null,
+    qaOnly: task.qaOnly === true,
+    readOnlyWorktree: task.readOnlyWorktree === true,
+    qaAttempts: task.qaAttempts ?? [],
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
@@ -442,6 +468,55 @@ function createWorktree(repo: string, sha: string, dest: string): void {
   }
 }
 
+function commitExists(repo: string, sha: string): boolean {
+  if (!SHA.test(sha)) return false;
+  const result = git(["-C", repo, "cat-file", "-t", sha]);
+  return result.ok && result.stdout.trim() === "commit";
+}
+
+/** Review checkout. Git metadata stays in the common dir, so rev-parse still works. */
+function lockWorktreeReadOnly(dest: string): void {
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      const info = statSync(path);
+      if (info.isDirectory()) walk(path);
+      chmodSync(path, info.isDirectory() ? 0o555 : 0o444);
+    }
+  };
+  walk(dest);
+  chmodSync(dest, 0o555);
+}
+
+function githubPrHead(prUrl: string): string | null {
+  const match = PR_URL.exec(prUrl.trim());
+  if (!match) return null;
+  const result = spawnSync("gh", ["pr", "view", match[3], "--repo", `${match[1]}/${match[2]}`, "--json", "headRefOid"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0) return null;
+  try {
+    const parsed = JSON.parse(result.stdout) as { headRefOid?: unknown };
+    const sha = typeof parsed.headRefOid === "string" ? parsed.headRefOid.trim().toLowerCase() : "";
+    return SHA.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberQaAttempt(row: FactoryTask, sessionId: string, sha: string, handoffId?: string): void {
+  if (!sessionId || !SHA.test(sha)) return;
+  if ((row.qaAttempts ?? []).some((item) => item.sessionId === sessionId && item.sha === sha)) return;
+  row.qaAttempts = [...(row.qaAttempts ?? []), {
+    sessionId,
+    sha,
+    ...(handoffId ? { handoffId } : {}),
+    createdAt: Date.now(),
+  }];
+}
+
 function worktreeMatches(task: FactoryTask): boolean {
   if (!task.worktree || !existsSync(task.worktree)) return false;
   const head = git(["-C", task.worktree, "rev-parse", "--is-inside-work-tree"]);
@@ -520,24 +595,49 @@ export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCre
       throw new FactoryDispatchError("conflict", `repository already has writer ${writer.id}`, writer);
     }
   }
+  let qaOnly = false;
+  let reviewHead = "";
+  let prUrl: string | undefined;
   if (spec.role === "qa") {
-    const of = typeof raw.qaOfTaskId === "string" ? raw.qaOfTaskId : "";
-    const target = of ? getFactoryTask(of) : undefined;
-    if (!target || target.role !== "implementer" || !target.resultSha) {
+    const of = typeof raw.qaOfTaskId === "string" ? raw.qaOfTaskId.trim() : "";
+    if (of) {
+      const target = getFactoryTask(of);
+      if (!target || target.role !== "implementer" || !target.resultSha) {
+        throw new FactoryDispatchError("invalid", "QA requires the implementer task and its result SHA");
+      }
+      if (target.specialistId === specialistId) {
+        throw new FactoryDispatchError("invalid", "QA must be a different specialist from the implementer");
+      }
+      if (baseSha.toLowerCase() !== target.resultSha.toLowerCase()) {
+        throw new FactoryDispatchError("invalid", "QA must review the exact result SHA");
+      }
+    } else if (typeof raw.headSha === "string" && raw.headSha.trim()) {
+      reviewHead = raw.headSha.trim().toLowerCase();
+      if (!SHA.test(reviewHead)) throw new FactoryDispatchError("invalid", "headSha must be a full 40-hex commit");
+      if (!commitExists(repo, baseSha.toLowerCase()) || !commitExists(repo, reviewHead)) {
+        throw new FactoryDispatchError("invalid", "baseSha and headSha must be commits in the repo");
+      }
+      if (!descendsFrom(repo, baseSha.toLowerCase(), reviewHead)) {
+        throw new FactoryDispatchError("invalid", "head SHA must descend from the pinned base SHA");
+      }
+      if (raw.prUrl !== undefined && raw.prUrl !== "") {
+        if (typeof raw.prUrl !== "string" || !PR_URL.test(raw.prUrl.trim())) {
+          throw new FactoryDispatchError("invalid", "prUrl must be an https GitHub pull request URL");
+        }
+        prUrl = raw.prUrl.trim();
+      }
+      qaOnly = true;
+    } else {
       throw new FactoryDispatchError("invalid", "QA requires the implementer task and its result SHA");
-    }
-    if (target.specialistId === specialistId) {
-      throw new FactoryDispatchError("invalid", "QA must be a different specialist from the implementer");
-    }
-    if (baseSha.toLowerCase() !== target.resultSha.toLowerCase()) {
-      throw new FactoryDispatchError("invalid", "QA must review the exact result SHA");
     }
   }
 
   const now = (deps.now ?? Date.now)();
   const id = newId();
   const worktree = join(DATA_DIR, "factory-worktrees", id);
-  createWorktree(repo, baseSha, worktree);
+  const checkout = qaOnly ? reviewHead : baseSha;
+  createWorktree(repo, checkout, worktree);
+  if (qaOnly) lockWorktreeReadOnly(worktree);
   const bound = resolveCanonical(worktree, repo);
   const task: FactoryTask = {
     id,
@@ -559,9 +659,16 @@ export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCre
     generation: 1,
     revisions: [],
     ...(bound?.branch ? { branch: bound.branch } : {}),
-    ...(bound?.sha ? { headSha: bound.sha } : {}),
+    ...(qaOnly ? { headSha: reviewHead } : bound?.sha ? { headSha: bound.sha } : {}),
     ...(dispatchKey ? { dispatchKey } : {}),
-    ...(spec.role === "qa" && typeof raw.qaOfTaskId === "string" ? { qaOfTaskId: raw.qaOfTaskId } : {}),
+    ...(spec.role === "qa" && typeof raw.qaOfTaskId === "string" && raw.qaOfTaskId.trim() ? { qaOfTaskId: raw.qaOfTaskId.trim() } : {}),
+    ...(qaOnly ? {
+      qaOnly: true as const,
+      readOnlyWorktree: true as const,
+      writerLock: "none" as const,
+      phase: "review" as const,
+      ...(prUrl ? { prUrl } : {}),
+    } : {}),
     ...(spec.role === "implementer" ? pipelineSeat(raw, specialistId) : {}),
     owner,
     authority,
@@ -607,6 +714,37 @@ export async function launchFactoryTask(id: string, deps: FactoryLaunchDeps): Pr
   if (task.status !== "bound") {
     throw new FactoryDispatchError("blocked", `cannot launch from ${task.status}`, task);
   }
+  if (task.prUrl) {
+    const resolved = deps.prHead ? await deps.prHead(task.prUrl) : githubPrHead(task.prUrl);
+    const actual = typeof resolved === "string" ? resolved.trim().toLowerCase() : "";
+    if (!SHA.test(actual) || !task.headSha || actual !== task.headSha.toLowerCase()) {
+      const reason = SHA.test(actual)
+        ? `PR head is ${actual}; create a task targeting that exact SHA`
+        : "PR head could not be revalidated; create a task targeting the exact SHA";
+      const blocked = mutate(id, (row) => {
+        row.status = "blocked";
+        row.blocker = reason;
+        row.nextAction = reason;
+        row.sessionId = undefined;
+      });
+      throw new FactoryDispatchError("blocked", reason, blocked);
+    }
+  }
+  if (task.qaOnly) {
+    const expected = task.headSha ?? "";
+    const head = task.worktree ? git(["-C", task.worktree, "rev-parse", "HEAD"]) : { ok: false, stdout: "" };
+    const actual = head.ok ? head.stdout.trim().toLowerCase() : "";
+    if (!SHA.test(expected) || actual !== expected) {
+      const reason = "blocked: worktree is not the exact head SHA";
+      const blocked = mutate(id, (row) => {
+        row.status = "blocked";
+        row.blocker = reason;
+        row.nextAction = reason;
+        row.sessionId = undefined;
+      });
+      throw new FactoryDispatchError("blocked", reason, blocked);
+    }
+  }
   if (unavailableFactoryRoles().some((row) => row.specialistId === task.specialistId)) {
     throw new FactoryDispatchError("role_unavailable", "specialist role is unavailable", task);
   }
@@ -648,6 +786,7 @@ export async function launchFactoryTask(id: string, deps: FactoryLaunchDeps): Pr
     }
     row.status = "running";
     row.nextAction = "harvest";
+    if (row.qaOnly && row.headSha && row.sessionId) rememberQaAttempt(row, row.sessionId, row.headSha);
   });
   if (running.status !== "running") {
     throw new FactoryDispatchError("blocked", running.blocker ?? "running refused", running);
@@ -1553,11 +1692,44 @@ export interface FactoryDeliverDeps extends FactoryLaunchDeps {
   pinCwd: (botId: string, threadId: string, cwd: string) => void;
 }
 
+/** A fresh sealed-candidate handoff that must not be marked launched unless the lease still matches. */
+function sealedReviewUnsafe(row: FactoryTask, handoff: FactoryHandoff): string | null {
+  if (handoff.stage !== "review" || !handoff.nextAction.startsWith("fresh independent QA of sealed candidate")) return null;
+  const sealed = sealedCandidate(row);
+  if (!sealed) return "blocked: sealed candidate is missing";
+  if (handoff.resultSha !== sealed.sha || handoff.inputSha !== sealed.sha) return "blocked: handoff SHA is not the sealed candidate";
+  if (row.writerLock === "implementer" || row.role === "implementer") return "blocked: QA lease is not read-only";
+  if (!row.worktree || row.worktree !== handoff.worktree || row.worktree !== sealed.worktree) {
+    return "blocked: task/session/lock provenance could not be proved";
+  }
+  return candidateDrift(row, sealed);
+}
+
+function leaveHandoffUnlaunched(id: string, handoffId: string, snapshot: FactoryTask, blocker: string): FactoryTask {
+  return mutate(id, (row) => {
+    const next = structuredClone(snapshot);
+    for (const key of Object.keys(row)) delete (row as unknown as Record<string, unknown>)[key];
+    Object.assign(row, next);
+    const handoff = row.handoffs?.find((item) => item.id === handoffId);
+    if (handoff) handoff.deliveredAt = undefined;
+    row.status = "blocked";
+    row.phase = row.phase === "shipped" || row.phase === "release_ready" ? row.phase : "blocked";
+    row.blocker = blocker.slice(0, 500);
+    row.nextAction = row.blocker;
+    row.qaAttempts = snapshot.qaAttempts ? structuredClone(snapshot.qaAttempts) : undefined;
+  });
+}
+
 /** Starts the specialist named on the newest undelivered handoff. A retry returns that handoff and does not start another worker. */
-export async function deliverHandoff(id: string, deps: FactoryDeliverDeps): Promise<{ task: FactoryTask; duplicate: boolean }> {
+export async function deliverHandoff(id: string, deps: FactoryDeliverDeps, opts?: { handoffId?: string }): Promise<{ task: FactoryTask; duplicate: boolean }> {
   const task = getFactoryTask(id);
   if (!task) throw new FactoryDispatchError("not_found", "no such factory task");
-  const pending = [...(task.handoffs ?? [])].reverse().find((item) => !item.deliveredAt);
+  const requested = opts?.handoffId?.trim();
+  let pending = requested
+    ? task.handoffs?.find((item) => item.id === requested)
+    : [...(task.handoffs ?? [])].reverse().find((item) => !item.deliveredAt);
+  if (requested && !pending) throw new FactoryDispatchError("not_found", "no such handoff", task);
+  if (pending?.deliveredAt) return { task, duplicate: true };
   if (!pending) {
     const last = task.handoffs?.[task.handoffs.length - 1];
     if (last?.deliveredAt) return { task, duplicate: true };
@@ -1569,6 +1741,8 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps): Prom
       row.phase = "blocked";
       row.blocker = "missing evidence";
       row.nextAction = "blocked: missing evidence";
+      const handoff = row.handoffs?.find((item) => item.id === pending!.id);
+      if (handoff) handoff.deliveredAt = undefined;
     });
     throw new FactoryDispatchError("blocked", "missing evidence", blocked);
   }
@@ -1583,6 +1757,8 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps): Prom
       row.phase = "blocked";
       row.blocker = `specialist ${target} is unavailable`;
       row.nextAction = "blocked: specialist unavailable";
+      const handoff = row.handoffs?.find((item) => item.id === pending!.id);
+      if (handoff) handoff.deliveredAt = undefined;
     });
     throw new FactoryDispatchError("role_unavailable", `specialist ${target} is unavailable`, blocked);
   }
@@ -1593,21 +1769,39 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps): Prom
       row.phase = "blocked";
       row.blocker = `specialist ${target} is unavailable`;
       row.nextAction = "blocked: specialist unavailable";
+      const handoff = row.handoffs?.find((item) => item.id === pending!.id);
+      if (handoff) handoff.deliveredAt = undefined;
     });
     throw new FactoryDispatchError("role_unavailable", `specialist ${target} is unavailable`, blocked);
   }
   if (pending.stage === "remediate" && task.writerLock !== "implementer") {
     throw new FactoryDispatchError("blocked", "remediation waits until the reviewer turn ends and the lock transfers", task);
   }
-  // The handoff record is durable before the next specialist is started.
-  mutate(id, (row) => {
-    const handoff = row.handoffs?.find((item) => item.id === pending.id);
-    if (handoff && !handoff.deliveredAt) handoff.deliveredAt = Date.now();
-  });
-  const stored = getFactoryTask(id)!;
-  const marked = stored.handoffs?.find((item) => item.id === pending.id);
-  if (!marked?.deliveredAt) throw new FactoryDispatchError("blocked", "handoff was not stored", stored);
+  const unsafe = sealedReviewUnsafe(task, pending);
+  if (unsafe) {
+    const blocked = mutate(id, (row) => {
+      row.status = "blocked";
+      row.phase = row.phase === "shipped" || row.phase === "release_ready" ? row.phase : "blocked";
+      row.blocker = unsafe;
+      row.nextAction = unsafe;
+      const handoff = row.handoffs?.find((item) => item.id === pending!.id);
+      if (handoff) handoff.deliveredAt = undefined;
+    });
+    throw new FactoryDispatchError("blocked", unsafe, blocked);
+  }
+  const rejectedSessions = new Set((task.revisions ?? []).filter((item) => item.kind === "rejection").map((item) => item.sessionId));
+  const snapshot = structuredClone(task);
+  const handoffId = pending.id;
+  const reviewSha = pending.resultSha;
   try {
+    // Durable only after the lease is safe. A failed start rolls this back.
+    mutate(id, (row) => {
+      const handoff = row.handoffs?.find((item) => item.id === handoffId);
+      if (handoff && !handoff.deliveredAt) handoff.deliveredAt = Date.now();
+    });
+    const stored = getFactoryTask(id)!;
+    const marked = stored.handoffs?.find((item) => item.id === handoffId);
+    if (!marked?.deliveredAt) throw new FactoryDispatchError("blocked", "handoff was not stored", stored);
     const thread = deps.createThread(target, `${pending.stage}: ${task.objective}`.slice(0, 80));
     deps.pinCwd(target, thread.threadId, task.worktree!);
     mutate(id, (row) => {
@@ -1622,16 +1816,24 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps): Prom
       row.status = "bound";
       row.nextAction = pending.nextAction;
     });
+    const launched = await launchFactoryTask(id, deps);
+    if (!launched.task.sessionId || rejectedSessions.has(launched.task.sessionId) || launched.task.status !== "running") {
+      throw new FactoryDispatchError("blocked", "refusing to reuse the QA session that submitted the rejected SHA", launched.task);
+    }
+    if (pending.stage === "review" && factoryRole(target) === "qa") {
+      return {
+        task: mutate(id, (row) => {
+          if (row.sessionId) rememberQaAttempt(row, row.sessionId, reviewSha, handoffId);
+        }),
+        duplicate: launched.duplicate,
+      };
+    }
+    return { task: getFactoryTask(id)!, duplicate: launched.duplicate };
   } catch (error) {
-    mutate(id, (row) => {
-      const handoff = row.handoffs?.find((item) => item.id === pending.id);
-      if (handoff && !row.sessionId) handoff.deliveredAt = undefined;
-      row.status = "blocked";
-      row.blocker = error instanceof Error ? error.message : "handoff failed";
-    });
-    throw error;
+    const blocker = error instanceof Error ? error.message : "handoff failed";
+    const restored = leaveHandoffUnlaunched(id, handoffId, snapshot, blocker);
+    throw new FactoryDispatchError("blocked", blocker, restored);
   }
-  return launchFactoryTask(id, deps);
 }
 
 export function releaseGateAuthorizes(worktree: string, sha: string): { ok: boolean; reason: string } {
@@ -1892,7 +2094,7 @@ Permissions are Auto only. \`bypassPermissions\` and Full are rejected. Read-onl
 3. The app creates an isolated git worktree and stores the task-to-worktree binding before any worker turn. It does not use the bot's global folder as the pin.
 4. Launch stores the Claude session id on that same task, then starts the turn. Status becomes running only after both are stored. A second launch returns the binding and does not start another writer.
 5. Quiet waits (\`waiting_ci\`, \`waiting_qa\`, \`waiting_owner\`, \`waiting_external\`) keep the worktree reserved.
-6. On worker completion the server reads the task, specialist, session, generation, canonical worktree, repository, branch, and git HEAD. An agent SHA or a done message is not the result. Each implementation and review is an immutable revision. A mismatched SHA is stored as a rejected revision and does not rewrite prior review evidence. When the implementer session ends and still holds the exclusive writer lock, the server verifies that binding, a clean worktree, actual HEAD, and ancestry from the recorded base, then stores an immutable candidate (generation, writer session, SHA, tree, worktree, and the verification evidence) before the worktree moves to a read-only QA lease. QA is compared to that sealed SHA. The writer session and writer lock do not have to stay active after the lease moves. A mismatched QA SHA stays rejected evidence, the candidate is unchanged, and fresh Independent QA is scheduled for the sealed SHA. A rejected review is not CLEAR. If the worktree changes after sealing, or task, session, and lock provenance cannot be proved, the task stays blocked. A newer HEAD is not adopted and a prior review is not rewritten. NOT_CLEAR starts a different implementation session only after QA has ended and the writer lock has transferred. The new SHA gets required tests and fresh QA. Old QA, security, and release results do not apply to it. release_ready is not shipped.
+6. On worker completion the server reads the task, specialist, session, generation, canonical worktree, repository, branch, and git HEAD. An agent SHA or a done message is not the result. Each implementation and review is an immutable revision. A mismatched SHA is stored as a rejected revision and does not rewrite prior review evidence. When the implementer session ends and still holds the exclusive writer lock, the server verifies that binding, a clean worktree, actual HEAD, and ancestry from the recorded base, then stores an immutable candidate (generation, writer session, SHA, tree, worktree, and the verification evidence) before the worktree moves to a read-only QA lease. QA is compared to that sealed SHA. The writer session and writer lock do not have to stay active after the lease moves. A mismatched QA SHA stays rejected evidence, the candidate is unchanged, and the pending QA handoff is consumed into a new Independent QA session against the sealed SHA on the read-only lease when that launch is safe. If it cannot be launched safely, the handoff stays unlaunched and the task stays blocked. The rejected session is not reused and the rejected revision is not edited. A rejected review is not CLEAR. If the worktree changes after sealing, or task, session, and lock provenance cannot be proved, the task stays blocked. A newer HEAD is not adopted and a prior review is not rewritten. NOT_CLEAR starts a different implementation session only after QA has ended and the writer lock has transferred. The new SHA gets required tests and fresh QA. Old QA, security, and release results do not apply to it. release_ready is not shipped.
 7. Restart resumes only when the stored session id was proven and the worktree still matches. Otherwise the task stays blocked.
 
 ## Same-task pipeline

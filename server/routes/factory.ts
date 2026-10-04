@@ -106,6 +106,19 @@ export function createFactoryRoutes(deps: FactoryRouteDeps): RouteHandler {
         const body = await readBody(req);
         if (!body || typeof body !== "object" || Array.isArray(body)) return json(res, 400, { error: "body must be a JSON object" });
         const task = harvestFactoryTask(harvest[1]!, body);
+        const fresh = [...(task.handoffs ?? [])].reverse().find((item) => !item.deliveredAt && item.stage === "review" && item.nextAction.startsWith("fresh independent QA of sealed candidate"));
+        if (fresh && task.status === "waiting_qa") {
+          const result = await deliverHandoff(task.id, {
+            bot: deps.bot,
+            createThread: deps.createThread,
+            pinCwd: deps.pinCwd,
+            start: async (started) => {
+              if (!started.ombThreadId) throw new FactoryDispatchError("blocked", "factory task has no thread");
+              await deps.startTurn(started.specialistId, factorySpecialistPrompt(started), started.ombThreadId);
+            },
+          }, { handoffId: fresh.id });
+          return json(res, 200, { task: viewTask(result.task), duplicate: result.duplicate });
+        }
         return json(res, 200, { task: viewTask(task) });
       }
       const wait = path.match(/^\/api\/factory\/tasks\/([\w-]+)\/wait$/);
@@ -118,6 +131,10 @@ export function createFactoryRoutes(deps: FactoryRouteDeps): RouteHandler {
       }
       const deliver = path.match(/^\/api\/factory\/tasks\/([\w-]+)\/deliver$/);
       if (deliver && method === "POST") {
+        const body = await readBody(req);
+        const handoffId = body && typeof body === "object" && !Array.isArray(body) && typeof (body as { handoffId?: unknown }).handoffId === "string"
+          ? (body as { handoffId: string }).handoffId
+          : undefined;
         const result = await deliverHandoff(deliver[1]!, {
           bot: deps.bot,
           createThread: deps.createThread,
@@ -126,7 +143,7 @@ export function createFactoryRoutes(deps: FactoryRouteDeps): RouteHandler {
             if (!task.ombThreadId) throw new FactoryDispatchError("blocked", "factory task has no thread");
             await deps.startTurn(task.specialistId, factorySpecialistPrompt(task), task.ombThreadId);
           },
-        });
+        }, handoffId ? { handoffId } : undefined);
         return json(res, 200, { task: viewTask(result.task), duplicate: result.duplicate, handoffs: result.task.handoffs ?? [] });
       }
       const ship = path.match(/^\/api\/factory\/tasks\/([\w-]+)\/ship$/);

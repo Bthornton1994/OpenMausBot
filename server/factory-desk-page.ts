@@ -55,6 +55,10 @@ export const FACTORY_DESK_HTML = `<!doctype html>
 <input id="repo" />
 <label for="baseSha">Base SHA (40 hex)</label>
 <input id="baseSha" spellcheck="false" />
+<label for="headSha">Exact head SHA (QA-only review, 40 hex)</label>
+<input id="headSha" spellcheck="false" />
+<label for="prUrl">Pull request URL (optional, QA-only)</label>
+<input id="prUrl" spellcheck="false" placeholder="https://github.com/owner/repo/pull/1" />
 <label for="acceptance">Acceptance</label>
 <textarea id="acceptance"></textarea>
 <label for="owner">Owner</label>
@@ -71,6 +75,8 @@ export const FACTORY_DESK_HTML = `<!doctype html>
 </div>
 <label for="taskId">Task</label>
 <select id="taskId"></select>
+<label for="handoffId">Queued handoff id</label>
+<input id="handoffId" spellcheck="false" />
 <label for="resultSha">Harvest result SHA (deliberately wrong to record a rejection)</label>
 <input id="resultSha" spellcheck="false" />
 <label for="harvestNote">Harvest evidence note</label>
@@ -138,6 +144,10 @@ document.getElementById("create").onclick = async () => {
     dependencies: [],
   };
   if (dispatchKey) body.dispatchKey = dispatchKey;
+  const headSha = document.getElementById("headSha").value.trim();
+  const prUrl = document.getElementById("prUrl").value.trim();
+  if (headSha) body.headSha = headSha;
+  if (prUrl) body.prUrl = prUrl;
   if (await call("POST", "/api/factory/tasks", body)) await refresh();
 };
 async function postSelected(suffix, body) {
@@ -146,7 +156,10 @@ async function postSelected(suffix, body) {
   if (await call("POST", "/api/factory/tasks/" + task.id + suffix, body)) await refresh();
 }
 document.getElementById("launch").onclick = () => postSelected("/launch");
-document.getElementById("deliver").onclick = () => postSelected("/deliver");
+document.getElementById("deliver").onclick = () => {
+  const handoffId = document.getElementById("handoffId").value.trim();
+  postSelected("/deliver", handoffId ? { handoffId } : {});
+};
 document.getElementById("cancel").onclick = () => postSelected("/cancel");
 document.getElementById("wait").onclick = () => postSelected("/wait", { status: document.getElementById("waitStatus").value.trim() });
 document.getElementById("ship").onclick = () => postSelected("/ship", {});
