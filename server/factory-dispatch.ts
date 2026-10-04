@@ -479,8 +479,9 @@ function commitExists(repo: string, sha: string): boolean {
 function lockWorktreeReadOnly(dest: string): void {
   // The walk finishes before any permission change. lstat and readlink do not
   // follow a link onto its target. The lock that follows is not a mode-bit
-  // clear: on Linux the snapshot is remounted read-only, and on Windows the
-  // reviewer is denied write and DACL changes. .git is not traversed: a linked
+  // clear. Linux remounts the snapshot read-only. Windows factory dispatch is
+  // unsupported and fails closed: it does not apply an ACL or clear write
+  // bits. An ACL is not a read-only boundary. .git is not traversed: a linked
   // worktree stores a gitdir pointer there, and following it would leave the
   // checkout.
   const rootInfo = lstatSync(dest);
@@ -598,7 +599,7 @@ function lockWorktreeReadOnly(dest: string): void {
   }
 }
 
-/** Undo lockWorktreeReadOnly. On Windows only the lock's held handles can do this. */
+/** Undo lockWorktreeReadOnly. Windows dispatch never applied a lock, so release fails closed too. */
 export function releaseWorktreeReadOnly(dest: string): void {
   releaseSnapshotBoundary(resolve(dest));
 }

@@ -1,8 +1,14 @@
-// Read-only review worktrees. Symlinks are resolved with lstat and readlink
+// Linux review worktrees. Symlinks are resolved with lstat and readlink
 // only: an outside target is not opened, stated, or chmod'd, and a cycle
-// fails closed before any permission change. The lock is a read-only mount
-// or a reviewer deny ACE, not a mode-bit clear the owner can undo. Tracked
-// executable bits stay.
+// fails closed before any permission change. Linux locks with a read-only
+// mount, not a mode-bit clear the owner can undo. Tracked executable bits
+// stay. Windows factory dispatch is unsupported and fails closed: no ACL
+// lock and no write-bit clear. An ACL is not a read-only boundary.
+// GitHub job 111526586502 recorded takeown status 0 and did not record user,
+// SID, or privileges. That job is not evidence about the desktop QA token
+// (BRYANT\Bthor medium, SeTakeOwnershipPrivilege absent), which was denied
+// takeown. Those identities are not equivalent. The takeown assertion in
+// this file is unchanged and is not relabeled as passing coverage of either.
 import { execFileSync, spawnSync } from "node:child_process";
 import { accessSync, chmodSync, constants, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -222,6 +228,21 @@ describe("review worktree read-only lock", () => {
     };
     execFileSync("git", ["-C", repo, "worktree", "remove", "--force", snapshot]);
 
+    const host: string = process.platform;
+    if (host === "win32") {
+      const existing = new Set(worktreeDirs());
+      // Fail closed. This is not a passed lock. GitHub job 111526586502
+      // recorded takeown status 0 and did not record user, SID, or privileges.
+      // That is not evidence about the desktop QA token (BRYANT\Bthor medium,
+      // SeTakeOwnershipPrivilege absent), which was denied takeown. The
+      // takeown assertion below is kept intact and is not this result.
+      expectLockRejected(() => review(repo, sha, head), /Windows factory dispatch is unsupported/);
+      const created = worktreeDirs().filter((dir) => !existing.has(dir));
+      expect(created.length).toBe(1);
+      assertUntouchedTree(created[0]!);
+      return;
+    }
+
     const task = review(repo, sha, head);
     const worktree = task.worktree!;
     try {
@@ -260,6 +281,11 @@ describe("review worktree read-only lock", () => {
       expect(() => chmodSync(join(worktree, "README"), 0o666)).toThrow();
       expect(() => chmodSync(join(worktree, "gradlew"), 0o777)).toThrow();
       if (process.platform === "win32") {
+        // Kept intact. Not a passed lock, and not coverage of GitHub job
+        // 111526586502. That job recorded takeown status 0 and did not record
+        // user, SID, or privileges. The desktop QA token is a different
+        // identity (BRYANT\Bthor medium, SeTakeOwnershipPrivilege absent) and
+        // was denied takeown. Those are not equivalent.
         const account = execFileSync("whoami", { encoding: "utf8" }).trim();
         const undo = spawnSync("icacls", [join(worktree, "README"), "/grant", `${account}:(F)`, "/Q"], { encoding: "utf8" });
         expect(undo.status).not.toBe(0);

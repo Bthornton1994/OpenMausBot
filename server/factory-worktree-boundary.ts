@@ -1,17 +1,17 @@
-// Review snapshots are not protected by clearing mode bits on a tree the
-// reviewer owns. The owner of a mode-bit lock can chmod it back. Linux mounts
-// the snapshot read-only over itself, so chmod fails with EROFS even for the
-// owner, and an unprivileged reviewer cannot remount or unmount it. Windows
-// denies the reviewer write, delete, and DACL changes, and replaces Owner
-// Rights so the reviewer cannot grant those back. Neither path falls open to
-// a mode-bit lock. A platform that cannot do this fails closed.
+// Debian/Linux is the only supported factory execution host. It mounts the
+// snapshot read-only over itself, so chmod fails with EROFS even for the
+// owner. That mount is not a QA read-only proof: the QA process is the same
+// server user, and a host where that user can `sudo -n` remount or umount the
+// snapshot does not hold the boundary. Windows factory dispatch is unsupported
+// and fails closed. It does not apply an ACL lock or clear write bits. An ACL
+// on the host is not a read-only boundary: it does not cover a token that can
+// take ownership. A separate VM is required before Windows is supported.
 import { spawnSync } from "node:child_process";
-import { chmodSync, lstatSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-
-import { applyWindowsAcl, holdWindowsAcl, restoreWindowsAcl } from "./factory-worktree-acl.ts";
+import { readFileSync } from "node:fs";
 
 export type SnapshotEntry = { path: string; dir: boolean; mode: number };
+
+const WINDOWS_FACTORY_UNSUPPORTED = "Windows factory dispatch is unsupported. Debian/Linux is the only supported factory execution host. Dispatch fails closed and does not apply an ACL lock or clear write bits. An ACL on the host is not a read-only boundary: it does not cover a token that can take ownership. A separate VM is required before Windows is supported.";
 
 function commandFailure(result: { status: number | null; stdout?: string | null; stderr?: string | null; error?: Error }): string {
   return (result.stderr || result.stdout || result.error?.message || `exit ${result.status}`).trim();
@@ -80,59 +80,25 @@ function releaseLinux(root: string): void {
   if (linuxMount(root).mounted) throw new Error("review snapshot stayed mounted after umount");
 }
 
-function grantUserWrite(root: string): void {
-  const writable = (path: string): void => {
-    const info = lstatSync(path);
-    if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) return;
-    chmodSync(path, (info.mode & 0o777) | 0o200);
-  };
-  const visit = (dir: string): void => {
-    for (const name of readdirSync(dir)) {
-      const path = join(dir, name);
-      const info = lstatSync(path);
-      if (info.isSymbolicLink()) continue;
-      if (info.isDirectory() && name !== ".git") visit(path);
-      writable(path);
-    }
-  };
-  writable(root);
-  visit(root);
-}
-
-function clearWriteBits(entries: readonly SnapshotEntry[]): void {
-  for (const entry of entries) chmodSync(entry.path, entry.mode & ~0o222);
+function windowsUnsupported(): never {
+  throw new Error(WINDOWS_FACTORY_UNSUPPORTED);
 }
 
 /** Make `root` immutable to the reviewer. Throws instead of using a mode-bit lock. */
-export function enforceSnapshotBoundary(root: string, entries: readonly SnapshotEntry[]): void {
+export function enforceSnapshotBoundary(root: string, _entries: readonly SnapshotEntry[]): void {
   if (process.platform === "linux") {
     lockLinux(root);
     return;
   }
-  if (process.platform === "win32") {
-    holdWindowsAcl(root, entries.map(({ path, dir }) => ({ path, dir })));
-    try {
-      clearWriteBits(entries);
-      applyWindowsAcl(root);
-    } catch (error) {
-      try { restoreWindowsAcl(root); } catch { /* the original error is the one that matters */ }
-      try { grantUserWrite(root); } catch { /* the original error is the one that matters */ }
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(`could not deny the reviewer write access: ${detail}`);
-    }
-    return;
-  }
+  if (process.platform === "win32") windowsUnsupported();
   throw new Error(`${process.platform} cannot enforce a reviewer-proof read-only snapshot`);
 }
 
-/** Undo enforceSnapshotBoundary. Windows can do this only through handles kept from the lock. */
+/** Undo enforceSnapshotBoundary. Windows dispatch never locked, so it cannot restore an ACL. */
 export function releaseSnapshotBoundary(root: string): void {
   if (process.platform === "linux") {
     releaseLinux(root);
     return;
   }
-  if (process.platform === "win32") {
-    restoreWindowsAcl(root);
-    grantUserWrite(root);
-  }
+  if (process.platform === "win32") windowsUnsupported();
 }

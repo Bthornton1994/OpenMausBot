@@ -309,6 +309,25 @@ describe("QA-only desk task", () => {
       authority: "qa only",
     }, deps)).toThrow(/QA requires the implementer task and its result SHA/);
 
+    if (process.platform === "win32") {
+      expect(() => createFactoryTask({
+        objective: "Review only",
+        specialistId: REVIEWER_ID,
+        model: "claude-opus-5-5",
+        permissions: "auto",
+        repo,
+        baseSha: sha,
+        headSha: head,
+        prUrl: "https://github.com/example/repo/pull/8",
+        acceptance: "read the diff",
+        dependencies: [],
+        requiredEvidence: ["review"],
+        owner: "Bryant Thornton",
+        authority: "qa only",
+      }, deps)).toThrow(/Windows factory dispatch is unsupported/);
+      return;
+    }
+
     const created = createFactoryTask({
       objective: "Review only",
       specialistId: REVIEWER_ID,
@@ -354,6 +373,24 @@ describe("QA-only desk task", () => {
     const head = commit(repo, "base\nreviewed\n");
     const drifted = "0123456789abcdef0123456789abcdef01234567";
     const deps = local();
+    if (process.platform === "win32") {
+      expect(() => createFactoryTask({
+        objective: "Review only",
+        specialistId: REVIEWER_ID,
+        model: "claude-opus-5-5",
+        permissions: "auto",
+        repo,
+        baseSha: sha,
+        headSha: head,
+        prUrl: "https://github.com/example/repo/pull/9",
+        acceptance: "read the diff",
+        dependencies: [],
+        requiredEvidence: ["review"],
+        owner: "Bryant Thornton",
+        authority: "qa only",
+      }, deps)).toThrow(/Windows factory dispatch is unsupported/);
+      return;
+    }
     const created = createFactoryTask({
       objective: "Review only",
       specialistId: REVIEWER_ID,

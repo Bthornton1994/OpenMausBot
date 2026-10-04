@@ -1,3 +1,5 @@
+# Not used by factory dispatch. An ACL is not a read-only boundary and does not
+# cover a token that can take ownership. Windows dispatch fails closed.
 # Holds WRITE_DAC handles, then denies write, create, delete, rename, and DACL changes.
 # Stdin and stdout are JSON lines. icacls output is not written to stdout.
 $ErrorActionPreference = "Stop"

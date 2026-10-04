@@ -1,8 +1,10 @@
-// Windows QA snapshots are not locked with the readonly attribute. That
-// attribute does not stop a directory owner from creating, deleting, or
-// renaming, and the owner can clear it. A deny ACE for the reviewer, plus an
-// Owner Rights ACE that replaces the implicit WRITE_DAC, is the lock. Handles
-// opened with WRITE_DAC before the deny stay in a worker, not in the reviewer.
+// Not the factory dispatch boundary. Dispatch does not call this, and an ACL
+// on the host is not a read-only boundary: it does not cover a token that can
+// take ownership. Windows factory dispatch fails closed as unsupported until a
+// separate VM proves a read-only boundary for the actual QA identity. The
+// readonly attribute is also not a lock: a directory owner can create, delete,
+// rename, and clear it. These helpers remain only so that history is not
+// relabeled as a passed lock.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
