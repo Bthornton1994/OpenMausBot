@@ -6,8 +6,8 @@
 
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Stats } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
@@ -476,16 +476,118 @@ function commitExists(repo: string, sha: string): boolean {
 
 /** Review checkout. Git metadata stays in the common dir, so rev-parse still works. */
 function lockWorktreeReadOnly(dest: string): void {
-  const walk = (dir: string): void => {
-    for (const name of readdirSync(dir)) {
-      const path = join(dir, name);
-      const info = statSync(path);
-      if (info.isDirectory()) walk(path);
-      chmodSync(path, info.isDirectory() ? 0o555 : 0o444);
+  // Permission changes wait until every symlink resolves inside this worktree.
+  // lstat and readlink do not follow a link onto its target, and chmod is never
+  // given a symlink path (it would). Write bits drop; the executable bit git
+  // uses for 100644 vs 100755 stays. .git is not traversed: a linked worktree
+  // stores a gitdir pointer there, and following it would leave the checkout.
+  const rootInfo = lstatSync(dest);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new FactoryDispatchError("invalid", "worktree root is not a real directory");
+  }
+  const root = resolve(dest);
+  const pending: string[] = [];
+  const fail = (message: string): never => {
+    throw new FactoryDispatchError("invalid", message);
+  };
+  const contained = (candidate: string): boolean => {
+    const rel = relative(root, candidate);
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  const aboveRoot = (candidate: string): boolean => {
+    if (candidate === sep) return root !== sep;
+    const prefix = candidate.endsWith(sep) ? candidate : `${candidate}${sep}`;
+    return root.startsWith(prefix);
+  };
+  const readLinkText = (linkPath: string): string => {
+    try {
+      const text = readlinkSync(linkPath);
+      if (!text) return fail("unresolved symlink path");
+      return text;
+    } catch (error) {
+      if (error instanceof FactoryDispatchError) throw error;
+      return fail("unresolved symlink path");
     }
   };
-  walk(dest);
-  chmodSync(dest, 0o555);
+  const lstatOr = (path: string, message: string): Stats => {
+    try {
+      return lstatSync(path);
+    } catch {
+      return fail(message);
+    }
+  };
+  const resolveSymlink = (linkPath: string, stack: readonly string[]): string => {
+    if (stack.includes(linkPath)) fail("symlink cycle");
+    return walkLink(readLinkText(linkPath), dirname(linkPath), [...stack, linkPath]);
+  };
+  const walkLink = (text: string, baseDir: string, stack: readonly string[]): string => {
+    if (!isAbsolute(text) && !contained(baseDir)) fail("symlink escapes the worktree");
+    let current = isAbsolute(text) ? sep : baseDir;
+    for (const part of text.split(sep)) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") {
+        if (!contained(current) || current === root) fail("symlink escapes the worktree");
+        current = dirname(current);
+        continue;
+      }
+      const next = join(current, part);
+      if (!contained(next)) {
+        if (aboveRoot(next)) {
+          current = next;
+          continue;
+        }
+        fail("symlink escapes the worktree");
+      }
+      const info = lstatOr(next, "unresolved symlink path");
+      if (info.isSymbolicLink()) {
+        current = resolveSymlink(next, stack);
+        if (!contained(current)) fail("symlink escapes the worktree");
+        continue;
+      }
+      current = next;
+    }
+    if (!contained(current)) fail("symlink escapes the worktree");
+    return current;
+  };
+  const visit = (dir: string): void => {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return fail("unresolved worktree path");
+    }
+    for (const name of names) {
+      const path = join(dir, name);
+      const info = lstatOr(path, "unresolved worktree path");
+      if (info.isSymbolicLink()) {
+        resolveSymlink(path, []);
+        continue;
+      }
+      if (name === ".git") {
+        pending.push(path);
+        continue;
+      }
+      if (info.isDirectory()) {
+        visit(path);
+        pending.push(path);
+        continue;
+      }
+      if (info.isFile()) {
+        pending.push(path);
+        continue;
+      }
+      fail("unsupported worktree entry");
+    }
+  };
+  visit(root);
+  pending.push(root);
+  const modes: { path: string; mode: number }[] = [];
+  for (const path of pending) {
+    const info = lstatOr(path, "unresolved worktree path");
+    if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) fail("unresolved worktree path");
+    modes.push({ path, mode: info.mode & 0o777 & ~0o222 });
+  }
+  for (const item of modes) chmodSync(item.path, item.mode);
 }
 
 function githubPrHead(prUrl: string): string | null {
