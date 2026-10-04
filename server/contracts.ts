@@ -237,6 +237,13 @@ export interface SendTurnInput {
    * config.toml and ignores this; the Claude driver drops
    * --strict-mcp-config for the turn. */
   mcpFromUserConfig?: boolean;
+  /** Factory launch only. A session id stored on the task before this turn.
+   * Used as `--session-id` when there is no resume cursor. Never a bypass. */
+  factorySessionId?: string;
+  /** When set, the Claude driver fences tools to this role and worktree. */
+  factoryBoundary?: { role: "implementer" | "reviewer" | "qa"; worktree: string };
+  /** Tools removed from the CLI for this turn (read-only factory seats). */
+  extraDisallowedTools?: string[];
 }
 
 /** An MCP server this machine starts and talks to over stdio. */
