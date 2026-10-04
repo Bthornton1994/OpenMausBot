@@ -130,9 +130,12 @@ describe("review worktree read-only lock", () => {
     const head = headOf(repo);
     const existing = new Set(worktreeDirs());
     chmodSync(outside, 0o000);
+    const outsideBeforeReview = stamp(outside);
     try {
       expectLockRejected(() => review(repo, sha, head), /symlink escapes the worktree/);
-      expect(lstatSync(outside).mode & 0o777).toBe(0);
+      const outsideAfterReview = stamp(outside);
+      expect(outsideAfterReview.mode).toBe(outsideBeforeReview.mode);
+      expect(outsideAfterReview.mtimeNs).toBe(outsideBeforeReview.mtimeNs);
     } finally {
       chmodSync(outside, outsideMode);
     }
@@ -157,9 +160,12 @@ describe("review worktree read-only lock", () => {
     const head = headOf(repo);
     const existing = new Set(worktreeDirs());
     chmodSync(outside, 0o000);
+    const outsideBeforeReview = stamp(outside);
     try {
       expectLockRejected(() => review(repo, sha, head), /symlink escapes the worktree/);
-      expect(lstatSync(outside).mode & 0o777).toBe(0);
+      const outsideAfterReview = stamp(outside);
+      expect(outsideAfterReview.mode).toBe(outsideBeforeReview.mode);
+      expect(outsideAfterReview.mtimeNs).toBe(outsideBeforeReview.mtimeNs);
     } finally {
       chmodSync(outside, outsideMode);
     }
@@ -213,7 +219,9 @@ describe("review worktree read-only lock", () => {
       expect(execFileSync("git", ["ls-files", "-s", "gradlew"], { cwd: worktree, encoding: "utf8" })).toMatch(/^100755 /);
       expect(execFileSync("git", ["ls-files", "-s", "README"], { cwd: worktree, encoding: "utf8" })).toMatch(/^100644 /);
       const gradlewMode = lstatSync(join(worktree, "gradlew")).mode;
-      expect(gradlewMode & 0o111).not.toBe(0);
+      if (process.platform !== "win32") {
+        expect(gradlewMode & 0o111).not.toBe(0);
+      }
       expect(gradlewMode & 0o222).toBe(0);
       expect(lstatSync(join(worktree, "alias")).isSymbolicLink()).toBe(true);
       expect(lstatSync(join(worktree, "dirlink")).isSymbolicLink()).toBe(true);
