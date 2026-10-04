@@ -22,6 +22,7 @@ import {
   getFactoryTask,
   harvestFactoryTask,
   launchFactoryTask,
+  releaseWorktreeReadOnly,
   _resetFactoryDispatch,
   type FactoryBot,
   type FactoryCompletionDeps,
@@ -345,7 +346,7 @@ describe("QA-only desk task", () => {
       expect.objectContaining({ sessionId: launched.task.sessionId, sha: head }),
     ]);
     expect(launched.task.status).toBe("running");
-    try { execSync(`chmod -R u+w ${JSON.stringify(created.worktree)}`); } catch { /* cleanup */ }
+    try { if (created.worktree) releaseWorktreeReadOnly(created.worktree); } catch { /* cleanup */ }
   });
 
   it("refuses launch when the pull request head drifted", async () => {
@@ -380,6 +381,6 @@ describe("QA-only desk task", () => {
     expect(after.status).not.toBe("running");
     expect(after.blocker).toContain(drifted);
     expect(after.qaAttempts ?? []).toEqual([]);
-    try { execSync(`chmod -R u+w ${JSON.stringify(created.worktree)}`); } catch { /* cleanup */ }
+    try { if (created.worktree) releaseWorktreeReadOnly(created.worktree); } catch { /* cleanup */ }
   });
 });

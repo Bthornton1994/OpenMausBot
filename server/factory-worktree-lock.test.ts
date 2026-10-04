@@ -1,8 +1,10 @@
 // Read-only review worktrees. Symlinks are resolved with lstat and readlink
 // only: an outside target is not opened, stated, or chmod'd, and a cycle
-// fails closed before any permission change. Tracked executable bits stay.
-import { execFileSync, execSync } from "node:child_process";
-import { accessSync, chmodSync, constants, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+// fails closed before any permission change. The lock is a read-only mount
+// or a reviewer deny ACE, not a mode-bit clear the owner can undo. Tracked
+// executable bits stay.
+import { execFileSync, spawnSync } from "node:child_process";
+import { accessSync, chmodSync, constants, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -14,6 +16,7 @@ import {
   REVIEWER_ID,
   createFactoryTask,
   _resetFactoryDispatch,
+  releaseWorktreeReadOnly,
   type FactoryBot,
 } from "./factory-dispatch.ts";
 
@@ -110,7 +113,7 @@ function assertUntouchedTree(dir: string): void {
 
 function unlock(dir: string | undefined): void {
   if (!dir) return;
-  try { execSync(`chmod -R u+w ${JSON.stringify(dir)}`); } catch { /* cleanup */ }
+  try { releaseWorktreeReadOnly(dir); } catch { /* cleanup */ }
 }
 
 beforeEach(() => {
@@ -232,8 +235,9 @@ describe("review worktree read-only lock", () => {
       const gradlewMode = lstatSync(join(worktree, "gradlew")).mode;
       if (process.platform !== "win32") {
         expect(gradlewMode & 0o111).not.toBe(0);
+      } else {
+        expect(gradlewMode & 0o222).toBe(0);
       }
-      expect(gradlewMode & 0o222).toBe(0);
       expect(lstatSync(join(worktree, "alias")).isSymbolicLink()).toBe(true);
       expect(lstatSync(join(worktree, "dirlink")).isSymbolicLink()).toBe(true);
       expect(lstatSync(join(worktree, "nested", "up")).isSymbolicLink()).toBe(true);
@@ -247,6 +251,23 @@ describe("review worktree read-only lock", () => {
       expect(() => writeFileSync(join(worktree, "gradlew"), "nope\n")).toThrow();
       expect(() => writeFileSync(join(worktree, "nested", "file"), "nope\n")).toThrow();
       expect(() => writeFileSync(join(worktree, "nested", "new-file"), "x\n")).toThrow();
+      expect(() => unlinkSync(join(worktree, "realfile"))).toThrow();
+      expect(() => renameSync(join(worktree, "README"), join(worktree, "README-renamed"))).toThrow();
+      expect(() => symlinkSync(join(worktree, "README"), join(worktree, "escape-link"))).toThrow();
+      if (process.platform === "win32") {
+        expect(() => symlinkSync(join(worktree, "README"), join(worktree, "escape-junction"), "junction")).toThrow();
+      }
+      expect(() => chmodSync(join(worktree, "README"), 0o666)).toThrow();
+      expect(() => chmodSync(join(worktree, "gradlew"), 0o777)).toThrow();
+      if (process.platform === "win32") {
+        const account = execFileSync("whoami", { encoding: "utf8" }).trim();
+        const undo = spawnSync("icacls", [join(worktree, "README"), "/grant", `${account}:(F)`, "/Q"], { encoding: "utf8" });
+        expect(undo.status).not.toBe(0);
+        const take = spawnSync("takeown", ["/F", join(worktree, "README")], { encoding: "utf8" });
+        expect(take.status).not.toBe(0);
+      }
+      expect(() => writeFileSync(join(worktree, "README"), "changed-after-chmod\n")).toThrow();
+      expect(() => writeFileSync(join(worktree, "brand-new"), "x\n")).toThrow();
       expect(readFileSync(join(worktree, "README"))).toEqual(snapshotBytes.readme);
       expect(enforceFactoryTool({
         role: task.role,

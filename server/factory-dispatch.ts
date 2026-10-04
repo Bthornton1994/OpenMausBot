@@ -6,7 +6,8 @@
 
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Stats } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Stats } from "node:fs";
+import { enforceSnapshotBoundary, releaseSnapshotBoundary } from "./factory-worktree-boundary.ts";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
@@ -476,11 +477,12 @@ function commitExists(repo: string, sha: string): boolean {
 
 /** Review checkout. Git metadata stays in the common dir, so rev-parse still works. */
 function lockWorktreeReadOnly(dest: string): void {
-  // Permission changes wait until every symlink resolves inside this worktree.
-  // lstat and readlink do not follow a link onto its target, and chmod is never
-  // given a symlink path (it would). Write bits drop; the executable bit git
-  // uses for 100644 vs 100755 stays. .git is not traversed: a linked worktree
-  // stores a gitdir pointer there, and following it would leave the checkout.
+  // The walk finishes before any permission change. lstat and readlink do not
+  // follow a link onto its target. The lock that follows is not a mode-bit
+  // clear: on Linux the snapshot is remounted read-only, and on Windows the
+  // reviewer is denied write and DACL changes. .git is not traversed: a linked
+  // worktree stores a gitdir pointer there, and following it would leave the
+  // checkout.
   const rootInfo = lstatSync(dest);
   if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
     throw new FactoryDispatchError("invalid", "worktree root is not a real directory");
@@ -581,13 +583,24 @@ function lockWorktreeReadOnly(dest: string): void {
   };
   visit(root);
   pending.push(root);
-  const modes: { path: string; mode: number }[] = [];
+  const entries: { path: string; dir: boolean; mode: number }[] = [];
   for (const path of pending) {
     const info = lstatOr(path, "unresolved worktree path");
     if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) fail("unresolved worktree path");
-    modes.push({ path, mode: info.mode & 0o777 & ~0o222 });
+    entries.push({ path, dir: info.isDirectory(), mode: info.mode & 0o777 });
   }
-  for (const item of modes) chmodSync(item.path, item.mode);
+  try {
+    enforceSnapshotBoundary(root, entries);
+  } catch (error) {
+    if (error instanceof FactoryDispatchError) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new FactoryDispatchError("invalid", `could not lock worktree read-only: ${detail}`);
+  }
+}
+
+/** Undo lockWorktreeReadOnly. On Windows only the lock's held handles can do this. */
+export function releaseWorktreeReadOnly(dest: string): void {
+  releaseSnapshotBoundary(resolve(dest));
 }
 
 function githubPrHead(prUrl: string): string | null {
