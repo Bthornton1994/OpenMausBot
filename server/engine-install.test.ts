@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { enginesBinDir, enginesPrefix, installNpmEngine, npmPackageOf, serverInstallFor } from "./engine-install.ts";
 import { augmentedPath, findCliCandidates, registerPathDir, resetPathCacheForTests } from "./env-path.ts";
@@ -62,7 +62,8 @@ describe.skipIf(process.platform === "win32")("installing with npm", () => {
     writeFileSync(join(binDir, "npm"), FAKE_NPM, { mode: 0o755 });
     chmodSync(join(binDir, "npm"), 0o755);
     originalPath = process.env.PATH;
-    process.env.PATH = binDir;
+    // Keep this suite's Node on PATH so the shebang stand-in npm can start.
+    process.env.PATH = `${binDir}:${dirname(process.execPath)}${originalPath ? `:${originalPath}` : ""}`;
     process.env.FAKE_NPM_LOG = join(scratch, "calls.jsonl");
     delete process.env.FAKE_NPM_MODE;
     resetPathCacheForTests();

@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -173,7 +173,7 @@ describe("server-owned factory lifecycle", () => {
       dispatchKey: "orphan",
     }, deps).task;
     const otherLaunch = await launchFactoryTask(otherTask.id, { start: () => {} });
-    const tree = execSync("git rev-parse HEAD^{tree}", { cwd: otherTask.worktree }).toString().trim();
+    const tree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: otherTask.worktree, encoding: "utf8" }).trim();
     const orphan = execSync(`git commit-tree ${tree} -m orphan`, { cwd: otherTask.worktree }).toString().trim();
     execSync(`git reset --hard ${orphan}`, { cwd: otherTask.worktree });
     const claimed = harvestFactoryTask(otherTask.id, {

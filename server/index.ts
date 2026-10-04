@@ -574,6 +574,7 @@ import { createBotPresetRoutes } from "./routes/bot-presets.ts";
 import { createBotMemoryRoutes } from "./routes/bot-memory.ts";
 import { createDeciderRoutes } from "./routes/decider.ts";
 import { createAntigravityLeftoverRoutes } from "./routes/antigravity-leftovers.ts";
+import { appendFactoryDeskLink } from "./factory-desk-page.ts";
 import { createFactoryRoutes } from "./routes/factory.ts";
 import { completeFactoryTurn, factorySpecialistPrompt, factoryTaskByThread, factoryTurnGuard, noteFactorySession } from "./factory-dispatch.ts";
 import { evaluateFactoryTool } from "./factory-boundary.ts";
@@ -14417,6 +14418,14 @@ function serveStatic(res: ServerResponse, path: string): boolean {
   try {
     const data = readFileSync(file);
     const type = MIME[extname(file)] ?? "application/octet-stream";
+    // The factory desk link is only injected into the app's own index page.
+    // Other HTML (error pages, fixtures) stays untouched.
+    if (type === "text/html" && (safe === "/index.html" || safe.endsWith("/index.html"))) {
+      const html = appendFactoryDeskLink(data.toString("utf8"));
+      res.writeHead(200, { "content-type": type, ...PAGE_HEADERS });
+      res.end(html);
+      return true;
+    }
     res.writeHead(200, { "content-type": type, ...(type === "text/html" ? PAGE_HEADERS : {}) });
     res.end(data);
     return true;
@@ -14424,8 +14433,9 @@ function serveStatic(res: ServerResponse, path: string): boolean {
     // SPA fallback
     try {
       const data = readFileSync(join(STATIC_DIR, "index.html"));
+      const html = appendFactoryDeskLink(data.toString("utf8"));
       res.writeHead(200, { "content-type": "text/html", ...PAGE_HEADERS });
-      res.end(data);
+      res.end(html);
       return true;
     } catch {
       return false;

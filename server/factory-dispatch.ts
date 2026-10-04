@@ -985,10 +985,21 @@ function pushRevision(row: FactoryTask, rev: Omit<FactoryRevision, "id" | "creat
   row.revisions = [...(row.revisions ?? []), { ...rev, id: newId(), createdAt: Date.now() }];
 }
 
+
+/** A repo-owned check script. POSIX execs it. Windows cannot start a shebang
+ * file, so Git's sh runs the same bytes; if sh is missing the spawn fails
+ * and the gate stays closed. */
+function runRepoScript(script: string, args: string[], cwd: string): { status: number | null; stdout: string } {
+  const result = process.platform === "win32"
+    ? spawnSync("sh", [script, ...args], { cwd, encoding: "utf8" })
+    : spawnSync(script, args, { cwd, encoding: "utf8" });
+  return { status: result.status, stdout: result.stdout ?? "" };
+}
+
 function runRequiredTests(worktree: string, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[] } {
   const script = join(worktree, ".omb", "required-tests");
   if (!worktree || !existsSync(script)) return { ran: false, ok: true, checks: [] };
-  const result = spawnSync(script, [sha], { cwd: worktree, encoding: "utf8" });
+  const result = runRepoScript(script, [sha], worktree);
   const ok = result.status === 0;
   return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }] };
 }
@@ -1428,7 +1439,7 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps): Prom
 export function releaseGateAuthorizes(worktree: string, sha: string): { ok: boolean; reason: string } {
   const gate = join(worktree, ".omb", "release-gate");
   if (!existsSync(gate)) return { ok: false, reason: `release gate did not authorize ${sha}: .omb/release-gate is missing` };
-  const result = spawnSync(gate, [sha], { cwd: worktree, encoding: "utf8" });
+  const result = runRepoScript(gate, [sha], worktree);
   const out = (result.stdout ?? "").trim();
   if (result.status !== 0 || out !== sha) {
     return { ok: false, reason: `release gate did not authorize ${sha}` };

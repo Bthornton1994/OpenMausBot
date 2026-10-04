@@ -23,6 +23,7 @@ import {
   type FactoryBot,
   type FactoryStatus,
 } from "../factory-dispatch.ts";
+import { FACTORY_DESK_HTML, FACTORY_DESK_PATH } from "../factory-desk-page.ts";
 import { PASS, type RouteHandler } from "./table.ts";
 
 export interface FactoryRouteDeps {
@@ -58,6 +59,17 @@ export function createFactoryRoutes(deps: FactoryRouteDeps): RouteHandler {
       }
       if (method === "GET" && path === "/api/factory/onboarding") {
         return json(res, 200, { markdown: FACTORY_ONBOARDING });
+      }
+      if (method === "GET" && path === FACTORY_DESK_PATH) {
+        res.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy": "frame-ancestors 'none'",
+          "x-frame-options": "DENY",
+          "referrer-policy": "no-referrer",
+          "cache-control": "no-store",
+        });
+        res.end(FACTORY_DESK_HTML);
+        return;
       }
       if (method === "POST" && path === "/api/factory/recover") {
         return json(res, 200, recoverFactoryTasks());
