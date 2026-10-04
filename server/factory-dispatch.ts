@@ -6,7 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
@@ -30,13 +30,28 @@ export const REVIEWER_ID = "223e5e26-37e4-42e3-9026-5983b66a17aa" as const;
 export const TESTER_ID = "1872d149-0be3-42c6-9218-3ea7d56609a4" as const;
 export const RELEASE_ID = "bb034770-3b5a-44de-9ffe-1d851a093afe" as const;
 
-export const PIPELINE_PHASES = ["implement", "review", "remediate", "test", "release", "ship", "shipped", "blocked"] as const;
+export const PIPELINE_PHASES = ["implement", "review", "remediate", "test", "release", "release_ready", "ship", "shipped", "blocked"] as const;
 export type PipelinePhase = (typeof PIPELINE_PHASES)[number];
 
 export interface FactoryCheck {
   name: string;
   result: string;
   sha: string;
+}
+
+export interface FactoryRevision {
+  id: string;
+  kind: "implementation" | "candidate" | "review" | "test" | "release" | "rejection";
+  sessionId: string;
+  specialistId: string;
+  generation: number;
+  /** The SHA this record was created for. Never rewritten. */
+  sha: string;
+  evidence: FactoryEvidence[];
+  findings: string[];
+  nextAction: string;
+  disposition?: QaEvidenceDisposition;
+  createdAt: number;
 }
 
 export interface FactoryHandoff {
@@ -134,6 +149,14 @@ export interface FactoryTask {
   reviewSha?: string;
   testSha?: string;
   releaseSha?: string;
+  /** Server binding. A revision's sha is not this field and is never edited. */
+  generation?: number;
+  branch?: string;
+  headSha?: string;
+  revisions?: FactoryRevision[];
+  /** Session that last received the writer lock, and HEAD at that moment. */
+  writerSessionId?: string;
+  writerShaAtAssign?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -174,6 +197,10 @@ export interface FactoryView {
   reviewSha: string | null;
   testSha: string | null;
   releaseSha: string | null;
+  generation: number;
+  branch: string | null;
+  headSha: string | null;
+  revisions: FactoryRevision[];
   createdAt: number;
   updatedAt: number;
 }
@@ -311,6 +338,10 @@ export function viewTask(task: FactoryTask): FactoryView {
     reviewSha: task.reviewSha ?? null,
     testSha: task.testSha ?? null,
     releaseSha: task.releaseSha ?? null,
+    generation: task.generation ?? 1,
+    branch: task.branch ?? null,
+    headSha: task.headSha ?? null,
+    revisions: task.revisions ?? [],
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
@@ -499,6 +530,7 @@ export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCre
   const id = newId();
   const worktree = join(DATA_DIR, "factory-worktrees", id);
   createWorktree(repo, baseSha, worktree);
+  const bound = resolveCanonical(worktree, repo);
   const task: FactoryTask = {
     id,
     objective,
@@ -516,6 +548,10 @@ export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCre
     worktree,
     evidence: [],
     checks: [],
+    generation: 1,
+    revisions: [],
+    ...(bound?.branch ? { branch: bound.branch } : {}),
+    ...(bound?.sha ? { headSha: bound.sha } : {}),
     ...(dispatchKey ? { dispatchKey } : {}),
     ...(spec.role === "qa" && typeof raw.qaOfTaskId === "string" ? { qaOfTaskId: raw.qaOfTaskId } : {}),
     ...(spec.role === "implementer" ? pipelineSeat(raw, specialistId) : {}),
@@ -571,6 +607,17 @@ export async function launchFactoryTask(id: string, deps: FactoryLaunchDeps): Pr
     row.sessionId = sessionId;
     row.status = "launch_intent";
     row.nextAction = "start turn";
+    if ((row.role === "implementer" || row.writerLock === "implementer") && row.worktree) {
+      const assigned = git(["-C", row.worktree, "rev-parse", "HEAD"]);
+      const assignedSha = assigned.ok ? assigned.stdout.trim().toLowerCase() : "";
+      if (SHA.test(assignedSha)) {
+        row.writerSessionId = sessionId;
+        row.writerShaAtAssign = assignedSha;
+      } else {
+        row.writerSessionId = undefined;
+        row.writerShaAtAssign = undefined;
+      }
+    }
   });
   if (!intent.sessionId || !intent.worktree) {
     throw new FactoryDispatchError("blocked", "launch intent was not stored", intent);
@@ -660,7 +707,6 @@ export function harvestFactoryTask(id: string, raw: FactoryHarvestInput): Factor
   const findings = parseFindings(raw.findings);
   const checkResults = parseCheckResults(raw.checkResults);
   let qaDisposition: QaEvidenceDisposition | undefined;
-  const exactSha = (task.resultSha ?? task.baseSha).toLowerCase();
   if (raw.qaDisposition !== undefined) {
     if (task.implementerId && task.specialistId === task.implementerId) {
       throw new FactoryDispatchError("invalid", "the implementer cannot clear QA or its own implementation");
@@ -674,32 +720,84 @@ export function harvestFactoryTask(id: string, raw: FactoryHarvestInput): Factor
     if (typeof raw.qaDisposition !== "string" || !(QA_DISPOSITIONS as readonly string[]).includes(raw.qaDisposition)) {
       throw new FactoryDispatchError("invalid", "QA disposition must be CLEAR, KEEP_DRAFT, or NOT_CLEAR");
     }
-    if (typeof raw.reviewedSha !== "string" || raw.reviewedSha.toLowerCase() !== exactSha) {
-      throw new FactoryDispatchError("mismatch", "QA must review the exact SHA");
-    }
     qaDisposition = raw.qaDisposition as QaEvidenceDisposition;
   }
   const checks = raw.checks === undefined ? task.checks : Array.isArray(raw.checks) && raw.checks.every((item) => typeof item === "string")
     ? raw.checks.map((item) => item.slice(0, 500))
     : (() => { throw new FactoryDispatchError("invalid", "checks must be a list of strings"); })();
-  const resultSha = (raw.resultSha as string).toLowerCase();
+  const canonical = resolveCanonical(task.worktree!, task.repo);
+  if (!canonical) throw new FactoryDispatchError("blocked", "canonical worktree HEAD could not be read");
+  const claimed = (raw.resultSha as string).toLowerCase();
+  const claimedReview = typeof raw.reviewedSha === "string" ? raw.reviewedSha.toLowerCase() : undefined;
+  if (qaDisposition && claimedReview === undefined) {
+    throw new FactoryDispatchError("invalid", "QA must name the SHA it reviewed");
+  }
+  const generation = task.generation ?? 1;
+  if (claimed !== canonical.sha || (claimedReview !== undefined && claimedReview !== canonical.sha)) {
+    const stale = claimed !== canonical.sha ? claimed : claimedReview!;
+    if ((task.revisions ?? []).some((item) => item.kind === "rejection" && item.sessionId === task.sessionId && item.sha === stale && item.generation === generation)) {
+      return task;
+    }
+    return mutate(id, (row) => {
+      const note = `rejected ${stale}; prior review evidence was not changed`;
+      row.branch = canonical.branch;
+      row.evidence = [...row.evidence, ...evidence, { at: Date.now(), kind: "rejection", ref: stale, note }].slice(-200);
+      pushRevision(row, {
+        kind: "rejection",
+        sessionId: row.sessionId!,
+        specialistId: row.specialistId,
+        generation,
+        sha: stale,
+        evidence: [{ at: Date.now(), kind: "rejection", ref: stale, note }],
+        findings: [`claimed ${stale}`],
+        nextAction: `rejected stale SHA ${stale}`,
+      });
+      const uncertain = writerHeadUncertain(row, canonical.sha, false);
+      if (uncertain) {
+        row.status = "blocked";
+        row.phase = row.phase === "shipped" || row.phase === "release_ready" ? row.phase : "blocked";
+        row.blocker = uncertain;
+        row.nextAction = uncertain;
+        return;
+      }
+      adoptVerifiedCandidate(row, canonical.sha, evidence);
+    });
+  }
+  const kind = stageKind(task);
+  if ((task.revisions ?? []).some((item) => item.kind === kind && item.sessionId === task.sessionId && item.sha === canonical.sha && item.generation === generation)) {
+    return task;
+  }
+  const resultSha = canonical.sha;
   return mutate(id, (row) => {
-    row.resultSha = resultSha;
+    row.headSha = canonical.sha;
+    row.branch = canonical.branch;
     row.evidence = [...row.evidence, ...evidence].slice(-200);
     row.checks = checks;
     if (checkResults.length) row.checkResults = [...(row.checkResults ?? []), ...checkResults].slice(-100);
     if (qaDisposition) {
       row.qaDisposition = qaDisposition;
-      row.reviewedSha = exactSha;
-      row.reviewSha = exactSha;
+      row.reviewedSha = resultSha;
+      row.reviewSha = resultSha;
     }
     if (typeof raw.blocker === "string") row.blocker = raw.blocker.trim().slice(0, 500) || undefined;
     if (row.implementerId && !row.qaOfTaskId) {
-      advancePipeline(row, { findings, resultSha, qaDisposition, checkResults });
+      advancePipeline(row, { findings, resultSha, qaDisposition, checkResults, evidence });
       return;
     }
-    if (typeof raw.nextAction === "string" && raw.nextAction.trim()) row.nextAction = raw.nextAction.trim().slice(0, 500);
-    else row.nextAction = qaDisposition ? "evidence only; no merge" : "waiting";
+    row.resultSha = resultSha;
+    const next = typeof raw.nextAction === "string" && raw.nextAction.trim() ? raw.nextAction.trim().slice(0, 500) : qaDisposition ? "evidence only; no merge" : "waiting";
+    row.nextAction = next;
+    pushRevision(row, {
+      kind: row.role === "qa" ? "review" : "implementation",
+      sessionId: row.sessionId!,
+      specialistId: row.specialistId,
+      generation: row.generation ?? 1,
+      sha: resultSha,
+      evidence,
+      findings,
+      nextAction: next,
+      ...(qaDisposition ? { disposition: qaDisposition } : {}),
+    });
     row.status = row.role === "implementer" && !qaDisposition ? "waiting_qa" : "harvested";
   });
 }
@@ -847,7 +945,52 @@ function parseCheckResults(value: unknown): FactoryCheck[] {
   });
 }
 
+function resolveCanonical(worktree: string, repo: string): { sha: string; branch: string } | null {
+  if (!worktree || !repo || !existsSync(worktree)) return null;
+  const head = git(["-C", worktree, "rev-parse", "HEAD"]);
+  if (!head.ok) return null;
+  const sha = head.stdout.trim().toLowerCase();
+  if (!SHA.test(sha)) return null;
+  const branchResult = git(["-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"]);
+  const branch = branchResult.ok ? branchResult.stdout.trim() : "";
+  if (!branch) return null;
+  const common = git(["-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const repoCommon = git(["-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (!common.ok || !repoCommon.ok) return null;
+  try {
+    if (realpathSync(common.stdout.trim()) !== realpathSync(repoCommon.stdout.trim())) return null;
+  } catch {
+    return null;
+  }
+  return { sha, branch };
+}
+
+function stageKind(row: FactoryTask): FactoryRevision["kind"] {
+  // The seated specialist, not the next phase. A harvest can move the phase
+  // before the next session starts; a duplicate completion must still match
+  // the revision this session already wrote.
+  if (row.role === "qa" || (row.assignedReviewerId && row.specialistId === row.assignedReviewerId)) return "review";
+  if (row.assignedTesterId && row.specialistId === row.assignedTesterId) return "test";
+  if (row.assignedReleaseId && row.specialistId === row.assignedReleaseId) return "release";
+  return "implementation";
+}
+
+function pushRevision(row: FactoryTask, rev: Omit<FactoryRevision, "id" | "createdAt">): void {
+  const dup = (row.revisions ?? []).some((item) => item.kind === rev.kind && item.sessionId === rev.sessionId && item.sha === rev.sha && item.generation === rev.generation);
+  if (dup) return;
+  row.revisions = [...(row.revisions ?? []), { ...rev, id: newId(), createdAt: Date.now() }];
+}
+
+function runRequiredTests(worktree: string, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[] } {
+  const script = join(worktree, ".omb", "required-tests");
+  if (!worktree || !existsSync(script)) return { ran: false, ok: true, checks: [] };
+  const result = spawnSync(script, [sha], { cwd: worktree, encoding: "utf8" });
+  const ok = result.status === 0;
+  return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }] };
+}
+
 function invalidateReview(row: FactoryTask, sha: string): void {
+  // Drops current pointers only. Revisions already stored keep their sha.
   row.qaDisposition = undefined;
   row.reviewedSha = undefined;
   row.reviewSha = undefined;
@@ -866,7 +1009,123 @@ function pushHandoff(row: FactoryTask, handoff: Omit<FactoryHandoff, "id" | "tas
   row.handoffs = [...(row.handoffs ?? []), { ...handoff, id: newId(), taskId: row.id, createdAt: Date.now() }];
 }
 
-function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSha: string; qaDisposition?: QaEvidenceDisposition; checkResults: FactoryCheck[] }): void {
+function worktreeClean(worktree: string): boolean {
+  const status = git(["-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"]);
+  return status.ok && status.stdout.trim() === "";
+}
+
+/** Null when HEAD is proven. Otherwise a reason to stay blocked. Does not adopt HEAD. */
+function descendsFrom(worktree: string, ancestor: string, head: string): boolean {
+  if (!SHA.test(ancestor) || !SHA.test(head)) return false;
+  return git(["-C", worktree, "merge-base", "--is-ancestor", ancestor, head]).ok;
+}
+
+/**
+ * Null only when every acceptance link holds. A mismatch never adopts HEAD
+ * on a partial check. `sessionEnded` is true only after that writer turn
+ * has finished; a harvest during the turn is not enough.
+ */
+function writerHeadUncertain(row: FactoryTask, head: string, sessionEnded: boolean): string | null {
+  if (!row.worktree || !row.implementerId) return "blocked: task has no assigned writer";
+  if (!sessionEnded || row.status === "running" || row.status === "launch_intent") {
+    return "blocked: writer session has not ended";
+  }
+  if (row.writerLock !== "implementer") return "blocked: task does not own the worktree lock";
+  if (!row.writerSessionId || !row.writerShaAtAssign || !row.baseSha) return "blocked: latest writer assignment was not recorded";
+  if (row.sessionId !== row.writerSessionId || row.specialistId !== row.implementerId) {
+    return "blocked: seated session is not the latest assigned writer";
+  }
+  const canonical = resolveCanonical(row.worktree, row.repo);
+  if (!canonical || canonical.sha !== head) return "blocked: canonical worktree HEAD could not be confirmed";
+  if (!SHA.test(head) || head === row.writerShaAtAssign) return "blocked: HEAD was not produced by the latest assigned writer";
+  if (!descendsFrom(row.worktree, row.baseSha, head)) return "blocked: HEAD does not descend from the recorded base";
+  if (!descendsFrom(row.worktree, row.writerShaAtAssign, head)) return "blocked: HEAD was not produced by the latest assigned writer";
+  const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
+  if (!current.ok || current.stdout.trim().toLowerCase() !== head) return "blocked: HEAD changed while it was being checked";
+  if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean";
+  return null;
+}
+
+function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: FactoryEvidence[]): void {
+  const script = join(row.worktree ?? "", ".omb", "required-tests");
+  if (!row.worktree || !existsSync(script)) {
+    row.status = "blocked";
+    row.phase = "blocked";
+    row.blocker = "uncertain: required checks are not present for the verified HEAD";
+    row.nextAction = row.blocker;
+    return;
+  }
+  if ((row.revisions ?? []).some((item) => item.kind === "review")) row.generation = (row.generation ?? 1) + 1;
+  row.qaDisposition = undefined;
+  row.reviewedSha = undefined;
+  row.reviewSha = undefined;
+  row.testSha = undefined;
+  row.releaseSha = undefined;
+  row.findings = [];
+  const tests = runRequiredTests(row.worktree, head);
+  pushRevision(row, {
+    kind: "candidate",
+    sessionId: row.writerSessionId!,
+    specialistId: row.implementerId!,
+    generation: row.generation ?? 1,
+    sha: head,
+    evidence,
+    findings: [],
+    nextAction: tests.ok ? `fresh QA of verified HEAD ${head}` : `required checks failed for ${head}`,
+  });
+  row.checkResults = [...(row.checkResults ?? []).filter((check) => check.sha === head), ...tests.checks].slice(-100);
+  if (!tests.ok) {
+    row.status = "blocked";
+    row.phase = "blocked";
+    row.writerLock = "implementer";
+    row.blocker = `required checks failed for ${head}`;
+    row.nextAction = row.blocker;
+    return;
+  }
+  row.resultSha = head;
+  row.headSha = head;
+  row.writerLock = "review";
+  row.phase = "review";
+  row.status = "waiting_qa";
+  row.blocker = undefined;
+  row.nextAction = `fresh QA of verified HEAD ${head}`;
+  pushHandoff(row, {
+    stage: "review",
+    repo: row.repo,
+    worktree: row.worktree,
+    inputSha: row.writerShaAtAssign ?? row.baseSha,
+    resultSha: head,
+    fromSpecialistId: row.implementerId!,
+    toSpecialistId: row.assignedReviewerId!,
+    summary: `Verified HEAD ${head.slice(0, 12)} is a new candidate; prior review evidence was not reused`,
+    requiredEvidence: ["review"],
+    checks: tests.checks,
+    findings: [],
+    nextAction: "fresh independent QA of this exact SHA",
+  });
+}
+
+function rejectStale(row: FactoryTask, claimed: string, reason: string): void {
+  const note = `${reason}; reviewed SHA ${row.reviewSha ?? "none"} unchanged`;
+  row.evidence = [...row.evidence, { at: Date.now(), kind: "rejection", ref: claimed, note }].slice(-200);
+  pushRevision(row, {
+    kind: "rejection",
+    sessionId: row.sessionId!,
+    specialistId: row.specialistId,
+    generation: row.generation ?? 1,
+    sha: claimed,
+    evidence: [{ at: Date.now(), kind: "rejection", ref: claimed, note }],
+    findings: [reason],
+    nextAction: `rejected stale SHA ${claimed}; reviewed SHA ${row.reviewSha ?? "none"} unchanged`,
+  });
+  const uncertain = writerHeadUncertain(row, row.headSha && row.headSha !== claimed ? row.headSha : claimed, false);
+  row.status = "blocked";
+  row.phase = "blocked";
+  row.blocker = uncertain ?? `rejected stale SHA ${claimed}; reviewed SHA ${row.reviewSha ?? "none"} unchanged`;
+  row.nextAction = row.blocker;
+}
+
+function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSha: string; qaDisposition?: QaEvidenceDisposition; checkResults: FactoryCheck[]; evidence: FactoryEvidence[] }): void {
   const worktree = row.worktree ?? "";
   const from = row.specialistId;
   if (!row.evidence.length) {
@@ -877,7 +1136,43 @@ function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSh
     return;
   }
   if (row.phase === "implement" || row.phase === "remediate") {
-    if (row.reviewSha && row.reviewSha !== input.resultSha) invalidateReview(row, input.resultSha);
+    const hadOtherReview = (row.revisions ?? []).some((item) => item.kind === "review" && item.sha !== input.resultSha);
+    if (hadOtherReview) {
+      row.generation = (row.generation ?? 1) + 1;
+      row.qaDisposition = undefined;
+      row.reviewedSha = undefined;
+      row.reviewSha = undefined;
+      row.testSha = undefined;
+      row.releaseSha = undefined;
+      row.findings = [];
+    } else if (row.reviewSha && row.reviewSha !== input.resultSha) {
+      invalidateReview(row, input.resultSha);
+    }
+    const tests = hadOtherReview ? runRequiredTests(worktree, input.resultSha) : { ran: false, ok: true, checks: [] as FactoryCheck[] };
+    row.resultSha = input.resultSha;
+    const nextAction = tests.ran && !tests.ok
+      ? `required tests failed for ${input.resultSha}; fresh QA was not started`
+      : "independent review of the exact SHA";
+    pushRevision(row, {
+      kind: "implementation",
+      sessionId: row.sessionId!,
+      specialistId: from,
+      generation: row.generation ?? 1,
+      sha: input.resultSha,
+      evidence: input.evidence,
+      findings: [],
+      nextAction,
+    });
+    if (tests.ran && !tests.ok) {
+      row.checkResults = [...(row.checkResults ?? []), ...tests.checks].slice(-100);
+      row.evidence = [...row.evidence, { at: Date.now(), kind: "test", ref: input.resultSha, note: "required tests failed" }].slice(-200);
+      row.status = "waiting_ci";
+      row.phase = "remediate";
+      row.writerLock = "implementer";
+      row.nextAction = nextAction;
+      return;
+    }
+    if (tests.checks.length) row.checkResults = [...(row.checkResults ?? []).filter((check) => check.sha === input.resultSha), ...tests.checks].slice(-100);
     row.writerLock = "review";
     row.phase = "review";
     row.status = "waiting_qa";
@@ -893,16 +1188,33 @@ function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSh
       toSpecialistId: row.assignedReviewerId!,
       summary: `Implementation ${input.resultSha.slice(0, 12)} is ready for independent review`,
       requiredEvidence: ["review"],
-      checks: input.checkResults,
+      checks: [...input.checkResults, ...tests.checks],
       findings: [],
       nextAction: "independent review of the exact SHA",
     });
     return;
   }
   if (row.phase === "review" || row.specialistId === row.assignedReviewerId) {
+    if (row.resultSha && input.resultSha !== row.resultSha) {
+      rejectStale(row, input.resultSha, "review does not match the implementation SHA");
+      return;
+    }
     row.findings = input.findings;
     row.reviewSha = input.resultSha;
-    if (input.findings.length) {
+    row.reviewedSha = input.resultSha;
+    row.resultSha = input.resultSha;
+    pushRevision(row, {
+      kind: "review",
+      sessionId: row.sessionId!,
+      specialistId: from,
+      generation: row.generation ?? 1,
+      sha: input.resultSha,
+      evidence: input.evidence,
+      findings: input.findings,
+      nextAction: input.findings.length || input.qaDisposition === "NOT_CLEAR" ? "remediate on a new implementation session" : "test the reviewed SHA",
+      ...(input.qaDisposition ? { disposition: input.qaDisposition } : {}),
+    });
+    if (input.findings.length || input.qaDisposition === "NOT_CLEAR") {
       const limit = row.remediationLimit ?? defaultRemediationLimit();
       const used = row.remediationCount ?? 0;
       if (used >= limit) {
@@ -926,11 +1238,11 @@ function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSh
         resultSha: input.resultSha,
         fromSpecialistId: from,
         toSpecialistId: row.implementerId!,
-        summary: input.findings.join("; ").slice(0, 500),
+        summary: input.findings.join("; ").slice(0, 500) || "NOT_CLEAR",
         requiredEvidence: row.requiredEvidence,
         checks: row.checkResults ?? [],
         findings: input.findings,
-        nextAction: "fix the finding, then a fresh review is required if the SHA changes",
+        nextAction: "fix the finding; the server will read the new SHA, rerun required tests, and request fresh QA",
       });
       return;
     }
@@ -963,13 +1275,21 @@ function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSh
       return;
     }
     if (input.checkResults.some((check) => check.sha !== input.resultSha) || row.reviewSha !== input.resultSha) {
-      invalidateReview(row, input.resultSha);
-      row.status = "blocked";
-      row.blocker = `stale SHA: tests do not match reviewed SHA ${row.reviewSha ?? "none"}`;
-      row.nextAction = "fresh review and tests required";
+      rejectStale(row, input.resultSha, `tests do not match reviewed SHA ${row.reviewSha ?? "none"}`);
       return;
     }
     row.testSha = input.resultSha;
+    row.resultSha = input.resultSha;
+    pushRevision(row, {
+      kind: "test",
+      sessionId: row.sessionId!,
+      specialistId: from,
+      generation: row.generation ?? 1,
+      sha: input.resultSha,
+      evidence: input.evidence,
+      findings: [],
+      nextAction: "release review",
+    });
     row.phase = "release";
     row.writerLock = "none";
     row.status = "waiting_qa";
@@ -986,23 +1306,31 @@ function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSh
       requiredEvidence: ["release"],
       checks: input.checkResults,
       findings: row.findings ?? [],
-      nextAction: "release reviewer records the outcome; a ship message is not authorization",
+      nextAction: "release reviewer records the outcome; release_ready is not a deployment",
     });
     return;
   }
   if (row.phase === "release" || row.specialistId === row.assignedReleaseId) {
     if (row.testSha !== input.resultSha || row.reviewSha !== input.resultSha) {
-      invalidateReview(row, input.resultSha);
-      row.status = "blocked";
-      row.blocker = "stale SHA: release review does not match tested SHA";
-      row.nextAction = "fresh review and tests required";
+      rejectStale(row, input.resultSha, "release review does not match tested SHA");
       return;
     }
     row.releaseSha = input.resultSha;
+    row.resultSha = input.resultSha;
+    pushRevision(row, {
+      kind: "release",
+      sessionId: row.sessionId!,
+      specialistId: from,
+      generation: row.generation ?? 1,
+      sha: input.resultSha,
+      evidence: input.evidence,
+      findings: input.findings,
+      nextAction: `release_ready ${input.resultSha}; not shipped`,
+    });
     row.phase = "release";
     row.status = "harvested";
     row.writerLock = "none";
-    row.nextAction = "ship only when the repo gate authorizes this exact SHA";
+    row.nextAction = "release_ready only after the repo gate; a gate match is not a deployment";
   }
 }
 
@@ -1076,7 +1404,6 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps): Prom
       row.role = spec.role;
       row.threads = [...(row.threads ?? []), { specialistId: target, threadId: thread.threadId }];
       row.ombThreadId = thread.threadId;
-      if (row.sessionId) row.evidence = row.evidence;
       row.sessionId = undefined;
       row.provenSessionId = undefined;
       row.status = "bound";
@@ -1135,12 +1462,129 @@ export function shipFactoryTask(id: string, raw: Record<string, unknown> = {}): 
     throw new FactoryDispatchError("blocked", gate.reason, blocked);
   }
   return mutate(id, (row) => {
-    row.phase = "shipped";
+    row.phase = "release_ready";
     row.status = "harvested";
     row.blocker = undefined;
-    row.nextAction = `shipped ${row.resultSha}`;
-    row.evidence = [...row.evidence, { at: Date.now(), kind: "gate", ref: row.resultSha!, note: "repo gate authorized this SHA" }];
+    row.nextAction = `release_ready ${row.resultSha}; not shipped`;
+    row.evidence = [...row.evidence, { at: Date.now(), kind: "gate", ref: row.resultSha!, note: "repo gate matched this SHA; not a deployment" }];
   });
+}
+
+export function factorySpecialistPrompt(task: FactoryTask): string {
+  const handoff = [...(task.handoffs ?? [])].reverse().find((item) => item.deliveredAt);
+  if (!handoff) return task.objective;
+  return [
+    task.objective,
+    `Handoff ${handoff.stage} on factory task ${task.id}.`,
+    `Repo ${handoff.repo}. Worktree ${handoff.worktree}. Branch ${task.branch ?? "unknown"}.`,
+    `Server generation ${task.generation ?? 1}.`,
+    `Input SHA ${handoff.inputSha}. The server reads git HEAD itself. Do not expect a reported SHA to be trusted.`,
+    `From ${handoff.fromSpecialistId} to ${handoff.toSpecialistId}.`,
+    handoff.summary,
+    `Required evidence: ${handoff.requiredEvidence.join(", ") || "none"}.`,
+    handoff.findings.length ? `Findings: ${handoff.findings.join("; ")}` : "Findings: none.",
+    handoff.nextAction,
+    "Stay inside this worktree. Do not merge, push, or claim the task is shipped. A ship message is not a deployment.",
+  ].join("\n");
+}
+
+export interface FactoryCompletionDeps extends FactoryDeliverDeps {
+  ok: boolean;
+}
+
+/**
+ * Session lifecycle harvest. Identity, generation, worktree, repo, branch,
+ * and HEAD come from the server. A done message is not accepted here.
+ * A second completion for a thread that is no longer current does not start
+ * another writer.
+ */
+export async function completeFactoryTurn(threadId: string, deps: FactoryCompletionDeps): Promise<{ task: FactoryTask | null; duplicate: boolean }> {
+  const task = factoryTaskByThread(threadId);
+  if (!task) return { task: null, duplicate: false };
+  if (task.ombThreadId !== threadId) return { task, duplicate: true };
+  if (task.status === "blocked" && task.worktree && task.writerSessionId && task.sessionId === task.writerSessionId && (task.revisions ?? []).some((item) => item.kind === "rejection")) {
+    const canonical = resolveCanonical(task.worktree, task.repo);
+    if (!canonical) return { task, duplicate: true };
+    const reconsidered = mutate(task.id, (row) => {
+      const reason = writerHeadUncertain(row, canonical.sha, true);
+      if (reason) {
+        row.status = "blocked";
+        row.phase = "blocked";
+        row.blocker = reason;
+        row.nextAction = reason;
+        return;
+      }
+      if ((row.revisions ?? []).some((item) => item.kind === "candidate" && item.sha === canonical.sha && item.sessionId === row.writerSessionId)) return;
+      adoptVerifiedCandidate(row, canonical.sha, [{ at: Date.now(), kind: "commit", ref: canonical.sha, note: "server read git HEAD after the writer session ended" }]);
+    });
+    if (reconsidered.status === "blocked" || reconsidered.status === "failed_closed" || reconsidered.status === "cancelled") {
+      return { task: reconsidered, duplicate: true };
+    }
+  } else if (task.status === "blocked" || task.status === "failed_closed" || task.status === "cancelled" || task.phase === "release_ready" || task.phase === "shipped") {
+    return { task, duplicate: true };
+  }
+  if (task.status === "running" || task.status === "launch_intent") {
+    if (!task.sessionId || !task.worktree) {
+      const blocked = mutate(task.id, (row) => {
+        row.status = "blocked";
+        row.blocker = "completion failed closed: session or worktree binding is missing";
+        row.nextAction = "blocked";
+      });
+      return { task: blocked, duplicate: false };
+    }
+    if (!deps.ok) {
+      const waiting = mutate(task.id, (row) => {
+        const canonical = resolveCanonical(row.worktree!, row.repo);
+        if (canonical) {
+          row.headSha = canonical.sha;
+          row.branch = canonical.branch;
+        }
+        row.evidence = [...row.evidence, { at: Date.now(), kind: "turn", ref: row.sessionId!, note: "worker completion was not ok; SHA was not accepted" }].slice(-200);
+        row.status = "waiting_qa";
+        row.blocker = undefined;
+        row.nextAction = "worker did not finish cleanly; waiting for a recoverable retry";
+      });
+      return { task: waiting, duplicate: false };
+    }
+    const canonical = resolveCanonical(task.worktree, task.repo);
+    if (!canonical) {
+      const blocked = mutate(task.id, (row) => {
+        row.status = "blocked";
+        row.blocker = "completion failed closed: canonical HEAD could not be read";
+        row.nextAction = "blocked";
+      });
+      return { task: blocked, duplicate: false };
+    }
+    const kind = stageKind(task);
+    const generation = task.generation ?? 1;
+    const recorded = (task.revisions ?? []).some((item) => item.kind === kind && item.sessionId === task.sessionId && item.sha === canonical.sha && item.generation === generation);
+    if (!recorded && kind === "implementation") {
+      harvestFactoryTask(task.id, {
+        sessionId: task.sessionId,
+        worktree: task.worktree,
+        resultSha: canonical.sha,
+        evidence: [{ kind: "commit", ref: canonical.sha, note: "server read git HEAD at worker completion" }],
+      });
+    } else if (!recorded) {
+      const waiting = mutate(task.id, (row) => {
+        row.headSha = canonical.sha;
+        row.branch = canonical.branch;
+        row.evidence = [...row.evidence, { at: Date.now(), kind: "turn", ref: canonical.sha, note: "session ended without a result bound to server HEAD" }].slice(-200);
+        if (row.status === "running" || row.status === "launch_intent") row.status = "waiting_qa";
+        row.blocker = undefined;
+        row.nextAction = `waiting for a result bound to server HEAD ${canonical.sha}`;
+      });
+      return { task: waiting, duplicate: false };
+    }
+  }
+  const current = getFactoryTask(task.id)!;
+  if (current.ombThreadId !== threadId) return { task: current, duplicate: true };
+  const pending = [...(current.handoffs ?? [])].reverse().find((item) => !item.deliveredAt);
+  if (!pending || current.status === "running" || current.status === "launch_intent" || current.status === "blocked") {
+    return { task: current, duplicate: !pending };
+  }
+  const delivered = await deliverHandoff(current.id, deps);
+  return { task: delivered.task, duplicate: delivered.duplicate };
 }
 
 export function portfolioDocument(): {
@@ -1235,7 +1679,7 @@ Permissions are Auto only. \`bypassPermissions\` and Full are rejected. Read-onl
 3. The app creates an isolated git worktree and stores the task-to-worktree binding before any worker turn. It does not use the bot's global folder as the pin.
 4. Launch stores the Claude session id on that same task, then starts the turn. Status becomes running only after both are stored. A second launch returns the binding and does not start another writer.
 5. Quiet waits (\`waiting_ci\`, \`waiting_qa\`, \`waiting_owner\`, \`waiting_external\`) keep the worktree reserved.
-6. Harvest writes the result SHA, evidence, checks, blocker, and next action on the same task. A session or worktree mismatch, or missing evidence, is rejected. CLEAR, KEEP_DRAFT, and NOT_CLEAR are evidence only. The implementer cannot record them. QA is a different specialist and reviews the exact SHA. Nothing is merged.
+6. On worker completion the server reads the task, specialist, session, generation, canonical worktree, repository, branch, and git HEAD. An agent SHA or a done message is not the result. Each implementation and review is an immutable revision. A mismatched SHA is stored as a rejected revision and does not rewrite prior review evidence. The server continues only after the writer session has ended, the task still owns the canonical worktree lock, and Git shows a clean worktree whose HEAD was produced by that latest writer and descends from the recorded base. That verified HEAD becomes a new candidate, required checks are rerun, and fresh QA is requested for that exact SHA. If any of those links is uncertain, the task stays blocked. NOT_CLEAR starts a different implementation session only after QA has ended and the writer lock has transferred. The new SHA gets required tests and fresh QA. Old QA, security, and release results do not apply to it. release_ready is not shipped.
 7. Restart resumes only when the stored session id was proven and the worktree still matches. Otherwise the task stays blocked.
 
 ## Same-task pipeline
@@ -1244,7 +1688,7 @@ An implementer task hands off on that same task id: independent review, remediat
 
 The implementer writes only in the assigned worktree. Reviewers and testers cannot edit files. Remediation returns to the implementer only after the reviewer turn ends and the writer lock transfers. A changed SHA invalidates the review and requires a fresh review and tests. The implementer cannot clear its own work. Only the assigned Independent QA specialist records a disposition.
 
-Remediation stops at the configured limit (default 2). Evidence stays, the task is blocked, and the next action names the CoS decision. Other tasks can continue on other worktrees. Ship runs the repo's \`.omb/release-gate\` for that exact SHA. An agent message, admin flag, or bypass is not authorization. Missing evidence, a wrong SHA, or an unavailable specialist blocks the task with that reason.
+Remediation stops at the configured limit (default 2). Evidence stays, the task is blocked, and the next action names the CoS decision. Other tasks can continue on other worktrees. The repo gate can mark release_ready for that exact SHA. That is not a deployment. An agent ship message, admin flag, bypass, or a scratch gate does not set shipped. Missing evidence, a wrong SHA, or an unavailable specialist blocks the task with that reason.
 
 ## Out of scope
 

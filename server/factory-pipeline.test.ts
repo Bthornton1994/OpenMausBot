@@ -240,7 +240,8 @@ describe("factory pipeline", () => {
     expect(() => shipFactoryTask(task.id, { message: "ship it" })).toThrow(/not authorization/);
     expect(() => shipFactoryTask(task.id, { admin: true })).toThrow(/not authorization/);
     const shipped = shipFactoryTask(task.id, {});
-    expect(shipped.phase).toBe("shipped");
+    expect(shipped.phase).toBe("release_ready");
+    expect(shipped.phase).not.toBe("shipped");
     expect(shipped.resultSha).toBe(built);
 
     const other = initRepo();
@@ -343,10 +344,14 @@ describe("factory pipeline", () => {
       checkResults: [{ name: "unit", result: "pass", sha: moved }],
     });
     expect(stale.status).toBe("blocked");
-    expect(stale.blocker).toMatch(/stale SHA/);
-    expect(stale.reviewSha).toBeUndefined();
+    expect(stale.phase).toBe("blocked");
+    expect(stale.blocker).toMatch(/blocked/);
+    expect(stale.reviewSha).toBe(built);
+    expect(stale.reviewedSha).toBe(built);
     expect(stale.testSha).toBeUndefined();
     expect(stale.releaseSha).toBeUndefined();
+    expect(stale.revisions?.find((item) => item.kind === "review")?.sha).toBe(built);
+    expect(stale.revisions?.some((item) => item.kind === "rejection" && item.sha === moved)).toBe(true);
   });
 
 

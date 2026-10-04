@@ -575,7 +575,7 @@ import { createBotMemoryRoutes } from "./routes/bot-memory.ts";
 import { createDeciderRoutes } from "./routes/decider.ts";
 import { createAntigravityLeftoverRoutes } from "./routes/antigravity-leftovers.ts";
 import { createFactoryRoutes } from "./routes/factory.ts";
-import { factoryTaskByThread, factoryTurnGuard, noteFactorySession } from "./factory-dispatch.ts";
+import { completeFactoryTurn, factorySpecialistPrompt, factoryTaskByThread, factoryTurnGuard, noteFactorySession } from "./factory-dispatch.ts";
 import { evaluateFactoryTool } from "./factory-boundary.ts";
 import { findAntigravityLeftovers, removeAntigravityLeftovers } from "./drivers/antigravity-temp.ts";
 
@@ -7308,6 +7308,35 @@ bus.subscribe((event: RuntimeEvent) => {
       }
       break;
     case "turn.completed": {
+      if (factoryTaskByThread(event.threadId)) {
+        const factoryThreadId = event.threadId;
+        const factoryOk = event.ok;
+        setImmediate(() => {
+          void completeFactoryTurn(factoryThreadId, {
+            ok: factoryOk,
+            bot: (id) => {
+              const seated = store.bot(id);
+              if (!seated) return null;
+              return { id: seated.id, model: seated.modelSelection?.model, driverKind: registry.get(seated.modelSelection.instanceId)?.driverKind };
+            },
+            createThread: (botId, title) => {
+              const created = store.createTask(botId, title, true, undefined, undefined, "auto");
+              if (!created) throw new Error("couldn't create that task");
+              return { threadId: created.threadId };
+            },
+            pinCwd: (botId, threadId, cwd) => {
+              const pinned = store.patchTask(botId, threadId, { cwd });
+              if (!pinned || pinned.cwd !== cwd) throw new Error("could not pin the factory worktree");
+            },
+            start: async (task) => {
+              if (!task.ombThreadId) throw new Error("factory task has no thread");
+              await startTurn(task.specialistId, factorySpecialistPrompt(task), { threadId: task.ombThreadId });
+            },
+          }).catch((error) => {
+            console.error("factory completion failed", error instanceof Error ? error.message : "error");
+          });
+        });
+      }
       // A peer-started turn settles as coordination, not as news. What keeps
       // that classification from outliving its turn is the rewrite at
       // dispatch, not this line — releasing it here too is hygiene, so a

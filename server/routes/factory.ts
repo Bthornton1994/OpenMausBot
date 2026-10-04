@@ -10,6 +10,7 @@ import {
   createFactoryTask,
   getFactoryTask,
   deliverHandoff,
+  factorySpecialistPrompt,
   harvestFactoryTask,
   launchFactoryTask,
   shipFactoryTask,
@@ -111,22 +112,7 @@ export function createFactoryRoutes(deps: FactoryRouteDeps): RouteHandler {
           pinCwd: deps.pinCwd,
           start: async (task) => {
             if (!task.ombThreadId) throw new FactoryDispatchError("blocked", "factory task has no thread");
-            const handoff = [...(task.handoffs ?? [])].reverse().find((item) => item.deliveredAt);
-            const text = handoff
-              ? [
-                  task.objective,
-                  `Handoff ${handoff.stage} on factory task ${task.id}.`,
-                  `Repo ${handoff.repo}. Worktree ${handoff.worktree}.`,
-                  `Input SHA ${handoff.inputSha}. Result SHA ${handoff.resultSha}.`,
-                  `From ${handoff.fromSpecialistId} to ${handoff.toSpecialistId}.`,
-                  handoff.summary,
-                  `Required evidence: ${handoff.requiredEvidence.join(", ") || "none"}.`,
-                  handoff.findings.length ? `Findings: ${handoff.findings.join("; ")}` : "Findings: none.",
-                  handoff.nextAction,
-                  "Stay inside this worktree. Do not merge, push, or claim the task is shipped.",
-                ].join("\n")
-              : task.objective;
-            await deps.startTurn(task.specialistId, text, task.ombThreadId);
+            await deps.startTurn(task.specialistId, factorySpecialistPrompt(task), task.ombThreadId);
           },
         });
         return json(res, 200, { task: viewTask(result.task), duplicate: result.duplicate, handoffs: result.task.handoffs ?? [] });
