@@ -47,6 +47,10 @@ export interface FactoryRevision {
   generation: number;
   /** The SHA this record was created for. Never rewritten. */
   sha: string;
+  /** Git tree of `sha` when a candidate is sealed. Never rewritten. */
+  tree?: string;
+  /** Worktree the candidate was sealed from. Never rewritten. */
+  worktree?: string;
   evidence: FactoryEvidence[];
   findings: string[];
   nextAction: string;
@@ -680,7 +684,7 @@ export interface FactoryHarvestInput {
   checkResults?: unknown;
 }
 
-export function harvestFactoryTask(id: string, raw: FactoryHarvestInput): FactoryTask {
+export function harvestFactoryTask(id: string, raw: FactoryHarvestInput, opts?: { writerSessionEnded?: boolean }): FactoryTask {
   const task = getFactoryTask(id);
   if (!task) throw new FactoryDispatchError("not_found", "no such factory task");
   if (typeof raw.sessionId !== "string" || raw.sessionId !== task.sessionId) {
@@ -739,10 +743,9 @@ export function harvestFactoryTask(id: string, raw: FactoryHarvestInput): Factor
   const generation = task.generation ?? 1;
   if (claimed !== canonical.sha || (claimedReview !== undefined && claimedReview !== canonical.sha)) {
     const stale = claimed !== canonical.sha ? claimed : claimedReview!;
-    if ((task.revisions ?? []).some((item) => item.kind === "rejection" && item.sessionId === task.sessionId && item.sha === stale && item.generation === generation)) {
-      return task;
-    }
     return mutate(id, (row) => {
+      if (settleSealedQa(row, canonical, claimed, claimedReview, evidence)) return;
+      if ((row.revisions ?? []).some((item) => item.kind === "rejection" && item.sessionId === row.sessionId && item.sha === stale && item.generation === generation)) return;
       const note = `rejected ${stale}; prior review evidence was not changed`;
       row.branch = canonical.branch;
       row.evidence = [...row.evidence, ...evidence, { at: Date.now(), kind: "rejection", ref: stale, note }].slice(-200);
@@ -773,6 +776,7 @@ export function harvestFactoryTask(id: string, raw: FactoryHarvestInput): Factor
   }
   const resultSha = canonical.sha;
   return mutate(id, (row) => {
+    if (settleSealedQa(row, canonical, claimed, claimedReview, evidence)) return;
     row.headSha = canonical.sha;
     row.branch = canonical.branch;
     row.evidence = [...row.evidence, ...evidence].slice(-200);
@@ -785,7 +789,7 @@ export function harvestFactoryTask(id: string, raw: FactoryHarvestInput): Factor
     }
     if (typeof raw.blocker === "string") row.blocker = raw.blocker.trim().slice(0, 500) || undefined;
     if (row.implementerId && !row.qaOfTaskId) {
-      advancePipeline(row, { findings, resultSha, qaDisposition, checkResults, evidence });
+      advancePipeline(row, { findings, resultSha, qaDisposition, checkResults, evidence }, { sealBeforeHandoff: opts?.writerSessionEnded === true });
       return;
     }
     row.resultSha = resultSha;
@@ -1037,14 +1041,13 @@ function descendsFrom(worktree: string, ancestor: string, head: string): boolean
 
 /**
  * Null only when every acceptance link holds. A mismatch never adopts HEAD
- * on a partial check. `sessionEnded` is true only after that writer turn
- * has finished; a harvest during the turn is not enough.
+ * on a partial check. `sessionEnded` is true only when the writer turn is
+ * finishing. A desk harvest during the turn passes false and stays blocked.
+ * Status may still be running at that finish; the flag is the end of the turn.
  */
 function writerHeadUncertain(row: FactoryTask, head: string, sessionEnded: boolean): string | null {
   if (!row.worktree || !row.implementerId) return "blocked: task has no assigned writer";
-  if (!sessionEnded || row.status === "running" || row.status === "launch_intent") {
-    return "blocked: writer session has not ended";
-  }
+  if (!sessionEnded) return "blocked: writer session has not ended";
   if (row.writerLock !== "implementer" || !holdsWriterLock(row)) return "blocked: task does not own the worktree lock";
   if (!row.writerSessionId || !row.writerShaAtAssign || !row.baseSha) return "blocked: latest writer assignment was not recorded";
   if (row.sessionId !== row.writerSessionId || row.specialistId !== row.implementerId) {
@@ -1059,6 +1062,179 @@ function writerHeadUncertain(row: FactoryTask, head: string, sessionEnded: boole
   if (!current.ok || current.stdout.trim().toLowerCase() !== head) return "blocked: HEAD changed while it was being checked";
   if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean";
   return null;
+}
+
+function gitTree(worktree: string, sha: string): string | null {
+  const result = git(["-C", worktree, "rev-parse", `${sha}^{tree}`]);
+  if (!result.ok) return null;
+  const tree = result.stdout.trim().toLowerCase();
+  return SHA.test(tree) ? tree : null;
+}
+
+/** Immutable candidate for this generation. Missing tree or worktree is not sealed. */
+function sealedCandidate(row: FactoryTask): FactoryRevision | undefined {
+  const generation = row.generation ?? 1;
+  const found = (row.revisions ?? []).filter((item) => item.kind === "candidate" && item.generation === generation && SHA.test(item.sha) && !!item.tree && SHA.test(item.tree) && !!item.worktree && !!item.sessionId);
+  return found.length ? found[found.length - 1] : undefined;
+}
+
+function qaLeaseHolds(row: FactoryTask): boolean {
+  if (!row.implementerId || !row.assignedReviewerId) return false;
+  if (row.writerLock === "implementer") return false;
+  if (row.specialistId === row.implementerId || row.role === "implementer") return false;
+  return row.role === "qa" || row.specialistId === row.assignedReviewerId;
+}
+
+function persistSealedCandidate(row: FactoryTask, head: string, evidence: FactoryEvidence[]): boolean {
+  if (!row.worktree || !row.writerSessionId || !row.implementerId) {
+    row.status = "blocked";
+    row.phase = "blocked";
+    row.blocker = "blocked: task/session/lock provenance could not be proved";
+    row.nextAction = row.blocker;
+    return false;
+  }
+  const tree = gitTree(row.worktree, head);
+  if (!tree) {
+    row.status = "blocked";
+    row.phase = "blocked";
+    row.blocker = "blocked: task/session/lock provenance could not be proved";
+    row.nextAction = row.blocker;
+    return false;
+  }
+  const generation = row.generation ?? 1;
+  const note = `sealed candidate ${head} tree ${tree} worktree ${row.worktree} generation ${generation} writer ${row.writerSessionId}`;
+  pushRevision(row, {
+    kind: "candidate",
+    sessionId: row.writerSessionId,
+    specialistId: row.implementerId,
+    generation,
+    sha: head,
+    tree,
+    worktree: row.worktree,
+    evidence: [...evidence, { at: Date.now(), kind: "seal", ref: head, note }],
+    findings: [],
+    nextAction: `sealed candidate ${head}`,
+  });
+  return sealedCandidate(row)?.sha === head;
+}
+
+function candidateDrift(row: FactoryTask, sealed: FactoryRevision): string | null {
+  if (!row.worktree || !row.repo || !sealed.worktree || !sealed.tree || !sealed.sha || !sealed.sessionId) {
+    return "blocked: task/session/lock provenance could not be proved";
+  }
+  if (row.worktree !== sealed.worktree) return "blocked: task/session/lock provenance could not be proved";
+  const canonical = resolveCanonical(row.worktree, row.repo);
+  if (!canonical) return "blocked: task/session/lock provenance could not be proved";
+  if (canonical.sha !== sealed.sha) return "blocked: worktree changed after the candidate was sealed";
+  const tree = gitTree(row.worktree, canonical.sha);
+  if (!tree || tree !== sealed.tree) return "blocked: worktree changed after the candidate was sealed";
+  if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean after the candidate was sealed";
+  const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
+  if (!current.ok || current.stdout.trim().toLowerCase() !== sealed.sha) return "blocked: worktree changed after the candidate was sealed";
+  return null;
+}
+
+function rememberRejection(row: FactoryTask, stale: string, evidence: FactoryEvidence[]): void {
+  if (!row.sessionId) return;
+  const generation = row.generation ?? 1;
+  if ((row.revisions ?? []).some((item) => item.kind === "rejection" && item.sessionId === row.sessionId && item.sha === stale && item.generation === generation)) return;
+  const note = `rejected ${stale}; prior review evidence was not changed`;
+  const rejection: FactoryEvidence = { at: Date.now(), kind: "rejection", ref: stale, note };
+  row.evidence = [...row.evidence, ...evidence, rejection].slice(-200);
+  pushRevision(row, {
+    kind: "rejection",
+    sessionId: row.sessionId,
+    specialistId: row.specialistId,
+    generation,
+    sha: stale,
+    evidence: [rejection],
+    findings: [`claimed ${stale}`],
+    nextAction: `rejected stale SHA ${stale}`,
+  });
+}
+
+function scheduleFreshQa(row: FactoryTask, sealed: FactoryRevision): void {
+  const sha = sealed.sha;
+  row.resultSha = sha;
+  row.headSha = sha;
+  row.status = "waiting_qa";
+  row.phase = "review";
+  row.writerLock = "review";
+  row.blocker = undefined;
+  row.nextAction = `fresh independent QA of sealed candidate ${sha}`;
+  if (!row.worktree || !row.implementerId || !row.assignedReviewerId) return;
+  pushHandoff(row, {
+    stage: "review",
+    repo: row.repo,
+    worktree: row.worktree,
+    inputSha: sha,
+    resultSha: sha,
+    fromSpecialistId: row.implementerId,
+    toSpecialistId: row.assignedReviewerId,
+    summary: `Rejected QA submission did not match sealed candidate ${sha.slice(0, 12)}; candidate unchanged`,
+    requiredEvidence: ["review"],
+    checks: (row.checkResults ?? []).filter((check) => check.sha === sha),
+    findings: [],
+    nextAction: `fresh independent QA of sealed candidate ${sha}`,
+  });
+}
+
+/**
+ * QA against a sealed candidate. The implementer session and writer lock are
+ * not required once the lease has moved. Returns true when this harvest must
+ * not fall through to the writer-lock check.
+ */
+function settleSealedQa(row: FactoryTask, canonical: { sha: string; branch: string }, claimed: string, claimedReview: string | undefined, evidence: FactoryEvidence[]): boolean {
+  if (!qaLeaseHolds(row)) return false;
+  if (row.status === "blocked" && row.blocker && row.blocker !== "blocked: writer session has not ended") {
+    const stale = claimed !== (sealedCandidate(row)?.sha ?? canonical.sha) ? claimed : claimedReview !== undefined && claimedReview !== (sealedCandidate(row)?.sha ?? canonical.sha) ? claimedReview : undefined;
+    if (stale) rememberRejection(row, stale, evidence);
+    return true;
+  }
+  let sealed = sealedCandidate(row);
+  if (!sealed) sealed = proveAndSealFromImplementation(row, canonical);
+  if (!sealed) {
+    if (claimed !== canonical.sha) rememberRejection(row, claimed, evidence);
+    else if (claimedReview !== undefined && claimedReview !== canonical.sha) rememberRejection(row, claimedReview, evidence);
+    row.status = "blocked";
+    row.phase = "blocked";
+    row.blocker = "blocked: task/session/lock provenance could not be proved";
+    row.nextAction = row.blocker;
+    return true;
+  }
+  const drift = candidateDrift(row, sealed);
+  const stale = claimed !== sealed.sha ? claimed : claimedReview !== undefined && claimedReview !== sealed.sha ? claimedReview : undefined;
+  if (stale) rememberRejection(row, stale, evidence);
+  if (drift) {
+    row.status = "blocked";
+    row.phase = "blocked";
+    row.blocker = drift;
+    row.nextAction = drift;
+    return true;
+  }
+  if (stale) {
+    scheduleFreshQa(row, sealed);
+    return true;
+  }
+  return false;
+}
+
+function proveAndSealFromImplementation(row: FactoryTask, canonical: { sha: string; branch: string }): FactoryRevision | undefined {
+  if (sealedCandidate(row)) return sealedCandidate(row);
+  if (!qaLeaseHolds(row) || !row.worktree || !row.writerSessionId || !row.implementerId || !row.baseSha) return undefined;
+  const generation = row.generation ?? 1;
+  const implementation = (row.revisions ?? []).find((item) => item.kind === "implementation" && item.generation === generation && item.sha === canonical.sha && item.sessionId === row.writerSessionId);
+  if (!implementation) return undefined;
+  if (row.headSha && row.headSha !== canonical.sha) return undefined;
+  if (row.resultSha && row.resultSha !== canonical.sha) return undefined;
+  if (canonical.sha === row.writerShaAtAssign) return undefined;
+  if (!descendsFrom(row.worktree, row.baseSha, canonical.sha)) return undefined;
+  if (row.writerShaAtAssign && !descendsFrom(row.worktree, row.writerShaAtAssign, canonical.sha)) return undefined;
+  if (!worktreeClean(row.worktree)) return undefined;
+  const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
+  if (!current.ok || current.stdout.trim().toLowerCase() !== canonical.sha) return undefined;
+  const sealedNow = persistSealedCandidate(row, canonical.sha, [{ at: Date.now(), kind: "seal", ref: canonical.sha, note: `sealed from implementation revision ${implementation.id}` }]);
+  return sealedNow ? sealedCandidate(row) : undefined;
 }
 
 function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: FactoryEvidence[]): void {
@@ -1078,13 +1254,24 @@ function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: Factor
   row.releaseSha = undefined;
   row.findings = [];
   const tests = runRequiredTests(row.worktree, head);
+  const tree = gitTree(row.worktree, head);
+  if (!tree || !row.writerSessionId || !row.implementerId) {
+    row.status = "blocked";
+    row.phase = "blocked";
+    row.blocker = "blocked: task/session/lock provenance could not be proved";
+    row.nextAction = row.blocker;
+    return;
+  }
+  const note = `sealed candidate ${head} tree ${tree} worktree ${row.worktree} generation ${row.generation ?? 1} writer ${row.writerSessionId}`;
   pushRevision(row, {
     kind: "candidate",
-    sessionId: row.writerSessionId!,
-    specialistId: row.implementerId!,
+    sessionId: row.writerSessionId,
+    specialistId: row.implementerId,
     generation: row.generation ?? 1,
     sha: head,
-    evidence,
+    tree,
+    worktree: row.worktree,
+    evidence: [...evidence, { at: Date.now(), kind: "seal", ref: head, note }],
     findings: [],
     nextAction: tests.ok ? `fresh QA of verified HEAD ${head}` : `required checks failed for ${head}`,
   });
@@ -1140,7 +1327,7 @@ function rejectStale(row: FactoryTask, claimed: string, reason: string): void {
   row.nextAction = row.blocker;
 }
 
-function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSha: string; qaDisposition?: QaEvidenceDisposition; checkResults: FactoryCheck[]; evidence: FactoryEvidence[] }): void {
+function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSha: string; qaDisposition?: QaEvidenceDisposition; checkResults: FactoryCheck[]; evidence: FactoryEvidence[] }, opts?: { sealBeforeHandoff?: boolean }): void {
   const worktree = row.worktree ?? "";
   const from = row.specialistId;
   if (!row.evidence.length) {
@@ -1151,6 +1338,16 @@ function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSh
     return;
   }
   if (row.phase === "implement" || row.phase === "remediate") {
+    if (opts?.sealBeforeHandoff) {
+      const reason = writerHeadUncertain(row, input.resultSha, true);
+      if (reason) {
+        row.status = "blocked";
+        row.phase = "blocked";
+        row.blocker = reason;
+        row.nextAction = reason;
+        return;
+      }
+    }
     const hadOtherReview = (row.revisions ?? []).some((item) => item.kind === "review" && item.sha !== input.resultSha);
     if (hadOtherReview) {
       row.generation = (row.generation ?? 1) + 1;
@@ -1163,6 +1360,7 @@ function advancePipeline(row: FactoryTask, input: { findings: string[]; resultSh
     } else if (row.reviewSha && row.reviewSha !== input.resultSha) {
       invalidateReview(row, input.resultSha);
     }
+    if (opts?.sealBeforeHandoff && !persistSealedCandidate(row, input.resultSha, input.evidence)) return;
     const tests = hadOtherReview ? runRequiredTests(worktree, input.resultSha) : { ran: false, ok: true, checks: [] as FactoryCheck[] };
     row.resultSha = input.resultSha;
     const nextAction = tests.ran && !tests.ok
@@ -1579,7 +1777,7 @@ export async function completeFactoryTurn(threadId: string, deps: FactoryComplet
         worktree: task.worktree,
         resultSha: canonical.sha,
         evidence: [{ kind: "commit", ref: canonical.sha, note: "server read git HEAD at worker completion" }],
-      });
+      }, { writerSessionEnded: true });
     } else if (!recorded) {
       const waiting = mutate(task.id, (row) => {
         row.headSha = canonical.sha;
@@ -1694,7 +1892,7 @@ Permissions are Auto only. \`bypassPermissions\` and Full are rejected. Read-onl
 3. The app creates an isolated git worktree and stores the task-to-worktree binding before any worker turn. It does not use the bot's global folder as the pin.
 4. Launch stores the Claude session id on that same task, then starts the turn. Status becomes running only after both are stored. A second launch returns the binding and does not start another writer.
 5. Quiet waits (\`waiting_ci\`, \`waiting_qa\`, \`waiting_owner\`, \`waiting_external\`) keep the worktree reserved.
-6. On worker completion the server reads the task, specialist, session, generation, canonical worktree, repository, branch, and git HEAD. An agent SHA or a done message is not the result. Each implementation and review is an immutable revision. A mismatched SHA is stored as a rejected revision and does not rewrite prior review evidence. The server continues only after the writer session has ended, the task still owns the canonical worktree lock, and Git shows a clean worktree whose HEAD was produced by that latest writer and descends from the recorded base. That verified HEAD becomes a new candidate, required checks are rerun, and fresh QA is requested for that exact SHA. If any of those links is uncertain, the task stays blocked. NOT_CLEAR starts a different implementation session only after QA has ended and the writer lock has transferred. The new SHA gets required tests and fresh QA. Old QA, security, and release results do not apply to it. release_ready is not shipped.
+6. On worker completion the server reads the task, specialist, session, generation, canonical worktree, repository, branch, and git HEAD. An agent SHA or a done message is not the result. Each implementation and review is an immutable revision. A mismatched SHA is stored as a rejected revision and does not rewrite prior review evidence. When the implementer session ends and still holds the exclusive writer lock, the server verifies that binding, a clean worktree, actual HEAD, and ancestry from the recorded base, then stores an immutable candidate (generation, writer session, SHA, tree, worktree, and the verification evidence) before the worktree moves to a read-only QA lease. QA is compared to that sealed SHA. The writer session and writer lock do not have to stay active after the lease moves. A mismatched QA SHA stays rejected evidence, the candidate is unchanged, and fresh Independent QA is scheduled for the sealed SHA. A rejected review is not CLEAR. If the worktree changes after sealing, or task, session, and lock provenance cannot be proved, the task stays blocked. A newer HEAD is not adopted and a prior review is not rewritten. NOT_CLEAR starts a different implementation session only after QA has ended and the writer lock has transferred. The new SHA gets required tests and fresh QA. Old QA, security, and release results do not apply to it. release_ready is not shipped.
 7. Restart resumes only when the stored session id was proven and the worktree still matches. Otherwise the task stays blocked.
 
 ## Same-task pipeline
