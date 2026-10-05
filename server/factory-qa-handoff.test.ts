@@ -1,45 +1,59 @@
-// Queued QA handoff consumption and QA-only desk tasks.
-// Live task 6ea2f99b-e29a-4b21-8fa5-b9b6dd56598c is not loaded. The fixture
-// copies its shape: waiting_qa, session 69e6f60a still seated, undelivered
-// handoff 3218431a, rejection b079f2e2 of aaaa… by that session, and a sealed
-// candidate the new session must review. The sealed SHA here is a local
-// commit, not the live 9869feef worktree.
+// QA is performed outside OMB. Every QA entry point that is still routed
+// rejects with qa_outside_omb, writes nothing, and starts nothing. The
+// stored-task fixture below is synthetic: it has the shape of a task that
+// was waiting on QA (waiting_qa, a QA seat, an undelivered review handoff,
+// a sealed candidate, and a rejected QA SHA). No live task is loaded.
 import { execFileSync, execSync } from "node:child_process";
-import { accessSync, constants, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import { enforceFactoryTool } from "./factory-boundary.ts";
+import { FACTORY_SPECIALISTS, type FactorySpecialistId } from "./factory-boundary.ts";
+import { FACTORY_DESK_HTML } from "./factory-desk-page.ts";
 import {
+  FACTORY_ONBOARDING,
   FactoryDispatchError,
   IMPLEMENTER_ID,
-  REVIEWER_ID,
+  QA_OUTSIDE_OMB,
   completeFactoryTurn,
   createFactoryTask,
   deliverHandoff,
+  factoryTurnGuard,
   getFactoryTask,
   harvestFactoryTask,
   launchFactoryTask,
-  releaseWorktreeReadOnly,
+  listFactoryTasks,
+  recoverFactoryTasks,
+  shipFactoryTask,
+  unavailableFactoryRoles,
+  waitFactoryTask,
   _resetFactoryDispatch,
   type FactoryBot,
   type FactoryCompletionDeps,
-  type FactoryDeliverDeps,
-  type FactoryRevision,
-  type FactoryTask,
 } from "./factory-dispatch.ts";
+import { json, readBody } from "./harness/http.ts";
+import { createFactoryRoutes } from "./routes/factory.ts";
+import { PASS, dispatchRoutes } from "./routes/table.ts";
 
+const QA_ID = "223e5e26-37e4-42e3-9026-5983b66a17aa";
 const DEAD = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 const REJECTED_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const LIVE_TASK = "6ea2f99b-e29a-4b21-8fa5-b9b6dd56598c";
-const LIVE_HANDOFF = "3218431a-7891-4c46-b728-9a80b149e1f3";
-const LIVE_SESSION = "69e6f60a-204b-4568-b835-b767d9f83ad7";
-const LIVE_REJECTION = "b079f2e2-9a34-4ce7-9bcd-f98f5dbb4ccd";
+const FIXTURE_TASK = "00000000-0000-4000-8000-0000000000a1";
+const FIXTURE_HANDOFF = "00000000-0000-4000-8000-0000000000b1";
+const FIXTURE_SESSION = "00000000-0000-4000-8000-0000000000c1";
+const FIXTURE_REJECTION = "00000000-0000-4000-8000-0000000000d1";
+const FIXTURE_THREAD = "fixture-qa-thread";
+
+const store = (): string => join(DATA_DIR, "factory-tasks.json");
+const worktreesDir = (): string => join(DATA_DIR, "factory-worktrees");
+const worktreeCount = (): number => (existsSync(worktreesDir()) ? readdirSync(worktreesDir()).length : 0);
 
 function initRepo(): { repo: string; sha: string } {
-  const repo = mkdtempSync(join(tmpdir(), "omb-qa-"));
+  const repo = mkdtempSync(join(tmpdir(), "omb-noqa-"));
   execSync("git init -b main", { cwd: repo });
   execSync("git config user.email factory@example.com", { cwd: repo });
   execSync("git config user.name factory", { cwd: repo });
@@ -54,370 +68,391 @@ function commit(worktree: string, body: string): string {
   return execSync("git rev-parse HEAD", { cwd: worktree }).toString().trim();
 }
 
-function treeOf(worktree: string, sha: string): string {
-  return execFileSync("git", ["rev-parse", `${sha}^{tree}`], { cwd: worktree, encoding: "utf8" }).trim();
-}
-
 function local() {
   let n = 0;
   const threads: { threadId: string; cwd?: string }[] = [];
-  const scope = Math.random().toString(16).slice(2);
+  const created: string[] = [];
   const bot = (id: string): FactoryBot => ({ id, model: "claude-opus-5-5", driverKind: "claudeAgent" });
   const createThread = (id: string) => {
-    const threadId = `qa-${scope}-${id.slice(0, 8)}-${n++}`;
+    const threadId = `noqa-${id.slice(0, 8)}-${n++}`;
     threads.push({ threadId });
+    created.push(id);
     return { threadId };
   };
   const pinCwd = (_id: string, threadId: string, cwd: string) => {
     const row = threads.find((item) => item.threadId === threadId);
     if (row) row.cwd = cwd;
   };
-  return { threads, bot, createThread, pinCwd };
+  return { threads, created, bot, createThread, pinCwd };
 }
 
-function deliverDeps(deps: ReturnType<typeof local>, starts: { n: number }, start: () => void = () => { starts.n += 1; }): FactoryDeliverDeps {
-  return { bot: deps.bot, createThread: deps.createThread, pinCwd: deps.pinCwd, start };
-}
-
-async function sealMismatch(): Promise<{
-  id: string;
-  built: string;
-  qaSession: string;
-  candidateId: string;
-  rejection: FactoryRevision;
-  deps: ReturnType<typeof local>;
-  starts: { n: number };
-}> {
-  const { repo, sha } = initRepo();
-  const deps = local();
-  const starts = { n: 0 };
-  const created = createFactoryTask({
+function intake(repo: string, sha: string, specialistId: string = IMPLEMENTER_ID, extra: Record<string, unknown> = {}) {
+  return {
     objective: "Add a harmless line",
-    specialistId: IMPLEMENTER_ID,
+    specialistId,
     model: "claude-opus-5-5",
     permissions: "auto",
     repo,
     baseSha: sha,
-    acceptance: "README contains sealed",
+    acceptance: "README contains harmless",
     dependencies: [],
     requiredEvidence: ["commit"],
     owner: "Bryant Thornton",
-    authority: "qa handoff proof",
-  }, deps).task;
-  const launched = await launchFactoryTask(created.id, { start: () => {} });
-  const built = commit(created.worktree!, "base\nsealed\n");
-  const host: FactoryCompletionDeps = { ok: true, ...deliverDeps(deps, starts) };
-  const routed = await completeFactoryTurn(launched.task.ombThreadId!, host);
-  const seated = routed.task!;
-  const candidate = seated.revisions?.find((item) => item.kind === "candidate");
-  if (!candidate) throw new Error("candidate was not sealed");
-  const rejected = harvestFactoryTask(seated.id, {
-    sessionId: seated.sessionId,
-    worktree: seated.worktree,
-    resultSha: DEAD,
-    reviewedSha: DEAD,
-    qaDisposition: "CLEAR",
-    evidence: [{ kind: "note", ref: DEAD, note: "disposable scratch mismatch" }],
-  });
-  const rejection = rejected.revisions?.find((item) => item.kind === "rejection" && item.sha === DEAD);
-  if (!rejection) throw new Error("rejection was not stored");
-  return { id: seated.id, built, qaSession: seated.sessionId!, candidateId: candidate.id, rejection, deps, starts };
+    authority: "qa outside omb proof",
+    ...extra,
+  };
 }
 
-function rejectionOf(task: FactoryTask | undefined, id: string): FactoryRevision {
-  const found = task?.revisions?.find((item) => item.id === id);
-  if (!found) throw new Error(`revision ${id} missing`);
-  return found;
+/** A stored task that was waiting on QA before QA moved out of OMB. */
+function writeStoredQaTask(): { repo: string; worktree: string; built: string } {
+  const { repo, sha } = initRepo();
+  const built = commit(repo, "base\nsealed\n");
+  const worktree = join(mkdtempSync(join(tmpdir(), "omb-noqa-wt-")), "wt");
+  execSync(`git worktree add --detach ${JSON.stringify(worktree)} ${built}`, { cwd: repo });
+  const tree = execFileSync("git", ["rev-parse", `${built}^{tree}`], { cwd: worktree, encoding: "utf8" }).trim();
+  const now = Date.now();
+  const task = {
+    id: FIXTURE_TASK,
+    objective: "Review the sealed candidate",
+    specialistId: QA_ID,
+    specialistKey: "independent-qa",
+    role: "qa",
+    model: "claude-opus-5-5",
+    permissions: "auto",
+    repo,
+    baseSha: sha,
+    acceptance: "review only",
+    dependencies: [],
+    requiredEvidence: ["review"],
+    status: "waiting_qa",
+    worktree,
+    sessionId: FIXTURE_SESSION,
+    ombThreadId: FIXTURE_THREAD,
+    threads: [{ specialistId: QA_ID, threadId: FIXTURE_THREAD }],
+    resultSha: built,
+    headSha: built,
+    evidence: [{ at: now, kind: "commit", ref: built }],
+    checks: [],
+    implementerId: IMPLEMENTER_ID,
+    assignedReviewerId: QA_ID,
+    phase: "review",
+    writerLock: "review",
+    generation: 1,
+    branch: "HEAD",
+    revisions: [
+      { id: "00000000-0000-4000-8000-0000000000e1", kind: "candidate", sessionId: "00000000-0000-4000-8000-0000000000f1", specialistId: IMPLEMENTER_ID, generation: 1, sha: built, tree, worktree, evidence: [], findings: [], nextAction: `sealed candidate ${built}`, createdAt: now },
+      { id: FIXTURE_REJECTION, kind: "rejection", sessionId: FIXTURE_SESSION, specialistId: QA_ID, generation: 1, sha: REJECTED_SHA, evidence: [], findings: [`claimed ${REJECTED_SHA}`], nextAction: `rejected stale SHA ${REJECTED_SHA}`, createdAt: now },
+    ],
+    handoffs: [{
+      id: FIXTURE_HANDOFF,
+      taskId: FIXTURE_TASK,
+      stage: "review",
+      repo,
+      worktree,
+      inputSha: built,
+      resultSha: built,
+      fromSpecialistId: IMPLEMENTER_ID,
+      toSpecialistId: QA_ID,
+      summary: "fixture review handoff",
+      requiredEvidence: ["review"],
+      checks: [],
+      findings: [],
+      nextAction: `fresh independent QA of sealed candidate ${built}`,
+      createdAt: now,
+    }],
+    owner: "Bryant Thornton",
+    authority: "fixture",
+    createdAt: now,
+    updatedAt: now,
+    nextAction: `fresh independent QA of sealed candidate ${built}`,
+  };
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(store(), JSON.stringify({ version: 1, tasks: [task], unavailableRoles: [] }));
+  _resetFactoryDispatch();
+  return { repo, worktree, built };
+}
+
+function expectQaOutside(fn: () => unknown): void {
+  let thrown: unknown;
+  try { fn(); } catch (error) { thrown = error; }
+  expect(thrown).toBeInstanceOf(FactoryDispatchError);
+  expect((thrown as FactoryDispatchError).code).toBe("qa_outside_omb");
+  expect((thrown as FactoryDispatchError).message).toContain(QA_OUTSIDE_OMB);
+}
+
+async function expectQaOutsideAsync(promise: Promise<unknown>): Promise<void> {
+  const error = await promise.then(() => null, (caught: unknown) => caught);
+  expect(error).toBeInstanceOf(FactoryDispatchError);
+  expect((error as FactoryDispatchError).code).toBe("qa_outside_omb");
 }
 
 beforeEach(() => {
-  try { unlinkSync(join(DATA_DIR, "factory-tasks.json")); } catch { /* fresh */ }
+  try { unlinkSync(store()); } catch { /* fresh */ }
   _resetFactoryDispatch();
 });
 
-describe("queued QA handoff", () => {
-  it("keeps the rejection and starts a new QA session against the sealed SHA", async () => {
-    const seated = await sealMismatch();
-    const before = getFactoryTask(seated.id)!;
-    expect(before.qaDisposition).toBeUndefined();
-    expect(before.resultSha).toBe(seated.built);
-    expect(before.sessionId).toBe(seated.qaSession);
-    const queued = before.handoffs?.find((item) => !item.deliveredAt && item.resultSha === seated.built);
-    expect(queued?.nextAction).toContain(seated.built);
-    const rejectionBefore = JSON.stringify(rejectionOf(before, seated.rejection.id));
-    const candidateBefore = JSON.stringify(before.revisions?.find((item) => item.id === seated.candidateId));
-
-    const started = await deliverHandoff(seated.id, deliverDeps(seated.deps, seated.starts), { handoffId: queued!.id });
-    expect(started.task.sessionId).toBeTruthy();
-    expect(started.task.sessionId).not.toBe(seated.qaSession);
-    expect(started.task.status).toBe("running");
-    expect(started.task.role).toBe("qa");
-    expect(started.task.writerLock).toBe("review");
-    expect(started.task.qaDisposition).toBeUndefined();
-    expect(started.task.resultSha).toBe(seated.built);
-    expect(started.task.handoffs?.find((item) => item.id === queued!.id)?.deliveredAt).toBeTypeOf("number");
-    expect(started.task.qaAttempts?.some((item) => item.sessionId === started.task.sessionId && item.sha === seated.built && item.handoffId === queued!.id)).toBe(true);
-    expect(started.task.qaAttempts?.some((item) => item.sessionId === seated.qaSession && item.sha === DEAD)).toBe(false);
-    expect(JSON.stringify(rejectionOf(started.task, seated.rejection.id))).toBe(rejectionBefore);
-    expect(JSON.stringify(started.task.revisions?.find((item) => item.id === seated.candidateId))).toBe(candidateBefore);
-    expect(enforceFactoryTool({ role: "qa", worktree: started.task.worktree!, tool: "Write", input: { file_path: join(started.task.worktree!, "README") } }).allow).toBe(false);
-    expect(execSync("git rev-parse HEAD", { cwd: started.task.worktree }).toString().trim()).toBe(seated.built);
-  });
-
-  it("does not mark a failed launch as delivered", async () => {
-    const seated = await sealMismatch();
-    const before = getFactoryTask(seated.id)!;
-    const queued = before.handoffs?.find((item) => !item.deliveredAt);
-    if (!queued) throw new Error("handoff was not queued");
-    const rejectionBefore = JSON.stringify(rejectionOf(before, seated.rejection.id));
-    let starts = 0;
-    await expect(deliverHandoff(seated.id, deliverDeps(seated.deps, seated.starts, () => {
-      starts += 1;
-      throw new Error("worker failed");
-    }), { handoffId: queued.id })).rejects.toBeInstanceOf(FactoryDispatchError);
-    const after = getFactoryTask(seated.id)!;
-    expect(starts).toBe(1);
-    expect(after.status).not.toBe("running");
-    expect(after.status === "blocked" || after.status === "waiting_qa").toBe(true);
-    expect(after.blocker ?? after.nextAction ?? "").not.toBe("");
-    expect(after.handoffs?.find((item) => item.id === queued.id)?.deliveredAt).toBeUndefined();
-    expect(after.sessionId).toBe(seated.qaSession);
-    expect(after.qaAttempts?.some((item) => item.sessionId !== seated.qaSession)).toBe(false);
-    expect(JSON.stringify(rejectionOf(after, seated.rejection.id))).toBe(rejectionBefore);
-    expect(after.revisions?.find((item) => item.id === seated.candidateId)?.sha).toBe(seated.built);
-    expect(after.qaDisposition).toBeUndefined();
-  });
-
-  it("consumes an already waiting handoff from a previous process", async () => {
+describe("QA intake is rejected before anything is written", () => {
+  it("refuses Independent QA and every other non-implementer seat without a worktree, thread, or unavailable-role record", () => {
     const { repo, sha } = initRepo();
-    const built = commit(repo, "base\nsealed\n");
-    const worktree = join(tmpdir(), `omb-qa-wt-${built.slice(0, 8)}`);
-    execSync(`git worktree add --detach ${JSON.stringify(worktree)} ${built}`, { cwd: repo });
-    const tree = treeOf(worktree, built);
-    const now = Date.now();
-    const candidate = {
-      id: "cacb9041-46bc-4eff-9f25-000ad3677f24",
-      kind: "candidate",
-      sessionId: "4da54f69-6f79-4129-89df-0b9ac6e7eedb",
-      specialistId: IMPLEMENTER_ID,
-      generation: 1,
-      sha: built,
-      tree,
-      worktree,
-      evidence: [{ at: now, kind: "seal", ref: built, note: "fixture seal" }],
-      findings: [],
-      nextAction: `sealed candidate ${built}`,
-      createdAt: now,
-    };
-    const rejection = {
-      id: LIVE_REJECTION,
-      kind: "rejection",
-      sessionId: LIVE_SESSION,
-      specialistId: REVIEWER_ID,
-      generation: 1,
-      sha: REJECTED_SHA,
-      evidence: [{ at: now, kind: "rejection", ref: REJECTED_SHA, note: "fixture rejection" }],
-      findings: [`claimed ${REJECTED_SHA}`],
-      nextAction: `rejected stale SHA ${REJECTED_SHA}`,
-      createdAt: now,
-    };
-    const task = {
-      id: LIVE_TASK,
-      objective: "Review the sealed candidate",
-      specialistId: REVIEWER_ID,
-      specialistKey: "independent-qa",
-      role: "qa",
-      model: "claude-opus-5-5",
-      permissions: "auto",
-      repo,
-      baseSha: sha,
-      acceptance: "review only",
-      dependencies: [],
-      requiredEvidence: ["review"],
-      status: "waiting_qa",
-      worktree,
-      sessionId: LIVE_SESSION,
-      resultSha: built,
-      headSha: built,
-      evidence: [{ at: now, kind: "commit", ref: built }, { at: now, kind: "rejection", ref: REJECTED_SHA }],
-      checks: [],
-      implementerId: IMPLEMENTER_ID,
-      assignedReviewerId: REVIEWER_ID,
-      phase: "review",
-      writerLock: "review",
-      generation: 1,
-      branch: "HEAD",
-      revisions: [candidate, rejection],
-      handoffs: [{
-        id: LIVE_HANDOFF,
-        taskId: LIVE_TASK,
-        stage: "review",
-        repo,
-        worktree,
-        inputSha: built,
-        resultSha: built,
-        fromSpecialistId: IMPLEMENTER_ID,
-        toSpecialistId: REVIEWER_ID,
-        summary: `Rejected QA submission did not match sealed candidate ${built.slice(0, 12)}; candidate unchanged`,
-        requiredEvidence: ["review"],
-        checks: [],
-        findings: [],
-        nextAction: `fresh independent QA of sealed candidate ${built}`,
-        createdAt: now,
-      }],
-      owner: "Bryant Thornton",
-      authority: "fixture",
-      createdAt: now,
-      updatedAt: now,
-      nextAction: `fresh independent QA of sealed candidate ${built}`,
-    };
-    writeFileSync(join(DATA_DIR, "factory-tasks.json"), JSON.stringify({ version: 1, tasks: [task], unavailableRoles: [] }));
-    _resetFactoryDispatch();
-    const deps = local();
-    const starts = { n: 0 };
-    const started = await deliverHandoff(LIVE_TASK, deliverDeps(deps, starts), { handoffId: LIVE_HANDOFF });
-    expect(starts.n).toBe(1);
-    expect(started.task.sessionId).not.toBe(LIVE_SESSION);
-    expect(started.task.status).toBe("running");
-    expect(started.task.writerLock).toBe("review");
-    expect(started.task.qaAttempts?.map((item) => ({ sessionId: item.sessionId, sha: item.sha, handoffId: item.handoffId }))).toEqual([
-      { sessionId: started.task.sessionId, sha: built, handoffId: LIVE_HANDOFF },
-    ]);
-    expect(started.task.revisions?.find((item) => item.id === LIVE_REJECTION)).toEqual(rejection);
-    expect(started.task.revisions?.find((item) => item.kind === "candidate")).toEqual(candidate);
-    expect(started.task.qaDisposition).toBeUndefined();
-    expect(execSync("git rev-parse HEAD", { cwd: worktree }).toString().trim()).toBe(built);
+    const before = worktreeCount();
+    for (const id of Object.keys(FACTORY_SPECIALISTS) as FactorySpecialistId[]) {
+      if (FACTORY_SPECIALISTS[id].role === "implementer") continue;
+      const deps = local();
+      // Even a seat whose fence could not be applied is refused as QA first.
+      expectQaOutside(() => createFactoryTask(intake(repo, sha, id, { dispatchKey: id }), { ...deps, bot: (botId) => ({ id: botId, model: "claude-opus-5-5", driverKind: "codex" }) }));
+      expect(deps.created).toEqual([]);
+    }
+    expect(listFactoryTasks()).toEqual([]);
+    expect(unavailableFactoryRoles()).toEqual([]);
+    expect(existsSync(store())).toBe(false);
+    expect(worktreeCount()).toBe(before);
+  });
+
+  it("refuses QA-only and QA-seat intake fields instead of ignoring them", () => {
+    const { repo, sha } = initRepo();
+    const head = commit(repo, "base\nreviewed\n");
+    for (const extra of [
+      { qaOfTaskId: FIXTURE_TASK },
+      { headSha: head },
+      { prUrl: "https://github.com/example/repo/pull/8" },
+      { qaDisposition: "CLEAR" },
+      { reviewedSha: head },
+      { reviewerId: QA_ID },
+      { testerId: "1872d149-0be3-42c6-9218-3ea7d56609a4" },
+      { releaseId: "bb034770-3b5a-44de-9ffe-1d851a093afe" },
+      { remediationLimit: 2 },
+    ]) {
+      const deps = local();
+      expectQaOutside(() => createFactoryTask(intake(repo, sha, IMPLEMENTER_ID, extra), deps));
+      expect(deps.created).toEqual([]);
+    }
+    expect(existsSync(store())).toBe(false);
+    expect(worktreeCount()).toBe(0);
   });
 });
 
-describe("QA-only desk task", () => {
-  it("does not need an implementer task and binds the reviewer to the exact head on a read-only worktree", async () => {
-    const { repo, sha } = initRepo();
-    const head = commit(repo, "base\nreviewed\n");
+describe("a stored QA task loads and starts nothing", () => {
+  it("lists a waiting_qa QA task, then refuses launch, harvest, delivery, a turn, and the ship gate without changing the store", async () => {
+    const fixture = writeStoredQaTask();
+    const listed = listFactoryTasks();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.state).toBe("waiting_qa");
+    expect(listed[0]?.quiet).toBe(true);
+    const bytes = readFileSync(store(), "utf8");
     const deps = local();
-    expect(() => createFactoryTask({
-      objective: "Review only",
-      specialistId: REVIEWER_ID,
-      model: "claude-opus-5-5",
-      permissions: "auto",
-      repo,
-      baseSha: sha,
-      acceptance: "read the diff",
-      dependencies: [],
-      requiredEvidence: ["review"],
-      owner: "Bryant Thornton",
-      authority: "qa only",
-    }, deps)).toThrow(/QA requires the implementer task and its result SHA/);
+    let starts = 0;
+    const start = () => { starts += 1; };
 
-    if (process.platform === "win32") {
-      expect(() => createFactoryTask({
-        objective: "Review only",
-        specialistId: REVIEWER_ID,
-        model: "claude-opus-5-5",
-        permissions: "auto",
-        repo,
-        baseSha: sha,
-        headSha: head,
-        prUrl: "https://github.com/example/repo/pull/8",
-        acceptance: "read the diff",
-        dependencies: [],
-        requiredEvidence: ["review"],
-        owner: "Bryant Thornton",
-        authority: "qa only",
-      }, deps)).toThrow(/Windows factory dispatch is unsupported/);
-      return;
-    }
+    await expectQaOutsideAsync(launchFactoryTask(FIXTURE_TASK, { start }));
+    expectQaOutside(() => harvestFactoryTask(FIXTURE_TASK, {
+      sessionId: FIXTURE_SESSION,
+      worktree: fixture.worktree,
+      resultSha: fixture.built,
+      reviewedSha: fixture.built,
+      qaDisposition: "CLEAR",
+      evidence: [{ kind: "review", ref: fixture.built }],
+    }));
+    // A mismatched QA SHA is refused too; it is not turned into a new QA handoff.
+    expectQaOutside(() => harvestFactoryTask(FIXTURE_TASK, {
+      sessionId: FIXTURE_SESSION,
+      worktree: fixture.worktree,
+      resultSha: DEAD,
+      evidence: [{ kind: "note", ref: DEAD }],
+    }));
+    await expectQaOutsideAsync(deliverHandoff(FIXTURE_TASK, { ...deps, start }, { handoffId: FIXTURE_HANDOFF }));
+    await expectQaOutsideAsync(deliverHandoff(FIXTURE_TASK, { ...deps, start }));
+    expectQaOutside(() => factoryTurnGuard(FIXTURE_THREAD));
+    expectQaOutside(() => shipFactoryTask(FIXTURE_TASK, {}));
 
-    const created = createFactoryTask({
-      objective: "Review only",
-      specialistId: REVIEWER_ID,
-      model: "claude-opus-5-5",
-      permissions: "auto",
-      repo,
-      baseSha: sha,
-      headSha: head,
-      prUrl: "https://github.com/example/repo/pull/8",
-      acceptance: "read the diff",
-      dependencies: [],
-      requiredEvidence: ["review"],
-      owner: "Bryant Thornton",
-      authority: "qa only",
-    }, deps).task;
-    expect(created.qaOfTaskId).toBeUndefined();
-    expect(created.implementerId).toBeUndefined();
-    expect(created.qaOnly).toBe(true);
-    expect(created.readOnlyWorktree).toBe(true);
-    expect(created.role).toBe("qa");
-    expect(created.headSha).toBe(head);
-    expect(created.baseSha).toBe(sha);
-    expect(execSync("git rev-parse HEAD", { cwd: created.worktree }).toString().trim()).toBe(head);
-    expect(() => accessSync(join(created.worktree!, "README"), constants.W_OK)).toThrow();
-    expect(enforceFactoryTool({ role: created.role, worktree: created.worktree!, tool: "Edit", input: { file_path: join(created.worktree!, "README") } }).allow).toBe(false);
-
-    let started = 0;
-    const launched = await launchFactoryTask(created.id, {
-      start: () => { started += 1; },
-      prHead: () => head,
-    });
-    expect(started).toBe(1);
-    expect(launched.task.sessionId).toBeTruthy();
-    expect(launched.task.qaAttempts).toEqual([
-      expect.objectContaining({ sessionId: launched.task.sessionId, sha: head }),
-    ]);
-    expect(launched.task.status).toBe("running");
-    try { if (created.worktree) releaseWorktreeReadOnly(created.worktree); } catch { /* cleanup */ }
+    expect(starts).toBe(0);
+    expect(deps.created).toEqual([]);
+    expect(readFileSync(store(), "utf8")).toBe(bytes);
+    const after = getFactoryTask(FIXTURE_TASK)!;
+    expect(after.handoffs?.[0]?.deliveredAt).toBeUndefined();
+    expect(after.qaDisposition).toBeUndefined();
+    expect(after.revisions?.map((item) => item.id)).toEqual(["00000000-0000-4000-8000-0000000000e1", FIXTURE_REJECTION]);
   });
 
-  it("refuses launch when the pull request head drifted", async () => {
-    const { repo, sha } = initRepo();
-    const head = commit(repo, "base\nreviewed\n");
-    const drifted = "0123456789abcdef0123456789abcdef01234567";
+  it("does not hand a finished QA turn to another QA session, and does not resume one on restart", async () => {
+    const fixture = writeStoredQaTask();
+    const raw = JSON.parse(readFileSync(store(), "utf8"));
+    raw.tasks[0].status = "running";
+    raw.tasks[0].provenSessionId = FIXTURE_SESSION;
+    writeFileSync(store(), JSON.stringify(raw));
+    _resetFactoryDispatch();
     const deps = local();
-    if (process.platform === "win32") {
-      expect(() => createFactoryTask({
-        objective: "Review only",
-        specialistId: REVIEWER_ID,
-        model: "claude-opus-5-5",
-        permissions: "auto",
-        repo,
-        baseSha: sha,
-        headSha: head,
-        prUrl: "https://github.com/example/repo/pull/9",
-        acceptance: "read the diff",
-        dependencies: [],
-        requiredEvidence: ["review"],
-        owner: "Bryant Thornton",
-        authority: "qa only",
-      }, deps)).toThrow(/Windows factory dispatch is unsupported/);
-      return;
+    let starts = 0;
+    const host: FactoryCompletionDeps = { ok: true, ...deps, start: () => { starts += 1; } };
+    const ended = await completeFactoryTurn(FIXTURE_THREAD, host);
+    expect(starts).toBe(0);
+    expect(deps.created).toEqual([]);
+    expect(ended.task?.status).toBe("blocked");
+    expect(ended.task?.blocker).toBe(QA_OUTSIDE_OMB);
+    expect(ended.task?.qaDisposition).toBeUndefined();
+    expect(ended.task?.handoffs?.[0]?.deliveredAt).toBeUndefined();
+    expect(ended.task?.resultSha).toBe(fixture.built);
+    const again = await completeFactoryTurn(FIXTURE_THREAD, host);
+    expect(again.duplicate).toBe(true);
+    expect(starts).toBe(0);
+
+    raw.tasks[0].status = "running";
+    writeFileSync(store(), JSON.stringify(raw));
+    _resetFactoryDispatch();
+    const recovered = recoverFactoryTasks();
+    expect(recovered.restored).toEqual([]);
+    expect(recovered.blocked).toEqual([FIXTURE_TASK]);
+    expect(getFactoryTask(FIXTURE_TASK)?.blocker).toBe(QA_OUTSIDE_OMB);
+  });
+
+  it("refuses a wait into waiting_qa and keeps the stored writer lock of a legacy waiting_qa implementer task", async () => {
+    const { repo, sha } = initRepo();
+    const deps = local();
+    const task = createFactoryTask(intake(repo, sha), deps).task;
+    expectQaOutside(() => waitFactoryTask(task.id, "waiting_qa"));
+    expect(getFactoryTask(task.id)?.status).toBe("bound");
+    const raw = JSON.parse(readFileSync(store(), "utf8"));
+    raw.tasks[0].status = "waiting_qa";
+    raw.tasks[0].phase = "review";
+    raw.tasks[0].writerLock = "review";
+    writeFileSync(store(), JSON.stringify(raw));
+    _resetFactoryDispatch();
+    expect(listFactoryTasks()[0]?.state).toBe("waiting_qa");
+    // A stored waiting_qa writer still reserves the repository.
+    expect(() => createFactoryTask(intake(repo, sha, IMPLEMENTER_ID, { dispatchKey: "second" }), local())).toThrow(/writer/);
+    // And it does not move to QA from a harvest.
+    expectQaOutside(() => harvestFactoryTask(task.id, {
+      sessionId: task.sessionId,
+      worktree: task.worktree,
+      resultSha: sha,
+      evidence: [{ kind: "commit", ref: sha }],
+    }));
+  });
+});
+
+describe("an implementer harvest cannot record QA", () => {
+  it("refuses a QA disposition or reviewed SHA from the implementer session and writes nothing", async () => {
+    const { repo, sha } = initRepo();
+    const deps = local();
+    const task = createFactoryTask(intake(repo, sha), deps).task;
+    const launched = await launchFactoryTask(task.id, { start: () => {} });
+    const built = commit(task.worktree!, "base\nharmless\n");
+    const bytes = readFileSync(store(), "utf8");
+    for (const extra of [{ qaDisposition: "CLEAR" }, { qaDisposition: "NOT_CLEAR" }, { reviewedSha: built }]) {
+      expectQaOutside(() => harvestFactoryTask(task.id, {
+        sessionId: launched.task.sessionId,
+        worktree: task.worktree,
+        resultSha: built,
+        evidence: [{ kind: "commit", ref: built }],
+        ...extra,
+      }));
     }
-    const created = createFactoryTask({
-      objective: "Review only",
-      specialistId: REVIEWER_ID,
-      model: "claude-opus-5-5",
-      permissions: "auto",
-      repo,
-      baseSha: sha,
-      headSha: head,
-      prUrl: "https://github.com/example/repo/pull/9",
-      acceptance: "read the diff",
-      dependencies: [],
-      requiredEvidence: ["review"],
-      owner: "Bryant Thornton",
-      authority: "qa only",
-    }, deps).task;
-    let started = 0;
-    await expect(launchFactoryTask(created.id, {
-      start: () => { started += 1; },
-      prHead: () => drifted,
-    })).rejects.toThrow(/exact SHA/);
-    expect(started).toBe(0);
-    const after = getFactoryTask(created.id)!;
-    expect(after.sessionId).toBeUndefined();
-    expect(after.status).toBe("blocked");
-    expect(after.status).not.toBe("running");
-    expect(after.blocker).toContain(drifted);
-    expect(after.qaAttempts ?? []).toEqual([]);
-    try { if (created.worktree) releaseWorktreeReadOnly(created.worktree); } catch { /* cleanup */ }
+    expect(readFileSync(store(), "utf8")).toBe(bytes);
+    expect(getFactoryTask(task.id)?.status).toBe("running");
+  });
+});
+
+describe("factory HTTP routes", () => {
+  const servers: Server[] = [];
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map((server) => new Promise((done) => server.close(done))));
+  });
+
+  async function serve(): Promise<{ base: string; turns: { botId: string; threadId: string }[]; created: string[] }> {
+    const deps = local();
+    const turns: { botId: string; threadId: string }[] = [];
+    const routes = [createFactoryRoutes({
+      bot: deps.bot,
+      createThread: deps.createThread,
+      pinCwd: deps.pinCwd,
+      startTurn: async (botId, _text, threadId) => { turns.push({ botId, threadId }); },
+    })];
+    const server = createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const handled = await dispatchRoutes(routes, {
+        req, res, url, path: url.pathname, method: req.method ?? "GET",
+        auth: { kind: "loopback", scopes: ["admin", "client"] }, json, readBody,
+      });
+      if (!handled) json(res, 404, { from: PASS.toString() });
+    });
+    servers.push(server);
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    return { base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, turns, created: deps.created };
+  }
+
+  async function post(base: string, path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+    const res = await fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    return { status: res.status, body: await res.json() as Record<string, unknown> };
+  }
+
+  it("answers 410 qa_outside_omb for QA routes and starts no turn, while implementation still launches", async () => {
+    const http = await serve();
+    const { repo, sha } = initRepo();
+
+    const qa = await post(http.base, "/api/factory/tasks", intake(repo, sha, QA_ID));
+    expect(qa.status).toBe(410);
+    expect(qa.body.code).toBe("qa_outside_omb");
+    expect(qa.body.error).toContain(QA_OUTSIDE_OMB);
+    const qaOnly = await post(http.base, "/api/factory/tasks", intake(repo, sha, IMPLEMENTER_ID, { headSha: sha, prUrl: "https://github.com/example/repo/pull/8" }));
+    expect(qaOnly.status).toBe(410);
+    expect(http.created).toEqual([]);
+
+    const created = await post(http.base, "/api/factory/tasks", intake(repo, sha));
+    expect(created.status).toBe(201);
+    const id = (created.body.task as { id: string }).id;
+    const launched = await post(http.base, `/api/factory/tasks/${id}/launch`, {});
+    expect(launched.status).toBe(200);
+    expect(http.turns).toHaveLength(1);
+    expect(http.turns[0]?.botId).toBe(IMPLEMENTER_ID);
+    const task = getFactoryTask(id)!;
+    const built = commit(task.worktree!, "base\nharmless\n");
+
+    const qaHarvest = await post(http.base, `/api/factory/tasks/${id}/harvest`, {
+      sessionId: task.sessionId, worktree: task.worktree, resultSha: built, reviewedSha: built, qaDisposition: "CLEAR", evidence: [{ kind: "review", ref: built }],
+    });
+    expect(qaHarvest.status).toBe(410);
+    expect(qaHarvest.body.code).toBe("qa_outside_omb");
+    const wait = await post(http.base, `/api/factory/tasks/${id}/wait`, { status: "waiting_qa" });
+    expect(wait.status).toBe(410);
+    const ship = await post(http.base, `/api/factory/tasks/${id}/ship`, {});
+    expect(ship.status).toBe(410);
+
+    // A desk harvest during the writer session is evidence only; it starts nothing.
+    const desk = await post(http.base, `/api/factory/tasks/${id}/harvest`, {
+      sessionId: task.sessionId, worktree: task.worktree, resultSha: built, evidence: [{ kind: "commit", ref: built }],
+    });
+    expect(desk.status).toBe(200);
+    expect((desk.body.task as { state: string }).state).toBe("running");
+    expect(http.turns).toHaveLength(1);
+    expect(http.created).toEqual([IMPLEMENTER_ID]);
+  });
+
+  it("answers 410 for a stored review handoff delivery and starts no turn", async () => {
+    writeStoredQaTask();
+    const http = await serve();
+    const delivered = await post(http.base, `/api/factory/tasks/${FIXTURE_TASK}/deliver`, { handoffId: FIXTURE_HANDOFF });
+    expect(delivered.status).toBe(410);
+    expect(delivered.body.code).toBe("qa_outside_omb");
+    const launched = await post(http.base, `/api/factory/tasks/${FIXTURE_TASK}/launch`, {});
+    expect(launched.status).toBe(410);
+    expect(http.turns).toEqual([]);
+    expect(http.created).toEqual([]);
+  });
+});
+
+describe("no QA surface is offered", () => {
+  it("the desk offers only the implementer and no QA-only field, QA wait, or ship gate", () => {
+    expect(FACTORY_DESK_HTML).not.toContain(QA_ID);
+    expect(FACTORY_DESK_HTML).not.toContain("Independent QA</option>");
+    expect(FACTORY_DESK_HTML).not.toContain('id="headSha"');
+    expect(FACTORY_DESK_HTML).not.toContain('id="prUrl"');
+    expect(FACTORY_DESK_HTML).not.toContain('value="waiting_qa"');
+    expect(FACTORY_DESK_HTML).not.toContain('id="ship"');
+    expect(FACTORY_DESK_HTML).toContain("QA and independent review are performed outside OMB");
+  });
+
+  it("the onboarding text does not claim a QA boundary", () => {
+    expect(FACTORY_ONBOARDING).toContain("QA and independent review are performed outside OMB");
+    expect(FACTORY_ONBOARDING).not.toMatch(/read-only QA lease|read-only lease|Only the assigned Independent QA specialist records/);
+    expect(readFileSync(join(process.cwd(), "docs", "factory-onboarding.md"), "utf8")).toBe(FACTORY_ONBOARDING);
   });
 });

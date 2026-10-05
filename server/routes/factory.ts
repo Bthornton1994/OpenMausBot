@@ -1,5 +1,8 @@
 // Factory HTTP. Authenticated with the rest of the route table. The store
-// is factory-dispatch.ts; this file only translates requests.
+// is factory-dispatch.ts; this file only translates requests. OMB handles
+// task intake and implementation dispatch only. QA routes kept for
+// compatibility (ship, a QA harvest, a review handoff) answer 410 with
+// code qa_outside_omb and start nothing.
 import { existsSync } from "node:fs";
 
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
@@ -41,6 +44,7 @@ function fail(error: unknown): { status: number; body: { error: string; code?: s
       : error.code === "blocked" ? 409
       : error.code === "mismatch" ? 409
       : error.code === "ineligible" ? 409
+      : error.code === "qa_outside_omb" ? 410
       : 400;
     return { status, body: { error: error.message, code: error.code, ...(error.task ? { task: viewTask(error.task) } : {}) } };
   }
@@ -105,20 +109,8 @@ export function createFactoryRoutes(deps: FactoryRouteDeps): RouteHandler {
       if (harvest && method === "POST") {
         const body = await readBody(req);
         if (!body || typeof body !== "object" || Array.isArray(body)) return json(res, 400, { error: "body must be a JSON object" });
+        // A harvest never starts another session. No QA is launched from here.
         const task = harvestFactoryTask(harvest[1]!, body);
-        const fresh = [...(task.handoffs ?? [])].reverse().find((item) => !item.deliveredAt && item.stage === "review" && item.nextAction.startsWith("fresh independent QA of sealed candidate"));
-        if (fresh && task.status === "waiting_qa") {
-          const result = await deliverHandoff(task.id, {
-            bot: deps.bot,
-            createThread: deps.createThread,
-            pinCwd: deps.pinCwd,
-            start: async (started) => {
-              if (!started.ombThreadId) throw new FactoryDispatchError("blocked", "factory task has no thread");
-              await deps.startTurn(started.specialistId, factorySpecialistPrompt(started), started.ombThreadId);
-            },
-          }, { handoffId: fresh.id });
-          return json(res, 200, { task: viewTask(result.task), duplicate: result.duplicate });
-        }
         return json(res, 200, { task: viewTask(task) });
       }
       const wait = path.match(/^\/api\/factory\/tasks\/([\w-]+)\/wait$/);

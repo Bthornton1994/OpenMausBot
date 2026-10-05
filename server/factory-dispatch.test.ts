@@ -196,7 +196,7 @@ describe("factory recovery and harvest", () => {
     expect(listFactoryTasks().find((row) => row.id === task.id)?.state).toBe("blocked");
   });
 
-  it("rejects a mismatched or evidenceless harvest and keeps QA evidence off the implementer", async () => {
+  it("rejects a mismatched or evidenceless harvest and never records QA on the implementer", async () => {
     const { repo, sha } = initRepo();
     const { task } = createFactoryTask(intake(repo, sha), deps());
     const launched = await launchFactoryTask(task.id, { start: () => {} });
@@ -221,32 +221,25 @@ describe("factory recovery and harvest", () => {
       evidence: [{ kind: "commit", ref: result }],
       qaDisposition: "CLEAR",
       reviewedSha: result,
-    })).toThrow(/cannot clear QA/);
+    })).toThrow(/QA is performed outside OMB/);
     const harvested = harvestFactoryTask(task.id, {
       sessionId: launched.task.sessionId,
       worktree: task.worktree,
       resultSha: result,
       evidence: [{ kind: "commit", ref: result }],
       checks: ["unit"],
-      nextAction: "independent QA",
     });
-    expect(harvested.resultSha).toBe(result);
-    expect(harvested.status).toBe("waiting_qa");
+    // During the writer session a desk harvest is evidence only.
+    expect(harvested.status).toBe("running");
+    expect(harvested.headSha).toBe(result);
+    expect(harvested.resultSha).toBeUndefined();
+    expect(harvested.checks).toEqual(["unit"]);
     expect(harvested.qaDisposition).toBeUndefined();
+    expect(harvested.handoffs ?? []).toEqual([]);
+    expect(harvested.assignedReviewerId).toBeUndefined();
 
-    const qa = createFactoryTask(intake(repo, result, QA, { qaOfTaskId: task.id, dispatchKey: "qa" }), deps()).task;
-    const qaLaunch = await launchFactoryTask(qa.id, { start: () => {} });
-    const reviewed = harvestFactoryTask(qa.id, {
-      sessionId: qaLaunch.task.sessionId,
-      worktree: qa.worktree,
-      resultSha: result,
-      evidence: [{ kind: "qa", ref: result, note: "KEEP_DRAFT" }],
-      qaDisposition: "KEEP_DRAFT",
-      reviewedSha: result,
-    });
-    expect(reviewed.qaDisposition).toBe("KEEP_DRAFT");
-    expect(reviewed.status).toBe("harvested");
-    expect(reviewed.nextAction).toMatch(/no merge/);
+    expect(() => createFactoryTask(intake(repo, result, QA, { qaOfTaskId: task.id, dispatchKey: "qa" }), deps())).toThrow(/QA is performed outside OMB/);
+    expect(listFactoryTasks()).toHaveLength(1);
   });
 });
 
@@ -264,12 +257,10 @@ describe("reviewer read-only", () => {
 });
 
 describe("navigator seat", () => {
-  it("can be created as a read-only specialist without taking the writer lock", () => {
+  it("is not dispatched by OMB and does not create a worktree", () => {
     const { repo, sha } = initRepo();
     const writer = createFactoryTask(intake(repo, sha), deps()).task;
-    const nav = createFactoryTask(intake(repo, sha, NAVIGATOR, { dispatchKey: "nav" }), deps()).task;
-    expect(nav.role).toBe("reviewer");
-    expect(nav.id).not.toBe(writer.id);
-    expect(nav.worktree).toBeTruthy();
+    expect(() => createFactoryTask(intake(repo, sha, NAVIGATOR, { dispatchKey: "nav" }), deps())).toThrow(FactoryDispatchError);
+    expect(listFactoryTasks().map((row) => row.id)).toEqual([writer.id]);
   });
 });

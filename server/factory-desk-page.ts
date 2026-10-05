@@ -3,6 +3,9 @@
 // carry a desktop or paired credential: the desktop window adds its mutation
 // header to requests it makes, and a paired admin session uses its own cookie
 // or bearer. Any other caller is still rejected by request auth.
+// The desk creates and advances implementation tasks only. QA and
+// independent review are performed outside OMB, so it offers no QA seat,
+// QA-only review fields, QA wait, or ship gate.
 export const FACTORY_DESK_PATH = "/api/factory/desk";
 
 const LINK = `<a href="${FACTORY_DESK_PATH}" data-factory-desk="1" style="position:fixed;right:12px;bottom:12px;z-index:80;background:#1c1917;color:#fafaf9;font:600 12px/1 system-ui,sans-serif;padding:8px 12px;border-radius:999px;text-decoration:none">Factory desk</a>`;
@@ -39,15 +42,10 @@ export const FACTORY_DESK_HTML = `<!doctype html>
 <p><a class="back" href="/">Back to OpenMausBot</a></p>
 <h1>Factory desk</h1>
 <p class="note">Open this page from the OpenMausBot desktop window (the Factory desk link on the main page, or this address in that same window). This page does not attach a desktop token. Creating or advancing a task from any other caller is rejected. Permissions stay Auto. The model stays claude-opus-5-5. Nothing here merges, deploys, or edits the task store by hand.</p>
+<p class="note">OMB handles task intake and implementation dispatch only. QA and independent review are performed outside OMB. This desk does not start QA or record a QA result.</p>
 <label for="specialist">Specialist</label>
 <select id="specialist">
-  <option value="07169dc6-72c2-4c7c-b3b3-62d9122aa46b">Codebase Navigator</option>
   <option value="063c67ac-f8ca-4c05-b6b8-e3bbf2e102a7" selected>Software Implementer</option>
-  <option value="1872d149-0be3-42c6-9218-3ea7d56609a4">Security and Privacy Reviewer</option>
-  <option value="7c8f2e77-2ad9-4c40-a623-4825528eefcd">UI and Accessibility Reviewer</option>
-  <option value="a6677c84-0c2d-41fa-bd76-fbb4c12859f7">Game and Interaction Reviewer</option>
-  <option value="223e5e26-37e4-42e3-9026-5983b66a17aa">Independent QA</option>
-  <option value="bb034770-3b5a-44de-9ffe-1d851a093afe">Release Readiness Reviewer</option>
 </select>
 <label for="objective">Objective</label>
 <textarea id="objective"></textarea>
@@ -55,10 +53,6 @@ export const FACTORY_DESK_HTML = `<!doctype html>
 <input id="repo" />
 <label for="baseSha">Base SHA (40 hex)</label>
 <input id="baseSha" spellcheck="false" />
-<label for="headSha">Exact head SHA (QA-only review, 40 hex)</label>
-<input id="headSha" spellcheck="false" />
-<label for="prUrl">Pull request URL (optional, QA-only)</label>
-<input id="prUrl" spellcheck="false" placeholder="https://github.com/owner/repo/pull/1" />
 <label for="acceptance">Acceptance</label>
 <textarea id="acceptance"></textarea>
 <label for="owner">Owner</label>
@@ -75,20 +69,23 @@ export const FACTORY_DESK_HTML = `<!doctype html>
 </div>
 <label for="taskId">Task</label>
 <select id="taskId"></select>
-<label for="handoffId">Queued handoff id</label>
+<label for="handoffId">Queued implementation handoff id</label>
 <input id="handoffId" spellcheck="false" />
 <label for="resultSha">Harvest result SHA (deliberately wrong to record a rejection)</label>
 <input id="resultSha" spellcheck="false" />
 <label for="harvestNote">Harvest evidence note</label>
 <input id="harvestNote" value="disposable scratch harvest" />
 <label for="waitStatus">Wait status</label>
-<input id="waitStatus" value="waiting_qa" />
+<select id="waitStatus">
+  <option value="waiting_ci" selected>waiting_ci</option>
+  <option value="waiting_owner">waiting_owner</option>
+  <option value="waiting_external">waiting_external</option>
+</select>
 <div class="row">
   <button type="button" id="launch">Launch</button>
   <button type="button" id="harvest">Harvest</button>
   <button type="button" id="deliver">Deliver</button>
   <button type="button" id="wait">Wait</button>
-  <button type="button" id="ship">Ship gate</button>
   <button type="button" id="cancel">Cancel</button>
 </div>
 <pre id="out">No request yet.</pre>
@@ -144,10 +141,6 @@ document.getElementById("create").onclick = async () => {
     dependencies: [],
   };
   if (dispatchKey) body.dispatchKey = dispatchKey;
-  const headSha = document.getElementById("headSha").value.trim();
-  const prUrl = document.getElementById("prUrl").value.trim();
-  if (headSha) body.headSha = headSha;
-  if (prUrl) body.prUrl = prUrl;
   if (await call("POST", "/api/factory/tasks", body)) await refresh();
 };
 async function postSelected(suffix, body) {
@@ -161,8 +154,7 @@ document.getElementById("deliver").onclick = () => {
   postSelected("/deliver", handoffId ? { handoffId } : {});
 };
 document.getElementById("cancel").onclick = () => postSelected("/cancel");
-document.getElementById("wait").onclick = () => postSelected("/wait", { status: document.getElementById("waitStatus").value.trim() });
-document.getElementById("ship").onclick = () => postSelected("/ship", {});
+document.getElementById("wait").onclick = () => postSelected("/wait", { status: document.getElementById("waitStatus").value });
 document.getElementById("harvest").onclick = () => {
   const task = selected();
   if (!task) { show(0, "Select a task first."); return; }

@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { DATA_DIR } from "./config.ts";
 import {
   IMPLEMENTER_ID,
-  REVIEWER_ID,
+  QA_OUTSIDE_OMB,
   completeFactoryTurn,
   createFactoryTask,
   FactoryDispatchError,
@@ -107,19 +107,25 @@ describe("server-owned factory lifecycle", () => {
     expect(rejection?.sha).toBe(sha);
 
     const routed = await completion(writerThread, deps, starts);
-    expect(routed.task?.status).toBe("running");
-    expect(routed.task?.phase).toBe("review");
+    // The sealed SHA is the result. No QA or review session is started.
+    expect(routed.task?.status).toBe("harvested");
+    expect(routed.task?.phase).toBe("implemented");
+    expect(routed.task?.writerLock).toBe("none");
     expect(routed.task?.resultSha).toBe(built);
     expect(routed.task?.headSha).toBe(built);
-    expect(routed.task?.specialistId).toBe(REVIEWER_ID);
-    expect(routed.task?.sessionId).not.toBe(writerSession);
+    expect(routed.task?.specialistId).toBe(IMPLEMENTER_ID);
+    expect(routed.task?.sessionId).toBe(writerSession);
+    expect(routed.task?.nextAction).toContain(QA_OUTSIDE_OMB);
+    expect(routed.task?.handoffs ?? []).toEqual([]);
     expect(routed.task?.revisions?.find((item) => item.kind === "candidate")?.sha).toBe(built);
     expect(routed.task?.revisions?.find((item) => item.id === rejection?.id)?.sha).toBe(sha);
     expect(routed.task?.checkResults?.some((check) => check.sha === built && check.result === "pass")).toBe(true);
-    expect(starts.n).toBe(1);
+    expect(starts.n).toBe(0);
+    expect(deps.threads).toHaveLength(1);
     const again = await completion(writerThread, deps, starts);
     expect(again.duplicate).toBe(true);
-    expect(starts.n).toBe(1);
+    expect(starts.n).toBe(0);
+    expect(again.task?.revisions?.filter((item) => item.kind === "candidate")).toHaveLength(1);
   });
 
   it("stays blocked when the worktree is dirty or HEAD does not descend from the recorded base", async () => {
@@ -193,7 +199,7 @@ describe("server-owned factory lifecycle", () => {
     expect(built).not.toBe(sha);
   });
 
-  it("routes NOT_CLEAR to a new implementation session, retests, and requires fresh QA on the new SHA", async () => {
+  it("does not adopt a HEAD the writer did not produce, and never routes to QA", async () => {
     const { repo, sha } = initRepo();
     const deps = local();
     const starts = { n: 0 };
@@ -209,70 +215,74 @@ describe("server-owned factory lifecycle", () => {
       requiredEvidence: ["commit"],
       owner: "Bryant Thornton",
       authority: "lifecycle proof",
-      remediationLimit: 2,
     }, deps).task;
     const launched = await launchFactoryTask(task.id, { start: () => {} });
-    const built = commit(task.worktree!, "base\nharmless\n");
-    const writerThread = launched.task.ombThreadId!;
-    const reviewTurn = await completion(writerThread, deps, starts);
-    expect(starts.n).toBe(1);
-    const qaSession = reviewTurn.task!.sessionId!;
-    const found = harvestFactoryTask(task.id, {
-      sessionId: qaSession,
-      worktree: task.worktree,
-      resultSha: built,
-      evidence: [{ kind: "review", ref: built }],
-      findings: ["missing fixed"],
-      qaDisposition: "NOT_CLEAR",
-      reviewedSha: built,
-    });
-    expect(found.writerLock).toBe("implementer");
-    expect(found.phase).toBe("remediate");
-    const oldReview = found.revisions?.find((item) => item.kind === "review");
-    expect(oldReview?.sha).toBe(built);
-    const repeated = harvestFactoryTask(task.id, {
-      sessionId: qaSession,
-      worktree: task.worktree,
-      resultSha: built,
-      evidence: [{ kind: "review", ref: built }],
-      findings: ["missing fixed"],
-      qaDisposition: "NOT_CLEAR",
-      reviewedSha: built,
-    });
-    expect(repeated.remediationCount).toBe(1);
-    expect(repeated.revisions?.find((item) => item.id === oldReview?.id)?.sha).toBe(built);
-    const qaThread = reviewTurn.task!.ombThreadId!;
-    const fixTurn = await completion(qaThread, deps, starts);
-    expect(fixTurn.task?.specialistId).toBe(IMPLEMENTER_ID);
-    expect(fixTurn.task?.sessionId).not.toBe(qaSession);
-    expect(fixTurn.task?.ombThreadId).not.toBe(qaThread);
-    expect(starts.n).toBe(2);
-    const again = await completion(qaThread, deps, starts);
-    expect(again.duplicate).toBe(true);
-    expect(starts.n).toBe(2);
+    // No commit: HEAD is still the writer's starting SHA.
+    const ended = await completion(launched.task.ombThreadId!, deps, starts);
+    expect(ended.task?.status).toBe("blocked");
+    expect(ended.task?.blocker).toMatch(/not produced by the latest assigned writer/);
+    expect(ended.task?.writerLock).toBe("implementer");
+    expect(ended.task?.resultSha).toBeUndefined();
+    expect(ended.task?.revisions?.some((item) => item.kind === "candidate")).toBe(false);
+    expect(ended.task?.handoffs ?? []).toEqual([]);
+    expect(starts.n).toBe(0);
+    // The blocked writer still reserves the repository.
+    expect(() => createFactoryTask({
+      objective: "A second writer must not start",
+      specialistId: IMPLEMENTER_ID,
+      model: "claude-opus-5-5",
+      permissions: "auto",
+      repo,
+      baseSha: sha,
+      acceptance: "none",
+      dependencies: [],
+      requiredEvidence: ["commit"],
+      owner: "Bryant Thornton",
+      authority: "lifecycle proof",
+      dispatchKey: "second",
+    }, deps)).toThrow(/writer/);
+  });
 
-    const fixed = commit(task.worktree!, "base\nharmless\nfixed\n");
-    const fixThread = fixTurn.task!.ombThreadId!;
-    const fixSession = fixTurn.task!.sessionId!;
-    const fresh = await completion(fixThread, deps, starts);
-    expect(fresh.task?.resultSha).toBe(fixed);
-    expect(fresh.task?.headSha).toBe(fixed);
-    expect(fresh.task?.generation).toBe(2);
-    expect(fresh.task?.reviewSha).toBeUndefined();
-    expect(fresh.task?.testSha).toBeUndefined();
-    expect(fresh.task?.releaseSha).toBeUndefined();
-    expect(fresh.task?.qaDisposition).toBeUndefined();
-    expect(fresh.task?.specialistId).toBe(REVIEWER_ID);
-    expect(fresh.task?.sessionId).not.toBe(fixSession);
-    expect(fresh.task?.checkResults?.some((check) => check.name === "required-tests" && check.result === "pass" && check.sha === fixed)).toBe(true);
-    expect(fresh.task?.revisions?.find((item) => item.id === oldReview?.id)?.sha).toBe(built);
-    expect(fresh.task?.revisions?.some((item) => item.kind === "implementation" && item.sha === fixed && item.generation === 2)).toBe(true);
-    expect(fresh.task?.phase).toBe("review");
-    expect(starts.n).toBe(3);
-
-    const duplicate = await completion(fixThread, deps, starts);
-    expect(duplicate.duplicate).toBe(true);
-    expect(starts.n).toBe(3);
+  it("blocks a worker that did not finish cleanly, keeps its lock, and accepts no SHA", async () => {
+    const { repo, sha } = initRepo();
+    const deps = local();
+    const starts = { n: 0 };
+    const task = createFactoryTask({
+      objective: "Add a harmless line",
+      specialistId: IMPLEMENTER_ID,
+      model: "claude-opus-5-5",
+      permissions: "auto",
+      repo,
+      baseSha: sha,
+      acceptance: "README contains fixed",
+      dependencies: [],
+      requiredEvidence: ["commit"],
+      owner: "Bryant Thornton",
+      authority: "lifecycle proof",
+    }, deps).task;
+    const launched = await launchFactoryTask(task.id, { start: () => {} });
+    commit(task.worktree!, "base\nfixed\n");
+    const ended = await completion(launched.task.ombThreadId!, deps, starts, false);
+    expect(ended.task?.status).toBe("blocked");
+    expect(ended.task?.status).not.toBe("waiting_qa");
+    expect(ended.task?.blocker).toMatch(/did not finish cleanly/);
+    expect(ended.task?.writerLock).toBe("implementer");
+    expect(ended.task?.resultSha).toBeUndefined();
+    expect(starts.n).toBe(0);
+    expect(() => createFactoryTask({
+      objective: "A second writer must not start",
+      specialistId: IMPLEMENTER_ID,
+      model: "claude-opus-5-5",
+      permissions: "auto",
+      repo,
+      baseSha: sha,
+      acceptance: "none",
+      dependencies: [],
+      requiredEvidence: ["commit"],
+      owner: "Bryant Thornton",
+      authority: "lifecycle proof",
+      dispatchKey: "second",
+    }, deps)).toThrow(/writer/);
   });
 
   it("restores one proven binding on restart and does not start a second writer", async () => {
@@ -303,7 +313,7 @@ describe("server-owned factory lifecycle", () => {
     const second = await completion(boundThread, deps, starts);
     expect(second.duplicate).toBe(true);
     expect(first.task?.sessionId === launched.task.sessionId || first.task?.threads?.some((row) => row.threadId === launched.task.ombThreadId)).toBe(true);
-    expect(starts.n).toBeLessThanOrEqual(2);
+    expect(starts.n).toBe(1);
     const file = JSON.parse(readFileSync(join(DATA_DIR, "factory-tasks.json"), "utf8"));
     const row = file.tasks.find((item: { id: string }) => item.id === task.id);
     const writers = row.threads.filter((item: { specialistId: string }) => item.specialistId === IMPLEMENTER_ID);

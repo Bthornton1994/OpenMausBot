@@ -1,6 +1,9 @@
 // Factory tool boundary. Prompt text is not enforcement: callers in the
 // Claude spawn path, the permission broker, and the PreToolUse hook all use
-// this decision. A read-only role that cannot be fenced is not dispatched.
+// this decision. OMB dispatches only the implementer; QA and independent
+// review are performed outside OMB. The read-only branch below stays as a
+// fail-closed default so a stored reviewer or QA role can never be treated
+// as a writer. It is not a QA isolation boundary.
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -20,14 +23,14 @@ export const FACTORY_SPECIALISTS = {
 export type FactorySpecialistId = keyof typeof FACTORY_SPECIALISTS;
 export type FactoryRole = (typeof FACTORY_SPECIALISTS)[FactorySpecialistId]["role"];
 
-export const QA_DISPOSITIONS = ["CLEAR", "KEEP_DRAFT", "NOT_CLEAR"] as const;
-export type QaEvidenceDisposition = (typeof QA_DISPOSITIONS)[number];
+/** Legacy stored value only. OMB does not record a QA disposition. */
+export type QaEvidenceDisposition = "CLEAR" | "KEEP_DRAFT" | "NOT_CLEAR";
 
 const READ_ONLY_TOOLS = new Set(["read", "grep", "glob", "ls", "websearch", "webfetch"]);
 const WRITE_TOOLS = new Set(["edit", "write", "notebookedit", "multiedit", "strreplace"]);
 const SHELL_TOOLS = new Set(["bash", "powershell", "shell"]);
 
-/** Tools the CLI must not even offer to a reviewer, navigator, QA, or release seat. */
+/** Tools the CLI must not offer a read-only role. OMB does not dispatch one; this keeps a stored one fenced. */
 export const REVIEWER_DISALLOWED_TOOLS = [
   "Edit", "Write", "NotebookEdit", "MultiEdit", "Bash", "PowerShell", "Task", "Agent",
 ] as const;

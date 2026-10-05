@@ -20,12 +20,12 @@ describe("factory desk page", () => {
     expect(FACTORY_DESK_HTML).not.toContain("bypassPermissions");
     expect(FACTORY_DESK_HTML).toContain("claude-opus-5-5");
     expect(FACTORY_DESK_HTML).toContain('permissions: "auto"');
-    expect(FACTORY_DESK_HTML).toContain('id="headSha"');
-    expect(FACTORY_DESK_HTML).toContain('id="prUrl"');
     expect(FACTORY_DESK_HTML).toContain('id="handoffId"');
-    expect(FACTORY_DESK_HTML).toContain("body.headSha = headSha");
-    expect(FACTORY_DESK_HTML).toContain("body.prUrl = prUrl");
-    expect(FACTORY_DESK_HTML).toContain("handoffId");
     expect(FACTORY_DESK_HTML).toContain('"/deliver"');
+    // QA is performed outside OMB: no QA-only review fields and no ship gate.
+    expect(FACTORY_DESK_HTML).not.toContain('id="headSha"');
+    expect(FACTORY_DESK_HTML).not.toContain('id="prUrl"');
+    expect(FACTORY_DESK_HTML).not.toContain('"/ship"');
+    expect(FACTORY_DESK_HTML).not.toContain("waiting_qa");
   });
 });
