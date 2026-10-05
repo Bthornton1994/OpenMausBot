@@ -5,9 +5,10 @@ import { execSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
+import { _setRequiredTestsSandboxForTests } from "./factory-checks.ts";
 import {
   FactoryDispatchError,
   IMPLEMENTER_ID,
@@ -139,10 +140,14 @@ async function legacyRemediation(): Promise<{ task: FactoryTask; built: string; 
   return { task: getFactoryTask(task.id)!, built, local, qaThread, qaSession };
 }
 
+// These tests are about the lifecycle, not confinement. The stand-in confines
+// nothing; without any sandbox required-tests fail closed (see factory-fence.test.ts).
 beforeEach(() => {
   try { unlinkSync(store()); } catch { /* fresh home */ }
   _resetFactoryDispatch();
+  _setRequiredTestsSandboxForTests({ name: "test-pass-through", wrap: (command, args) => ({ command, args }) });
 });
+afterEach(() => _setRequiredTestsSandboxForTests(null));
 
 describe("implementation-only pipeline", () => {
   it("stops at the sealed implementation SHA with no review handoff and frees the repository", async () => {

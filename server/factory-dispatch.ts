@@ -970,10 +970,11 @@ function pushRevision(row: FactoryTask, rev: Omit<FactoryRevision, "id" | "creat
 
 /** Runs the base-pinned required-tests for `sha`. The writer's own copy is
  * never executed; one that differs from the recorded base is a failure. */
-function runRequiredTests(row: FactoryTask, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[]; reason?: string } {
+function runRequiredTests(row: FactoryTask, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[]; reason?: string; unsandboxed?: true } {
   if (!row.worktree) return { ran: false, ok: true, checks: [] };
   const outcome = runRequiredTestsPinned(row.worktree, row.baseSha, sha);
   if (outcome.state === "undefined") return { ran: false, ok: true, checks: [] };
+  if (outcome.state === "unsandboxed") return { ran: false, ok: false, checks: [], reason: outcome.reason, unsandboxed: true };
   const ok = outcome.state === "ran" && outcome.ok;
   const reason = outcome.state === "modified" || (outcome.state === "ran" && !outcome.ok) ? outcome.reason : undefined;
   return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }], ...(reason ? { reason } : {}) };
@@ -1135,6 +1136,10 @@ function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: Factor
   if ((row.revisions ?? []).some((item) => item.kind === "review")) row.generation = (row.generation ?? 1) + 1;
   clearReviewPointers(row, head);
   const tests = runRequiredTests(row, head);
+  if (tests.unsandboxed) {
+    blockTask(row, tests.reason!);
+    return;
+  }
   const drift = worktreeStateProblem(row, head);
   if (drift) {
     row.checkResults = [...(row.checkResults ?? []).filter((check) => check.sha === head), ...tests.checks].slice(-100);
@@ -1212,6 +1217,10 @@ function completeImplementation(row: FactoryTask, input: { resultSha: string; ch
     clearReviewPointers(row, input.resultSha);
   }
   const tests: ReturnType<typeof runRequiredTests> = hadOtherReview ? runRequiredTests(row, input.resultSha) : { ran: false, ok: true, checks: [] };
+  if (tests.unsandboxed) {
+    blockTask(row, tests.reason!);
+    return;
+  }
   const drift = worktreeStateProblem(row, input.resultSha);
   if (drift) {
     if (tests.checks.length) row.checkResults = [...(row.checkResults ?? []), ...tests.checks].slice(-100);

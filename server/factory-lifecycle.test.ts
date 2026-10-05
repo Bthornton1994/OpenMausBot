@@ -2,9 +2,10 @@ import { execFileSync, execSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
+import { _setRequiredTestsSandboxForTests } from "./factory-checks.ts";
 import {
   IMPLEMENTER_ID,
   QA_OUTSIDE_OMB,
@@ -66,10 +67,14 @@ function completion(threadId: string, deps: ReturnType<typeof local>, starts: { 
   return completeFactoryTurn(threadId, host);
 }
 
+// These tests are about the lifecycle, not confinement. The stand-in confines
+// nothing; without any sandbox required-tests fail closed (see factory-fence.test.ts).
 beforeEach(() => {
   try { unlinkSync(join(DATA_DIR, "factory-tasks.json")); } catch { /* fresh */ }
   _resetFactoryDispatch();
+  _setRequiredTestsSandboxForTests({ name: "test-pass-through", wrap: (command, args) => ({ command, args }) });
 });
+afterEach(() => _setRequiredTestsSandboxForTests(null));
 
 describe("server-owned factory lifecycle", () => {
   it("adopts a clean descendant HEAD only after the writer session ends", async () => {

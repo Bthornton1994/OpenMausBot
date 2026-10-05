@@ -7,15 +7,24 @@ import { execSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import { enforceFactoryTool, symlinkEscapeReason } from "./factory-boundary.ts";
-import { checkEnvironment, runBounded, runRequiredTestsPinned } from "./factory-checks.ts";
+import {
+  NO_SANDBOX_REASON,
+  _setRequiredTestsSandboxForTests,
+  checkEnvironment,
+  detectRequiredTestsSandbox,
+  runBounded,
+  runRequiredTestsPinned,
+  type RequiredTestsSandbox,
+} from "./factory-checks.ts";
 import {
   IMPLEMENTER_ID,
   completeFactoryTurn,
   createFactoryTask,
+  getFactoryTask,
   harvestFactoryTask,
   launchFactoryTask,
   _resetFactoryDispatch,
@@ -169,7 +178,46 @@ function commitFile(repo: string, name: string, body: string): string {
   return execSync("git rev-parse HEAD", { cwd: repo }).toString().trim();
 }
 
-describe.skipIf(!HAS_SH)("base-pinned required tests", () => {
+// Pass-through stand-in. It confines nothing; it only lets the tests below
+// exercise the runner mechanics. It is never a real sandbox and is refused
+// outside vitest.
+const PASS_THROUGH: RequiredTestsSandbox = { name: "test-pass-through", wrap: (command, args) => ({ command, args }) };
+
+describe("required tests fail closed without an OS sandbox", () => {
+  it("has no sandbox by default, because none has been demonstrated", () => {
+    expect(detectRequiredTestsSandbox()).toBeNull();
+  });
+
+  it("never spawns the base script when no sandbox is available", () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
+    const { repo, base } = repoWithScript(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    const head = commitFile(repo, "README", "base\nmore\n");
+    expect(runRequiredTestsPinned(repo, base, head)).toEqual({ state: "unsandboxed", reason: NO_SANDBOX_REASON });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("still reports no definition at the base as undefined, with nothing to run", () => {
+    const { repo, base } = repoWithScript(null);
+    const head = commitFile(repo, "README", "base\nmore\n");
+    expect(runRequiredTestsPinned(repo, base, head)).toEqual({ state: "undefined" });
+  });
+
+  it("refuses to install a test sandbox outside vitest", () => {
+    const saved = process.env.VITEST;
+    delete process.env.VITEST;
+    try {
+      expect(() => _setRequiredTestsSandboxForTests(PASS_THROUGH)).toThrow(/test-only/);
+    } finally {
+      process.env.VITEST = saved;
+    }
+    expect(detectRequiredTestsSandbox()).toBeNull();
+  });
+});
+
+describe.skipIf(!HAS_SH)("base-pinned required tests (runner mechanics under a test stand-in)", () => {
+  beforeEach(() => _setRequiredTestsSandboxForTests(PASS_THROUGH));
+  afterEach(() => _setRequiredTestsSandboxForTests(null));
+
   it("runs the base copy and passes it the head SHA", () => {
     const { repo, base } = repoWithScript("#!/bin/sh\n[ \"$1\" = \"$(git rev-parse HEAD)\" ] || exit 1\ngrep -q fixed README || exit 1\nexit 0\n");
     const head = commitFile(repo, "README", "base\nfixed\n");
@@ -248,12 +296,65 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
   beforeEach(() => {
     try { unlinkSync(join(DATA_DIR, "factory-tasks.json")); } catch { /* fresh */ }
     _resetFactoryDispatch();
+    _setRequiredTestsSandboxForTests(PASS_THROUGH);
   });
+  afterEach(() => _setRequiredTestsSandboxForTests(null));
 
   const drifts: [string, string, RegExp][] = [
     ["dirties the worktree", "#!/bin/sh\necho stray > stray.txt\nexit 0\n", /not clean/],
     ["moves HEAD", "#!/bin/sh\ngit -c user.email=a@b.c -c user.name=n commit --allow-empty -q -m drift\nexit 0\n", /HEAD changed/],
   ];
+
+  // A legacy row can carry a review of an older SHA. That is the only seal
+  // path that runs the required tests, so it is the one that needs a recheck.
+  function withLegacyReview(taskId: string, sha: string, sessionId: string | undefined) {
+    getFactoryTask(taskId)!.revisions!.push({
+      id: "legacy-review", kind: "review", sessionId: sessionId ?? "legacy", specialistId: IMPLEMENTER_ID,
+      generation: 1, sha, evidence: [], findings: [], nextAction: "legacy", createdAt: Date.now(),
+    } as never);
+  }
+
+  for (const [label, script, expected] of drifts) {
+    it(`blocks the legacy hadOtherReview seal when the required tests leave a worktree that ${label}`, async () => {
+      const { deps, task, launched, base } = await seatedWriter(script);
+      withLegacyReview(task.id, base, launched.task.sessionId);
+      const done = await completion(launched.task.ombThreadId!, deps);
+      expect(done.task?.status).toBe("blocked");
+      expect(done.task?.blocker).toMatch(expected);
+      expect(done.task?.blocker).toMatch(/after required checks ran; not sealed/);
+      expect(done.task?.resultSha).toBeUndefined();
+      expect(done.task?.revisions?.some((item) => item.kind === "implementation")).toBe(false);
+    });
+  }
+
+  it("blocks the legacy hadOtherReview seal without spawning the script when no sandbox exists", async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
+    const { deps, task, launched, base } = await seatedWriter(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    _setRequiredTestsSandboxForTests(null);
+    withLegacyReview(task.id, base, launched.task.sessionId);
+    const done = await completion(launched.task.ombThreadId!, deps);
+    expect(done.task?.status).toBe("blocked");
+    expect(done.task?.blocker).toBe(NO_SANDBOX_REASON);
+    expect(existsSync(marker)).toBe(false);
+    expect(done.task?.revisions?.some((item) => item.kind === "implementation")).toBe(false);
+  });
+
+  it("blocks stale-SHA adoption without spawning the script when no sandbox exists", async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
+    const { deps, task, launched, base } = await seatedWriter(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    _setRequiredTestsSandboxForTests(null);
+    harvestFactoryTask(task.id, {
+      sessionId: launched.task.sessionId,
+      worktree: task.worktree,
+      resultSha: base,
+      evidence: [{ kind: "commit", ref: base, note: "agent named the base" }],
+    });
+    const done = await completion(launched.task.ombThreadId!, deps);
+    expect(done.task?.status).toBe("blocked");
+    expect(done.task?.blocker).toBe(NO_SANDBOX_REASON);
+    expect(existsSync(marker)).toBe(false);
+    expect(done.task?.revisions?.some((item) => item.kind === "candidate")).toBe(false);
+  });
 
   for (const [label, script, expected] of drifts) {
     it(`does not adopt after a stale-SHA rejection when the required tests leave a worktree that ${label}`, async () => {

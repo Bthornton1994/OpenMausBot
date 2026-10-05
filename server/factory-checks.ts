@@ -2,8 +2,9 @@
 // recorded base commit, never from the writer's worktree, so a task writer
 // cannot change what gets executed. The child gets a scrubbed environment, a
 // hard timeout, and (on POSIX) its own process group that is killed when the
-// run ends. It still runs in the worktree, so any code the check itself
-// invokes from the task's files is not sandboxed. See docs/factory-lanes.md.
+// run ends. Those are not a sandbox, so the script is spawned only through an
+// OS sandbox; without one it fails closed and is never run.
+// See docs/factory-lanes.md.
 
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -91,14 +92,43 @@ function definitionAt(worktree: string, sha: string): string | null {
   return match ? `${match[1]} ${match[2]}` : null;
 }
 
+/** An OS-level confinement for the check process: it must not be able to read
+ * or write host resources outside its assigned workspace. `wrap` rewrites the
+ * command so it runs inside that confinement. */
+export interface RequiredTestsSandbox {
+  name: string;
+  wrap(command: string, args: string[], dirs: { workspace: string; scratch: string }): { command: string; args: string[] };
+}
+
+/** No sandbox has been demonstrated on any supported host, so none is
+ * returned and required-tests never spawn. A real one must be added here only
+ * together with a test that proves the process cannot touch the host outside
+ * its workspace. */
+export function detectRequiredTestsSandbox(): RequiredTestsSandbox | null {
+  return testSandbox;
+}
+
+let testSandbox: RequiredTestsSandbox | null = null;
+
+/** Test-only hook so the runner mechanics can be exercised. Refused outside vitest. */
+export function _setRequiredTestsSandboxForTests(sandbox: RequiredTestsSandbox | null): void {
+  if (!process.env.VITEST) throw new Error("test-only");
+  testSandbox = sandbox;
+}
+
+export const NO_SANDBOX_REASON =
+  "blocked: required-tests need an OS sandbox and none is available on this host; the script was not run";
+
 export type RequiredTestsOutcome =
   | { state: "undefined" }
+  | { state: "unsandboxed"; reason: string }
   | { state: "modified"; reason: string }
   | { state: "ran"; ok: boolean; reason?: string };
 
-/** Runs the base-pinned required-tests for `headSha`. The writer's copy is
- * never executed: if it differs from the base copy the result is `modified`,
- * which callers treat as a failure that needs a human. */
+/** Runs the base-pinned required-tests for `headSha` inside an OS sandbox. With
+ * no sandbox the script is never spawned and the result is `unsandboxed`. The
+ * writer's copy is never executed: if it differs from the base copy the result
+ * is `modified`, which callers treat as a failure that needs a human. */
 export function runRequiredTestsPinned(
   worktree: string,
   baseSha: string,
@@ -107,6 +137,8 @@ export function runRequiredTestsPinned(
 ): RequiredTestsOutcome {
   const pinned = definitionAt(worktree, baseSha);
   if (!pinned) return { state: "undefined" };
+  const sandbox = detectRequiredTestsSandbox();
+  if (!sandbox) return { state: "unsandboxed", reason: NO_SANDBOX_REASON };
   if (!/^100(644|755) /.test(pinned)) {
     return { state: "modified", reason: "required-tests at the recorded base is not a regular file" };
   }
@@ -122,9 +154,8 @@ export function runRequiredTestsPinned(
     chmodSync(script, 0o700);
     const env = checkEnvironment(scratch);
     const timeoutMs = opts.timeoutMs ?? REQUIRED_TESTS_TIMEOUT_MS;
-    const run = process.platform === "win32"
-      ? runBounded("sh", [script, headSha], { cwd: worktree, env, timeoutMs })
-      : runBounded(script, [headSha], { cwd: worktree, env, timeoutMs });
+    const wrapped = sandbox.wrap("sh", [script, headSha], { workspace: worktree, scratch });
+    const run = runBounded(wrapped.command, wrapped.args, { cwd: worktree, env, timeoutMs });
     if (run.timedOut) return { state: "ran", ok: false, reason: `required-tests timed out after ${Math.round(timeoutMs / 1000)}s and was killed` };
     if (run.error) return { state: "ran", ok: false, reason: `required-tests could not run: ${run.error}` };
     return { state: "ran", ok: run.status === 0 };
