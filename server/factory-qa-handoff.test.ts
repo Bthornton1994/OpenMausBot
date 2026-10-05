@@ -453,6 +453,7 @@ describe("no QA surface is offered", () => {
   it("the onboarding text does not claim a QA boundary", () => {
     expect(FACTORY_ONBOARDING).toContain("QA and independent review are performed outside OMB");
     expect(FACTORY_ONBOARDING).not.toMatch(/read-only QA lease|read-only lease|Only the assigned Independent QA specialist records/);
-    expect(readFileSync(join(process.cwd(), "docs", "factory-onboarding.md"), "utf8")).toBe(FACTORY_ONBOARDING);
+    // A Windows checkout may convert the doc to CRLF; compare the text, not the line endings.
+    expect(readFileSync(join(process.cwd(), "docs", "factory-onboarding.md"), "utf8").replace(/\r\n/g, "\n")).toBe(FACTORY_ONBOARDING);
   });
 });
