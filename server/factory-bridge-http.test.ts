@@ -718,10 +718,10 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     ]);
   });
 
-  it("t1758u the QA route records who recorded the verdict; after a restart one recorded by anyone else releases nothing", async () => {
+  it("t1758u a stored verdict names who recorded it; after a restart one recorded by anyone else releases nothing", async () => {
     const lane = heldByQa("t1758u-recorder");
-    const recorded = await json(base, "POST", `/factory/lanes/${lane.id}/qa`, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
-    expect(recorded.status).toBe(200);
+    recordQaDisposition(lane.id, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
+    const recorded = await json(base, "GET", `/factory/lanes/${lane.id}`);
     expect(recorded.body.lane).toMatchObject({ phase: "qa_wait", qaDisposition: "PASS", qaRecordedBy: "qa-bot" });
 
     const now = Date.now();
@@ -772,7 +772,6 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
         await json(base, "POST", "/factory/lanes", { ...laneInput("t1758u-i3-new"), reviewerBotId }),
         await json(base, "POST", `/factory/lanes/${ready.id}/transition`, { phase: "ready", reviewerBotId }),
         await json(base, "POST", `/factory/lanes/${held.id}/transition`, { phase: "qa_wait", reviewerBotId }),
-        await json(base, "POST", `/factory/lanes/${held.id}/qa`, { reviewerBotId, disposition: "FAIL", ref: "_cos/QA_DIGEST.md" }),
       ]) {
         expect(res.status, label).toBe(400);
         expect(res.body.error.code, label).toBe("invalid");
