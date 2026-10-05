@@ -590,111 +590,40 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     expect(restate.body.lane).toMatchObject({ phase: "qa_wait", reviewerBotId: "qa-bot", nextAction: "await QA" });
   });
 
-  it("t1755u F1 QA route records the assigned reviewer's FAIL, refuses anyone else, and enables the rework handoff", async () => {
-    const lane = heldByQa("t1755u-qa-fail");
-    const before = getLane(lane.id);
-    const qa = (body: unknown, headers: Record<string, string> = {}) => json(base, "POST", `/factory/lanes/${lane.id}/qa`, body, headers);
-    const move = (body: Record<string, unknown>) => json(base, "POST", `/factory/lanes/${lane.id}/transition`, body);
-    const fail = { reviewerBotId: "qa-bot", disposition: "FAIL", ref: "_cos/QA_DIGEST.md", note: "missing test" };
-
-    // QA pending: the handoff is still refused.
-    const pending = await move({ phase: "running" });
-    expect(pending.status).toBe(403);
-    expect(pending.body.error.message).toMatch(/no QA verdict recorded/);
-
-    expect((await qa(fail, { authorization: "Bearer wrong-token" })).status).toBe(401);
-    for (const reviewerBotId of [lane.ownerBotId, "someone-else"]) {
-      const res = await qa({ ...fail, reviewerBotId });
-      expect(res.status, reviewerBotId).toBe(403);
-      expect(res.body.error.code, reviewerBotId).toBe("qa_independence");
-    }
-    for (const [label, body] of [
-      ["unknown disposition", { ...fail, disposition: "MAYBE" }],
-      ["no ref", { reviewerBotId: "qa-bot", disposition: "FAIL" }],
-      ["no reviewer", { disposition: "FAIL", ref: "_cos/QA_DIGEST.md" }],
-      ["note not text", { ...fail, note: { why: "x" } }],
-      ["extra field", { ...fail, phase: "running" }],
-    ] as const) {
-      const res = await qa(body);
-      expect(res.status, label).toBe(400);
-      expect(res.body.error.code, label).toBe("invalid");
-    }
-    expect((await qa({ ...fail, phase: "running" })).body.error.message).toBe("unsupported fields: phase");
-    const textPlain = await qa(JSON.stringify(fail), { "content-type": "text/plain" });
-    expect(textPlain.status).toBe(400);
-    expect(textPlain.body.error.message).toBe("Content-Type must be application/json");
-    expect((await json(base, "POST", "/factory/lanes/nope-t1755u/qa", fail)).status).toBe(404);
-    expect(getLane(lane.id)).toEqual(before);
-
-    const recorded = await qa(fail);
-    expect(recorded.status).toBe(200);
-    expect(recorded.body.lane).toMatchObject({ id: lane.id, phase: "qa_wait", qaDisposition: "FAIL", reviewerBotId: "qa-bot" });
-    expect(recorded.body.lane.evidence.at(-1)).toMatchObject({ kind: "qa", ref: "_cos/QA_DIGEST.md", note: "FAIL by qa-bot — missing test" });
-    expect(getLane(lane.id)?.qaDisposition).toBe("FAIL");
-
-    // The handoff cannot credit another reviewer with that FAIL.
-    const swap = await move({ phase: "running", reviewerBotId: "qa-bot-2" });
-    expect(swap.status).toBe(403);
-    expect(swap.body.error.code).toBe("ineligible");
-    expect(getLane(lane.id)?.phase).toBe("qa_wait");
-
-    const rework = await move({ phase: "running", nextAction: "fix the QA findings" });
-    expect(rework.status).toBe(200);
-    expect(rework.body.lane).toMatchObject({ phase: "running", reviewerBotId: "qa-bot", nextAction: "fix the QA findings" });
-    expect(rework.body.lane.evidence.slice(-2)).toEqual([
-      expect.objectContaining({ kind: "rework", ref: "_cos/QA_DIGEST.md", note: "QA FAIL by qa-bot handed the lane back for rework" }),
-      expect.objectContaining({ kind: "phase", ref: "qa_wait->running" }),
-    ]);
-    expect(readFileSync(join(DATA_DIR, "bridge.log"), "utf8")).not.toContain(TOKEN);
-  });
-
-  it("t1755u F1 QA route fails closed without a protect SoT, and a PASS through it lets the lane finish", async () => {
-    const lane = heldByQa("t1755u-qa-pass");
-    const before = getLane(lane.id);
-    const pass = { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" };
-    const qa = () => json(base, "POST", `/factory/lanes/${lane.id}/qa`, pass);
-
-    delete process.env.COS_FACTORY_PROTECT_DIR;
-    const unset = await qa();
-    const missing = join(DATA_DIR, "protect-t1755u-missing");
-    mkdirSync(missing, { recursive: true });
-    process.env.COS_FACTORY_PROTECT_DIR = missing;
-    const unreadable = await qa();
-    process.env.COS_FACTORY_PROTECT_DIR = FIXTURE;
-    for (const res of [unset, unreadable]) {
-      expect(res.status).toBe(403);
-      expect(res.body.error).toEqual({ code: "ineligible", message: "protect SoT unavailable, failing closed" });
-    }
-    expect(getLane(lane.id)).toEqual(before);
-
-    const recorded = await qa();
-    expect(recorded.status).toBe(200);
-    expect(recorded.body.lane).toMatchObject({ phase: "qa_wait", qaDisposition: "PASS" });
-    const back = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "running" });
-    expect(back.status).toBe(403);
-    expect(back.body.error.message).toMatch(/\(QA PASS\); running needs QA FAIL$/);
-    const done = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "done", outcome: "KEEP_DRAFT" });
-    expect(done.status).toBe(200);
-    expect(done.body.lane).toMatchObject({ phase: "done", qaDisposition: "PASS", outcome: "KEEP_DRAFT" });
-  });
-
-  it("t1756u F-3 QA route refuses a verdict on a finished lane and leaves the store byte-identical", async () => {
+  it("no bridge route records a QA verdict; a stored verdict stays readable", async () => {
+    const lane = heldByQa("no-qa-write");
     const file = join(DATA_DIR, "factory-lanes.json");
-    for (const [phase, recorded, late] of [
-      ["done", "PASS", "FAIL"],
-      ["failed", "FAIL", "PASS"],
-      ["cancelled", "BLOCKED", "PASS"],
-    ] as const) {
-      const lane = heldByQa(`t1756u-f3-${phase}`);
-      recordQaDisposition(lane.id, { reviewerBotId: "qa-bot", disposition: recorded, ref: "_cos/QA_DIGEST.md" });
-      transition(lane.id, phase);
-      const before = readFileSync(file, "utf8");
-      const res = await json(base, "POST", `/factory/lanes/${lane.id}/qa`, { reviewerBotId: "qa-bot", disposition: late, ref: "_cos/LATE_QA.md" });
-      expect(res.status, phase).toBe(400);
-      expect(res.body.error, phase).toEqual({ code: "terminal", message: `lane ${lane.id} is ${phase}; terminal lanes do not change` });
-      expect(readFileSync(file, "utf8"), phase).toBe(before);
-      expect(getLane(lane.id), phase).toMatchObject({ phase, qaDisposition: recorded });
+    const before = readFileSync(file, "utf8");
+
+    // The old verdict route is gone: a well-formed verdict from the assigned reviewer writes nothing.
+    for (const disposition of ["PASS", "FAIL"]) {
+      const res = await json(base, "POST", `/factory/lanes/${lane.id}/qa`, { reviewerBotId: "qa-bot", disposition, ref: "_cos/QA_DIGEST.md" });
+      expect(res.status, disposition).toBe(404);
+      expect(res.body.error, disposition).toEqual({ code: "unauthorized_op", message: `factory bridge does not expose POST /factory/lanes/${lane.id}/qa` });
     }
+    // Nor can a verdict ride along on another write route.
+    for (const [path, body] of [
+      [`/factory/lanes/${lane.id}/transition`, { phase: "qa_wait", qaDisposition: "PASS" }],
+      [`/factory/lanes/${lane.id}/wait`, { qaDisposition: "PASS" }],
+      ["/factory/lanes", { ...laneInput("no-qa-register"), qaDisposition: "PASS" }],
+      ["/factory/claim", { qaDisposition: "PASS" }],
+    ] as const) {
+      const res = await json(base, "POST", path, body);
+      expect(res.status, path).toBe(400);
+      expect(res.body.error, path).toEqual({ code: "invalid", message: "unsupported fields: qaDisposition" });
+    }
+    expect(readFileSync(file, "utf8")).toBe(before);
+    const pending = await json(base, "POST", `/factory/lanes/${lane.id}/transition`, { phase: "done" });
+    expect(pending.status).toBe(403);
+    expect(pending.body.error.message).toMatch(/\(no QA verdict recorded\); done needs QA PASS$/);
+
+    // A verdict already in the store is still served to readers.
+    recordQaDisposition(lane.id, { reviewerBotId: "qa-bot", disposition: "PASS", ref: "_cos/QA_DIGEST.md" });
+    const read = await json(base, "GET", `/factory/lanes/${lane.id}`);
+    expect(read.status).toBe(200);
+    expect(read.body.lane).toMatchObject({ phase: "qa_wait", qaDisposition: "PASS" });
+    const report = await json(base, "GET", `/factory/lanes/${lane.id}/report`);
+    expect(report.body.report).toMatchObject({ qaDisposition: "PASS" });
   });
 
   it("t1756u F-1 after a restart, a held verdict stored without a reviewer releases nothing; the reviewer the route assigns must record a fresh one", async () => {
@@ -712,7 +641,6 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     writeFileSync(join(DATA_DIR, "factory-lanes.json"), JSON.stringify({ version: 1, lanes: [stored] }));
     _resetFactoryLanes();
     const move = (body: Record<string, unknown>) => json(base, "POST", "/factory/lanes/t1756u-f1/transition", body);
-    const qa = (body: Record<string, unknown>) => json(base, "POST", "/factory/lanes/t1756u-f1/qa", body);
 
     const loaded = await json(base, "GET", "/factory/lanes/t1756u-f1");
     expect(loaded.status).toBe(200);
@@ -721,14 +649,11 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     expect(handoff.status).toBe(403);
     expect(handoff.body.error.message).toMatch(/\(no QA verdict recorded\); running needs QA FAIL$/);
 
-    // F-4: the route ignores a blank reviewer, so the hold stays assignable, and a blank records nothing.
+    // F-4: the route ignores a blank reviewer, so the hold stays assignable.
     for (const reviewerBotId of ["", "   "]) {
       const blank = await move({ phase: "qa_wait", reviewerBotId });
       expect(blank.status).toBe(200);
       expect(blank.body.lane.reviewerBotId).toBeUndefined();
-      const blankQa = await qa({ reviewerBotId, disposition: "FAIL", ref: "_cos/QA_DIGEST.md" });
-      expect(blankQa.status).toBe(400);
-      expect(blankQa.body.error.code).toBe("invalid");
     }
 
     const assigned = await move({ phase: "qa_wait", reviewerBotId: "qa-bot-2" });
@@ -737,7 +662,7 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     expect(assigned.body.lane.qaDisposition).toBeUndefined();
     expect((await move({ phase: "running" })).status).toBe(403);
 
-    expect((await qa({ reviewerBotId: "qa-bot-2", disposition: "FAIL", ref: "_cos/QA_DIGEST-2.md" })).status).toBe(200);
+    recordQaDisposition("t1756u-f1", { reviewerBotId: "qa-bot-2", disposition: "FAIL", ref: "_cos/QA_DIGEST-2.md" });
     const rework = await move({ phase: "running" });
     expect(rework.status).toBe(200);
     expect(rework.body.lane.evidence.slice(-2)).toEqual([
@@ -746,7 +671,7 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     ]);
   });
 
-  it("t1757u R-1 after a restart, a held verdict without its reviewer's qa note releases nothing; the route's own verdict does", async () => {
+  it("t1757u R-1 after a restart, a held verdict without its reviewer's qa note releases nothing; the reviewer's own verdict does", async () => {
     const now = Date.now();
     const held = (id: string, fields: Record<string, unknown>) => ({ ...laneInput(id), id, phase: "qa_wait", fullSha: SHA, createdAt: now, updatedAt: now, ...fields });
     const qaEntry = (ref: string, note: string) => ({ at: now, kind: "qa", ref, note });
@@ -783,9 +708,8 @@ describe("factory bridge HTTP (t1742u/t1743u)", () => {
     expect(ok.status).toBe(200);
     expect(ok.body.lane).toMatchObject({ phase: "done", qaDisposition: "PASS" });
 
-    // qa-bot-2's own FAIL through the route is the handoff, credited to them with their ref.
-    const recorded = await json(base, "POST", "/factory/lanes/r1-swap/qa", { reviewerBotId: "qa-bot-2", disposition: "FAIL", ref: "_cos/QA_DIGEST-2.md" });
-    expect(recorded.status).toBe(200);
+    // qa-bot-2's own FAIL is the handoff, credited to them with their ref.
+    recordQaDisposition("r1-swap", { reviewerBotId: "qa-bot-2", disposition: "FAIL", ref: "_cos/QA_DIGEST-2.md" });
     const handed = await move("r1-swap", { phase: "running" });
     expect(handed.status).toBe(200);
     expect(handed.body.lane.evidence.slice(-2)).toEqual([

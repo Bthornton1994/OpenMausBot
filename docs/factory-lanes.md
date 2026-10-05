@@ -168,20 +168,18 @@ is refused with `code: "ineligible"` and writes nothing.
   held lane's reviewer change, and it kept a verdict on entering `qa_wait`.
 - So after pointing this code at a `DATA_DIR` an older tool wrote, a held
   lane whose verdict was dropped stays in `qa_wait` until its assigned
-  reviewer records the verdict again (`POST /factory/lanes/:id/qa`). The
+  reviewer records the verdict again (`recordQaDisposition`). The
   same happens at the next load if a `qa` entry that is not the reviewer's
   verdict is added to a held lane with `appendEvidence`.
 - `releaseOwnership` is refused until a verdict is recorded (the phase keeps
   blocking other writers either way).
 - The implementer claim APIs keep refusing a `qa_wait` lane even after `FAIL`
   (rule `qa_phase`); the handoff goes through `transition`.
-- The loopback bridge (`scripts/factory-bridge.ts`) records verdicts with
-  `POST /factory/lanes/:id/qa` (`{ reviewerBotId, disposition, ref, note? }`).
-  It calls `recordQaDisposition` behind the same token, JSON-only body and
-  fail-closed protect-directory check as the bridge's other writes. The token
-  authorizes the caller, not a bot: the bridge checks the `reviewerBotId` it is
-  given against the lane's assigned reviewer, but cannot prove the caller is
-  that bot.
+- The loopback bridge (`scripts/factory-bridge.ts`) records no QA verdict.
+  QA is performed outside OMB, so the old `POST /factory/lanes/:id/qa` route is
+  gone and answers `404 unauthorized_op`; no other bridge route accepts a
+  `qaDisposition`. A verdict already stored on a lane is still returned by
+  `GET /factory/lanes/:id` and its `/report`.
 
 ## Protect gate (`server/factory-protect-gate.ts`)
 
