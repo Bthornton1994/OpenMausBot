@@ -118,6 +118,7 @@ describe("scopes", () => {
       ["POST", "/api/bots/x/slack-management"], ["GET", "/api/bots/x/slack-management/extra"],
       ["PUT", "/api/config"], ["POST", "/api/auth/pairing"], ["GET", "/api/auth/sessions"], ["DELETE", "/api/auth/sessions/abc"],
       ["POST", "/api/auth/pair"], // handled before the gate; the gate itself never grants it
+      ["POST", "/api/factory/tasks"], ["POST", "/api/factory/recover"], ["GET", "/api/factory/tasks"],
       ["GET", "/api/something-new"], // anything unlisted is admin until listed
     ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
   });
@@ -285,6 +286,43 @@ describe("resolveRequestAuth", () => {
       request({ host: "127.0.0.1:8799" }, "POST"),
       options("/api/internal/ask-bot"),
     ).auth?.kind).toBe("loopback");
+  });
+
+  it("rejects unauthorized factory task mutations and admits the desk page as a read", () => {
+    const options = (path: string) => ({
+      sessions,
+      cookieName,
+      streamPath: "/api/events",
+      url: new URL(path, "http://x"),
+      loopbackMutationToken: "owner-token-123",
+    });
+    for (const path of [
+      "/api/factory/tasks",
+      "/api/factory/tasks/task-1/launch",
+      "/api/factory/tasks/task-1/harvest",
+      "/api/factory/tasks/task-1/deliver",
+      "/api/factory/tasks/task-1/wait",
+      "/api/factory/tasks/task-1/ship",
+      "/api/factory/tasks/task-1/cancel",
+      "/api/factory/recover",
+    ]) {
+      const denied = resolveRequestAuth(request({ host: "127.0.0.1:8799" }, "POST"), options(path));
+      expect(denied.auth, path).toBeNull();
+      expect(denied.status, path).toBe(403);
+      expect(denied.error, path).toMatch(/desktop app or a paired device/);
+      const desktop = resolveRequestAuth(
+        request({ host: "127.0.0.1:8799", "x-openmausbot-desktop-owner": "owner-token-123" }, "POST"),
+        options(path),
+      );
+      expect(desktop.auth?.kind, path).toBe("loopback");
+      const paired = resolveRequestAuth(
+        request({ host: "127.0.0.1:8799", authorization: `Bearer ${pairedToken()}` }, "POST"),
+        options(path),
+      );
+      expect(paired.auth?.kind, path).toBe("session");
+    }
+    expect(resolveRequestAuth(request({ host: "127.0.0.1:8799" }, "GET"), options("/api/factory/desk")).auth?.kind).toBe("loopback");
+    expect(resolveRequestAuth(request({ host: "127.0.0.1:8799" }, "GET"), options("/api/factory/tasks")).auth?.kind).toBe("loopback");
   });
 
   it("never grants loopback trust to a request that came through a proxy, whatever Host it carries", () => {

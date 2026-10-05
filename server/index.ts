@@ -574,6 +574,10 @@ import { createBotPresetRoutes } from "./routes/bot-presets.ts";
 import { createBotMemoryRoutes } from "./routes/bot-memory.ts";
 import { createDeciderRoutes } from "./routes/decider.ts";
 import { createAntigravityLeftoverRoutes } from "./routes/antigravity-leftovers.ts";
+import { appendFactoryDeskLink } from "./factory-desk-page.ts";
+import { createFactoryRoutes } from "./routes/factory.ts";
+import { completeFactoryTurn, factorySpecialistPrompt, factoryTaskByThread, factoryTurnGuard, noteFactorySession } from "./factory-dispatch.ts";
+import { evaluateFactoryTool } from "./factory-boundary.ts";
 import { findAntigravityLeftovers, removeAntigravityLeftovers } from "./drivers/antigravity-temp.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
@@ -6961,6 +6965,7 @@ bus.subscribe((event: RuntimeEvent) => {
       if (bot && event.sessionId && event.providerInstanceId) {
         store.setResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
       }
+      if (event.sessionId) noteFactorySession(event.threadId, event.sessionId);
       if (typeof event.model === "string" && event.model) sessionModelByThread.set(event.threadId, event.model);
       break;
     case "item.completed":
@@ -7053,6 +7058,21 @@ bus.subscribe((event: RuntimeEvent) => {
       }
       break;
     case "request.opened": {
+      const factoryFence = factoryTaskByThread(event.threadId);
+      if (factoryFence && event.requestType === "permission" && event.requestId && event.tool) {
+        const command = event.command && typeof event.command.command === "string" ? event.command.command : "";
+        const decision = evaluateFactoryTool({
+          role: factoryFence.role,
+          worktree: factoryFence.worktree ?? "",
+          tool: event.tool,
+          input: command ? { command } : {},
+        });
+        if (!("defer" in decision) && decision.allow === false) {
+          const instanceId = event.providerInstanceId ?? (bot ?? (speaker ? store.bot(speaker.botId) : undefined))?.modelSelection.instanceId ?? "";
+          void answerRequest(event.threadId, instanceId, event.requestId, "deny", decision.reason);
+          break;
+        }
+      }
       // A structured ask carries the model's own options and has no
       // allow/deny answer, so it is a question no matter which channel the
       // provider routed it through — and, like every question, no approval
@@ -7289,6 +7309,35 @@ bus.subscribe((event: RuntimeEvent) => {
       }
       break;
     case "turn.completed": {
+      if (factoryTaskByThread(event.threadId)) {
+        const factoryThreadId = event.threadId;
+        const factoryOk = event.ok;
+        setImmediate(() => {
+          void completeFactoryTurn(factoryThreadId, {
+            ok: factoryOk,
+            bot: (id) => {
+              const seated = store.bot(id);
+              if (!seated) return null;
+              return { id: seated.id, model: seated.modelSelection?.model, driverKind: registry.get(seated.modelSelection.instanceId)?.driverKind };
+            },
+            createThread: (botId, title) => {
+              const created = store.createTask(botId, title, true, undefined, undefined, "auto");
+              if (!created) throw new Error("couldn't create that task");
+              return { threadId: created.threadId };
+            },
+            pinCwd: (botId, threadId, cwd) => {
+              const pinned = store.patchTask(botId, threadId, { cwd });
+              if (!pinned || pinned.cwd !== cwd) throw new Error("could not pin the factory worktree");
+            },
+            start: async (task) => {
+              if (!task.ombThreadId) throw new Error("factory task has no thread");
+              await startTurn(task.specialistId, factorySpecialistPrompt(task), { threadId: task.ombThreadId });
+            },
+          }).catch((error) => {
+            console.error("factory completion failed", error instanceof Error ? error.message : "error");
+          });
+        });
+      }
       // A peer-started turn settles as coordination, not as news. What keeps
       // that classification from outliving its turn is the rewrite at
       // dispatch, not this line — releasing it here too is hygiene, so a
@@ -9738,6 +9787,19 @@ async function startTurn(
       const dispatchedConfig = sessionConfig(liveBot?.soul ?? bot.soul);
       if (strictResume && !(opts?.cardContinuation && continuingRoutine) && dispatchedConfig !== plannedConfig) dispatchContext = decideContext(dispatchedConfig);
       // Before sendTurn: an adapter may emit the whole turn before it resolves.
+      let factoryGuard: ReturnType<typeof factoryTurnGuard> = null;
+      try {
+        factoryGuard = factoryTurnGuard(threadId);
+      } catch (error) {
+        throw Object.assign(new Error(error instanceof Error ? error.message : "factory task is blocked"), { status: 409 });
+      }
+      const factoryMode = approvalModeForTurn(bot, commsDepth > 0, threadId);
+      if (factoryGuard && factoryMode !== "auto") {
+        throw Object.assign(new Error("factory turns accept only Auto"), { status: 409 });
+      }
+      if (factoryGuard && cwd && cwd !== factoryGuard.worktree) {
+        throw Object.assign(new Error("factory worktree is not the thread folder"), { status: 409 });
+      }
       handoffs.dispatching(threadId, dispatchClaimId, dispatchContext.handoff);
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
@@ -9756,6 +9818,8 @@ async function startTurn(
         // resume the wrong conversation and defeat the context bubble
         resumeCursor: dispatchContext.resumeCursor,
         sessionReset: dispatchContext.sessionReset,
+        ...(!dispatchContext.resumeCursor && factoryGuard?.sessionId ? { factorySessionId: factoryGuard.sessionId } : {}),
+        ...(factoryGuard ? { factoryBoundary: { role: factoryGuard.role, worktree: factoryGuard.worktree }, extraDisallowedTools: factoryGuard.disallowedTools } : {}),
         ...(dispatchContext.recoveryText !== undefined ? { recoveryText: dispatchContext.recoveryText } : {}),
         ...(dispatchContext.recoveryIsReplay ? { recoveryIsReplay: true } : {}),
         transcript,
@@ -14354,6 +14418,14 @@ function serveStatic(res: ServerResponse, path: string): boolean {
   try {
     const data = readFileSync(file);
     const type = MIME[extname(file)] ?? "application/octet-stream";
+    // The factory desk link is only injected into the app's own index page.
+    // Other HTML (error pages, fixtures) stays untouched.
+    if (type === "text/html" && (safe === "/index.html" || safe.endsWith("/index.html"))) {
+      const html = appendFactoryDeskLink(data.toString("utf8"));
+      res.writeHead(200, { "content-type": type, ...PAGE_HEADERS });
+      res.end(html);
+      return true;
+    }
     res.writeHead(200, { "content-type": type, ...(type === "text/html" ? PAGE_HEADERS : {}) });
     res.end(data);
     return true;
@@ -14361,8 +14433,9 @@ function serveStatic(res: ServerResponse, path: string): boolean {
     // SPA fallback
     try {
       const data = readFileSync(join(STATIC_DIR, "index.html"));
+      const html = appendFactoryDeskLink(data.toString("utf8"));
       res.writeHead(200, { "content-type": "text/html", ...PAGE_HEADERS });
-      res.end(data);
+      res.end(html);
       return true;
     } catch {
       return false;
@@ -14472,6 +14545,25 @@ ROUTES.push(createBotMemoryRoutes({
   },
 }));
 ROUTES.push(createDeciderRoutes({ decider }));
+ROUTES.push(createFactoryRoutes({
+  bot: (id) => {
+    const bot = store.bot(id);
+    if (!bot) return null;
+    return { id: bot.id, model: bot.modelSelection?.model, driverKind: registry.get(bot.modelSelection.instanceId)?.driverKind };
+  },
+  createThread: (botId, title) => {
+    const task = store.createTask(botId, title, true, undefined, undefined, "auto");
+    if (!task) throw Object.assign(new Error("couldn't create that task"), { status: 500 });
+    return { threadId: task.threadId };
+  },
+  pinCwd: (botId, threadId, cwd) => {
+    const task = store.patchTask(botId, threadId, { cwd });
+    if (!task || task.cwd !== cwd) throw Object.assign(new Error("could not pin the factory worktree"), { status: 500 });
+  },
+  startTurn: async (botId, message, threadId) => {
+    await startTurn(botId, message, { threadId });
+  },
+}));
 ROUTES.push(createAntigravityLeftoverRoutes({
   hosted: Boolean(hostedModels),
   isAntigravity: (instanceId) => registry.get(instanceId)?.driverKind === "antigravityAgent",
@@ -21099,8 +21191,19 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!body || typeof body !== "object" || Array.isArray(body)) return json(res, 400, { error: "body must be a JSON object" });
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      if (body.approvalMode !== undefined && body.approvalMode !== "ask" && body.approvalMode !== "full") {
-        return json(res, 400, { error: "new task approvalMode must be ask or full" });
+      if (body.approvalMode === "bypass" || body.approvalMode === "bypassPermissions" || body.approvalMode === "dangerously-skip-permissions") {
+        return json(res, 400, { error: "unsupported permission value" });
+      }
+      if (body.approvalMode !== undefined && body.approvalMode !== "ask" && body.approvalMode !== "auto" && body.approvalMode !== "full") {
+        return json(res, 400, { error: "unsupported permission value" });
+      }
+      if (body.approvalMode === "auto") {
+        if (bot.computer === "local" && body.acknowledgeLocalAuto !== true) {
+          return json(res, 400, { error: "Auto mode on this computer requires confirming the warning first (acknowledgeLocalAuto)" });
+        }
+        if (!supportsApprovalMode(bot.modelSelection, "auto")) {
+          return json(res, 400, { error: "This provider does not support Auto" });
+        }
       }
       if (body.approvalMode === "full") {
         if (auth.kind !== "loopback" || !sharedWorkspaceFullAccessEnabled()) {

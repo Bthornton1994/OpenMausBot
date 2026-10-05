@@ -12,7 +12,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join, dirname, isAbsolute, normalize } from "node:path";
+import { join, dirname, isAbsolute, normalize, resolve } from "node:path";
 
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { writeFileAtomic } from "../atomic.ts";
@@ -49,6 +49,7 @@ import {
 import { appendNative } from "./native.ts";
 import { permissionCommand, permissionLaunchCwd } from "./permission-command.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+import { factoryPreToolSettings } from "../factory-boundary.ts";
 import { extractMcpImages } from "../mcp-tool-images.ts";
 import {
   ASK_USER_QUESTION_TOOL,
@@ -1271,7 +1272,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // so a fake's transient failures don't stall real seconds
       const retryScale = Number(process.env.FAKE_CLAUDE_RETRY_SCALE ?? "1");
       const sessionId = !turn.sessionReset && typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
-      const newSessionId = sessionId ? null : newId();
+      const allocatedSession = !sessionId && typeof turn.factorySessionId === "string" && /^[0-9a-f-]{36}$/i.test(turn.factorySessionId)
+        ? turn.factorySessionId
+        : null;
+      const newSessionId = sessionId ? null : (allocatedSession ?? newId());
 
       const args = [
         "-p",
@@ -1290,8 +1294,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       }
       if (turn.guestConfined) args.push("--restricted", "--tools", GUEST_CLAUDE_TOOLS.join(","));
       else if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
-      if (config.disallowedTools?.length) {
-        args.push("--disallowedTools", config.disallowedTools.join(","));
+      const disallowedTools = [...(config.disallowedTools ?? []), ...(turn.extraDisallowedTools ?? [])];
+      if (turn.factoryBoundary && permissionMode === "bypassPermissions") {
+        throw new Error("factory turns cannot use bypassPermissions");
+      }
+      if (disallowedTools.length) {
+        args.push("--disallowedTools", [...new Set(disallowedTools)].join(","));
       }
       const turnEnvironment = environment();
       if ((turn.refreshSystemPrompt || turn.guestConfined) && !cliVersionChecked) {
@@ -1485,15 +1493,29 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       }
       const settings: Record<string, unknown> = { ...authSettings };
       if (hooks) settings.hooks = claudeHookSettings(HOOK_HELPER_PATH);
+      if (turn.factoryBoundary) {
+        const bindingPath = join(DATA_DIR, "factory-bindings", `${turn.threadId}.json`);
+        mkdirSync(dirname(bindingPath), { recursive: true, mode: 0o700 });
+        writeFileAtomic(bindingPath, JSON.stringify({ role: turn.factoryBoundary.role, worktree: turn.factoryBoundary.worktree }), { mode: 0o600 });
+        env.OMB_FACTORY_BINDING = bindingPath;
+        const existingHooks = settings.hooks && typeof settings.hooks === "object" ? settings.hooks as Record<string, unknown> : {};
+        settings.hooks = { ...existingHooks, ...factoryPreToolSettings(SPAWNED_PROXIES.factoryBoundary) };
+      }
       if (turn.guestConfined) settings.permissions = GUEST_CLAUDE_PERMISSIONS;
       const authSettingsPath = mcpConfigPath && Object.keys(settings).length
         ? join(dirname(mcpConfigPath), "auth-settings.json") : null;
+      if (turn.factoryBoundary && !authSettingsPath) {
+        throw new Error("factory boundary could not be attached to the Claude settings file");
+      }
       if (authSettingsPath) args.push("--settings", authSettingsPath);
       // Our approvals and browser credentials expire at the user-turn
       // boundary. Native background workers cannot outlive that boundary;
       // parallel bot work must use the harness's durable delegate_bot path.
       env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
       const cwd = turn.cwd ?? homedir();
+      if (turn.factoryBoundary && resolve(cwd) !== resolve(turn.factoryBoundary.worktree)) {
+        throw new Error("factory turn cwd is not the bound worktree");
+      }
       const commandCwd = permissionLaunchCwd(cwd);
       // Everything that shapes the process, minus session/turn-specific temp
       // paths. Their contents are represented directly in the key instead.

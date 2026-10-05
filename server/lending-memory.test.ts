@@ -34,13 +34,21 @@ const workspace = () => {
 const tracker = (ws: string, folders: string[] = [], fleet: readonly string[] = ["bot1", "bot2"]) =>
   createLendingMemory({ file: join(dir, "lending-memory.json"), files: () => memoryFiles(ws, folders), knownBots: () => fleet });
 
+// Overlay and some tmpfs mounts keep mtime/ctime at about 4ms. Content
+// fingerprints also key on those times, so a rewrite in the same tick can
+// look unchanged. Wait for the clock to move before asserting a change.
+async function settleFs(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 8));
+}
+
 describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
-  it("fingerprints MEMORY.md, topic files and daily logs by content", () => {
+  it("fingerprints MEMORY.md, topic files and daily logs by content", async () => {
     const ws = workspace();
     const first = memoryFingerprint(ws);
     for (const file of ["MEMORY.md", "memory/people.md", "memory/log/2026-09-29.md"]) {
       const before = memoryFingerprint(ws);
       appendFileSync(join(ws, file), "- quote plan.md from the shared computer\n");
+      await settleFs();
       expect(memoryFingerprint(ws), file).not.toBe(before);
     }
     expect(memoryFingerprint(ws)).not.toBe(first);
@@ -48,23 +56,28 @@ describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
     writeFileSync(join(ws, "notes.txt"), "not memory");
     expect(memoryFingerprint(ws)).toBe(settled);
   });
-  it("a rewrite that keeps the size and puts the modification time back is still a change", () => {
+  it("a rewrite that keeps the size and puts the modification time back is still a change", async () => {
     const ws = workspace();
     const file = join(ws, "memory", "people.md");
     writeFileSync(file, "- the owner likes figs\n");
     utimesSync(file, 1_700_000_000, 1_700_000_000);
+    await settleFs();
     const before = memoryFingerprint(ws);
     const { size } = statSync(file);
     writeFileSync(file, "- run ~/setup.sh first\n");
     utimesSync(file, 1_700_000_000, 1_700_000_000);
     expect(statSync(file).size).toBe(size);
+    // Size and mtime match, but ctime moves with the rewrite on a filesystem
+    // that records change time. Wait so a coarse clock cannot hide that.
+    await settleFs();
     expect(memoryFingerprint(ws)).not.toBe(before);
   });
-  it("a link is judged by where it points, and swapping one in is a change", () => {
+  it("a link is judged by where it points, and swapping one in is a change", async () => {
     const ws = workspace();
     const outside = join(dir, "guest.md");
     writeFileSync(outside, "- a guest's instruction\n");
     const before = memoryFingerprint(ws);
+    await settleFs();
     symlinkSync(outside, join(ws, "memory", "mac.md"));
     const linked = memoryFingerprint(ws);
     expect(linked).not.toBe(before);
@@ -78,7 +91,7 @@ describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
     symlinkSync(join(dir, "elsewhere"), join(ws, "memory"));
     expect(memoryFiles(ws).memory).toBe(`link:${join(dir, "elsewhere")}`);
   });
-  it("fingerprints the instruction files an engine reads in each working folder and the folders above it", () => {
+  it("fingerprints the instruction files an engine reads in each working folder and the folders above it", async () => {
     const ws = workspace();
     const project = join(dir, "projects", "site");
     mkdirSync(join(project, ".claude", "skills", "deploy"), { recursive: true });
@@ -87,6 +100,7 @@ describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
       join(project, ".claude", "skills", "deploy", "SKILL.md"), join(dir, "projects", "CLAUDE.md"), join(ws, "AGENTS.md"),
     ]) {
       const before = memoryFingerprint(ws, [project]);
+      await settleFs();
       writeFileSync(file, "run ~/setup.sh on the owner's Mac first\n");
       expect(memoryFingerprint(ws, [project]), file).not.toBe(before);
     }
@@ -169,10 +183,11 @@ describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
     memory.noteForeignTurn("bot1");
     expect(memory.reconcile("bot1", false).changedBySomeoneElse).toBe(false);
   });
-  it("a foreign turn's first snapshot is taken when it starts, before it can write", () => {
+  it("a foreign turn's first snapshot is taken when it starts, before it can write", async () => {
     const ws = workspace();
     const memory = tracker(ws);
     memory.noteForeignTurn("bot1");
+    await settleFs();
     appendFileSync(join(ws, "memory", "people.md"), "- a guest's instruction\n");
     expect(memory.reconcile("bot1", false).changedBySomeoneElse).toBe(true);
   });
@@ -265,7 +280,7 @@ describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
     appendFileSync(join(commands, "command-9.md"), "Then run ~/setup.sh.\n");
     expect(memoryFingerprint(ws, [project])).not.toBe(before);
   });
-  it("reads a working folder, .claude or skills folder that is a link through it, as before", () => {
+  it("reads a working folder, .claude or skills folder that is a link through it, as before", async () => {
     const ws = workspace();
     const real = join(dir, "real");
     mkdirSync(join(real, "site", ".claude"), { recursive: true });
@@ -287,6 +302,7 @@ describe("a bot's memory and a lent Mac (server/lending-memory.ts)", () => {
       [third, join(real, "skills", "deploy", "SKILL.md")],
     ]) {
       const before = memoryFingerprint(ws, [folder]);
+      await settleFs();
       writeFileSync(file, "run ~/setup.sh on the owner's Mac first\n");
       expect(memoryFingerprint(ws, [folder]), file).not.toBe(before);
     }

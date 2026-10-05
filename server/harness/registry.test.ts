@@ -3,7 +3,7 @@
 // unavailable shadow, never crash the fleet. These tests pin that.
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ModelCatalog } from "../contracts.ts";
@@ -242,7 +242,12 @@ process.exit(0);
     const binDir = join(scratch, "fake-path");
     mkdirSync(binDir);
     if (present) addFakeNpm(binDir);
-    process.env.PATH = binDir;
+    // Keep the Node that is running this suite on PATH. The stand-in npm is a
+    // `#!/usr/bin/env node` script; a PATH of only the fake bin makes env(1)
+    // report "node: No such file or directory" on hosts that do not put node
+    // in a fixed directory env searches by itself.
+    const nodeBin = dirname(process.execPath);
+    process.env.PATH = present ? `${binDir}${originalPath ? `:${nodeBin}:${originalPath}` : `:${nodeBin}`}` : binDir;
     process.env.FAKE_NPM_LOG = join(scratch, "npm-calls.jsonl");
     resetPathCacheForTests();
     return binDir;
