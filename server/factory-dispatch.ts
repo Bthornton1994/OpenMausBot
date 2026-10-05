@@ -10,11 +10,12 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
+import { REQUIRED_TESTS_PATH, runRequiredTestsPinned } from "./factory-checks.ts";
 import {
   FACTORY_ENGINE_MODEL,
   FACTORY_SPECIALISTS,
@@ -967,22 +968,21 @@ function pushRevision(row: FactoryTask, rev: Omit<FactoryRevision, "id" | "creat
 }
 
 
-/** A repo-owned check script. POSIX execs it. Windows cannot start a shebang
- * file, so Git's sh runs the same bytes; if sh is missing the spawn fails
- * and the gate stays closed. */
-function runRepoScript(script: string, args: string[], cwd: string): { status: number | null; stdout: string } {
-  const result = process.platform === "win32"
-    ? spawnSync("sh", [script, ...args], { cwd, encoding: "utf8" })
-    : spawnSync(script, args, { cwd, encoding: "utf8" });
-  return { status: result.status, stdout: result.stdout ?? "" };
+/** Runs the base-pinned required-tests for `sha`. The writer's own copy is
+ * never executed; one that differs from the recorded base is a failure. */
+function runRequiredTests(row: FactoryTask, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[]; reason?: string } {
+  if (!row.worktree) return { ran: false, ok: true, checks: [] };
+  const outcome = runRequiredTestsPinned(row.worktree, row.baseSha, sha);
+  if (outcome.state === "undefined") return { ran: false, ok: true, checks: [] };
+  const ok = outcome.state === "ran" && outcome.ok;
+  const reason = outcome.state === "modified" || (outcome.state === "ran" && !outcome.ok) ? outcome.reason : undefined;
+  return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }], ...(reason ? { reason } : {}) };
 }
 
-function runRequiredTests(worktree: string, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[] } {
-  const script = join(worktree, ".omb", "required-tests");
-  if (!worktree || !existsSync(script)) return { ran: false, ok: true, checks: [] };
-  const result = runRepoScript(script, [sha], worktree);
-  const ok = result.status === 0;
-  return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }] };
+/** The pinned definition exists at the recorded base. */
+function requiredTestsDefinedAtBase(row: FactoryTask): boolean {
+  if (!row.worktree || !row.baseSha) return false;
+  return git(["-C", row.worktree, "ls-tree", row.baseSha, "--", REQUIRED_TESTS_PATH]).stdout.trim() !== "";
 }
 
 /** Drops legacy review pointers. Revisions already stored keep their sha. */
@@ -999,6 +999,47 @@ function clearReviewPointers(row: FactoryTask, sha: string): void {
 function worktreeClean(worktree: string): boolean {
   const status = git(["-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"]);
   return status.ok && status.stdout.trim() === "";
+}
+
+/** Paths of symlinks the writer added or changed since the base whose target
+ * is absolute or climbs out of the tree. Null when the diff cannot be read. */
+function escapingSymlinks(worktree: string, baseSha: string, head: string): string[] | null {
+  const diff = spawnSync("git", ["-C", worktree, "diff", "--raw", "--no-abbrev", "--no-renames", "-z", baseSha, head], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (diff.status !== 0) return null;
+  const fields = (diff.stdout ?? "").split("\0");
+  const escaping: string[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const meta = fields[i]!.match(/^:\d{6} (\d{6}) [0-9a-f]+ ([0-9a-f]+) /);
+    if (!meta || meta[1] !== "120000") continue;
+    const path = fields[i + 1]!;
+    const blob = git(["-C", worktree, "cat-file", "blob", meta[2]!]);
+    if (!blob.ok) return null;
+    const target = blob.stdout.replace(/\\/g, "/");
+    const resolved = posix.normalize(posix.join(posix.dirname(path), target));
+    if (/^([A-Za-z]:|\/)/.test(target) || resolved === ".." || resolved.startsWith("../")) escaping.push(path);
+  }
+  return escaping;
+}
+
+/** What must still hold right before a candidate is sealed or the writer lock
+ * is released: HEAD is the SHA being sealed, the worktree is clean, and no
+ * symlink the writer committed points out of the tree. */
+function worktreeStateProblem(row: FactoryTask, head: string): string | null {
+  if (!row.worktree) return "blocked: task has no assigned writer";
+  const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
+  if (!current.ok || current.stdout.trim().toLowerCase() !== head.toLowerCase()) return "blocked: HEAD changed while it was being checked";
+  if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean";
+  const links = escapingSymlinks(row.worktree, row.baseSha, head);
+  if (links === null) return "blocked: committed symlinks could not be inspected";
+  if (links.length) return `blocked: committed symlink points outside the worktree: ${links[0]}`;
+  return null;
+}
+
+function blockTask(row: FactoryTask, reason: string): void {
+  row.status = "blocked";
+  row.phase = "blocked";
+  row.blocker = reason;
+  row.nextAction = reason;
 }
 
 function descendsFrom(worktree: string, ancestor: string, head: string): boolean {
@@ -1025,10 +1066,7 @@ function writerHeadUncertain(row: FactoryTask, head: string, sessionEnded: boole
   if (!SHA.test(head) || head === row.writerShaAtAssign) return "blocked: HEAD was not produced by the latest assigned writer";
   if (!descendsFrom(row.worktree, row.baseSha, head)) return "blocked: HEAD does not descend from the recorded base";
   if (!descendsFrom(row.worktree, row.writerShaAtAssign, head)) return "blocked: HEAD was not produced by the latest assigned writer";
-  const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
-  if (!current.ok || current.stdout.trim().toLowerCase() !== head) return "blocked: HEAD changed while it was being checked";
-  if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean";
-  return null;
+  return worktreeStateProblem(row, head);
 }
 
 function gitTree(worktree: string, sha: string): string | null {
@@ -1090,17 +1128,19 @@ function finishImplementation(row: FactoryTask, head: string): void {
 }
 
 function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: FactoryEvidence[]): void {
-  const script = join(row.worktree ?? "", ".omb", "required-tests");
-  if (!row.worktree || !existsSync(script)) {
-    row.status = "blocked";
-    row.phase = "blocked";
-    row.blocker = "uncertain: required checks are not present for the verified HEAD";
-    row.nextAction = row.blocker;
+  if (!row.worktree || !requiredTestsDefinedAtBase(row)) {
+    blockTask(row, "uncertain: required checks are not defined at the recorded base");
     return;
   }
   if ((row.revisions ?? []).some((item) => item.kind === "review")) row.generation = (row.generation ?? 1) + 1;
   clearReviewPointers(row, head);
-  const tests = runRequiredTests(row.worktree, head);
+  const tests = runRequiredTests(row, head);
+  const drift = worktreeStateProblem(row, head);
+  if (drift) {
+    row.checkResults = [...(row.checkResults ?? []).filter((check) => check.sha === head), ...tests.checks].slice(-100);
+    blockTask(row, `${drift} (after required checks ran; not sealed)`);
+    return;
+  }
   const tree = gitTree(row.worktree, head);
   if (!tree || !row.writerSessionId || !row.implementerId) {
     row.status = "blocked";
@@ -1127,7 +1167,7 @@ function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: Factor
     row.status = "blocked";
     row.phase = "blocked";
     row.writerLock = "implementer";
-    row.blocker = `required checks failed for ${head}`;
+    row.blocker = `required checks failed for ${head}${tests.reason ? `: ${tests.reason}` : ""}`;
     row.nextAction = row.blocker;
     return;
   }
@@ -1171,11 +1211,17 @@ function completeImplementation(row: FactoryTask, input: { resultSha: string; ch
   } else if (row.reviewSha && row.reviewSha !== input.resultSha) {
     clearReviewPointers(row, input.resultSha);
   }
+  const tests: ReturnType<typeof runRequiredTests> = hadOtherReview ? runRequiredTests(row, input.resultSha) : { ran: false, ok: true, checks: [] };
+  const drift = worktreeStateProblem(row, input.resultSha);
+  if (drift) {
+    if (tests.checks.length) row.checkResults = [...(row.checkResults ?? []), ...tests.checks].slice(-100);
+    blockTask(row, tests.ran ? `${drift} (after required checks ran; not sealed)` : `${drift} (not sealed)`);
+    return;
+  }
   if (!persistSealedCandidate(row, input.resultSha, input.evidence)) return;
-  const tests = hadOtherReview ? runRequiredTests(row.worktree ?? "", input.resultSha) : { ran: false, ok: true, checks: [] as FactoryCheck[] };
   row.resultSha = input.resultSha;
   const nextAction = tests.ran && !tests.ok
-    ? `required tests failed for ${input.resultSha}`
+    ? `required tests failed for ${input.resultSha}${tests.reason ? `: ${tests.reason}` : ""}`
     : `implementation sealed at ${input.resultSha}`;
   pushRevision(row, {
     kind: "implementation",

@@ -5,7 +5,8 @@
 // fail-closed default so a stored reviewer or QA role can never be treated
 // as a writer. It is not a QA isolation boundary.
 
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const FACTORY_ENGINE_MODEL = "claude-opus-5-5";
 
@@ -59,28 +60,94 @@ function pathFrom(input: Record<string, unknown>): string | null {
   return null;
 }
 
+/** Drive paths ("C:\x", "C:/x", "C:x") and UNC or device paths ("\\host", "//host"). */
+const FOREIGN_ABSOLUTE = /^(?:[A-Za-z]:|[\\/]{2})/;
+
 /** True when `candidate` is the worktree or a path inside it. Missing,
- * relative escapes, and absolute paths outside fail closed. */
+ * relative escapes, and absolute paths outside fail closed. A backslash is a
+ * separator on every platform, and drive and UNC paths are refused outright
+ * off Windows, where they would otherwise read as odd relative names. */
 export function pathInsideWorktree(worktree: string, candidate: string): boolean {
   if (!worktree.trim() || !candidate.trim() || candidate.includes("\0")) return false;
+  const windows = process.platform === "win32";
+  if (!windows && FOREIGN_ABSOLUTE.test(candidate)) return false;
+  const normal = windows ? candidate : candidate.replace(/\\/g, "/");
   const root = resolve(worktree);
-  const abs = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
+  const abs = isAbsolute(normal) ? resolve(normal) : resolve(root, normal);
   const rel = relative(root, abs);
   if (rel === "") return true;
   return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
-function bashDenied(role: FactoryRole, worktree: string, command: string): string | null {
+/** Why a file-tool path cannot be trusted to stay in the worktree, or null.
+ * Every existing component under the root must not be a symlink or junction,
+ * and the deepest existing ancestor must resolve inside the real worktree.
+ * Anything it cannot examine is refused. This is a check at one moment: a
+ * link planted after it is not seen, which is why link-creating shell
+ * commands are refused and the seal rechecks the committed tree. */
+export function symlinkEscapeReason(worktree: string, candidate: string): string | null {
+  let realRoot: string;
+  try {
+    realRoot = realpathSync.native(resolve(worktree));
+  } catch {
+    return "worktree cannot be resolved on disk; refusing";
+  }
+  const normal = process.platform === "win32" ? candidate : candidate.replace(/\\/g, "/");
+  const root = resolve(worktree);
+  const abs = isAbsolute(normal) ? resolve(normal) : resolve(root, normal);
+  const rel = relative(root, abs);
+  const parts = rel === "" ? [] : rel.split(sep);
+  let current = root;
+  let deepest = root;
+  for (const part of parts) {
+    current = join(current, part);
+    try {
+      if (lstatSync(current).isSymbolicLink()) return `path goes through a link: ${current}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+      return "path could not be examined; refusing";
+    }
+    deepest = current;
+  }
+  try {
+    const back = relative(realRoot, realpathSync.native(deepest));
+    if (back === "") return null;
+    if (back === ".." || back.startsWith(`..${sep}`) || isAbsolute(back)) return `path resolves outside the worktree: ${deepest}`;
+  } catch {
+    return "path could not be resolved; refusing";
+  }
+  return null;
+}
+
+const DRIVE_PATH = /(?:^|[\s"'=(])([A-Za-z]:[\\/][^\s"'`;|&<>]*)/g;
+const UNC_PATH = /(?:^|[\s"'=(])((?:\\\\|\/\/)[^\s"'`;|&<>]+)/;
+const ROOTED_PATH = /(?:^|[\s"'=(])(\/[^\s"'`;|&<>]*)/g;
+const ROOTED_BACKSLASH_PATH = /(?:^|[\s"'=(])(\\[^\s"'`;|&<>]*)/g;
+/** `..` as a whole path segment, with either separator, anywhere in the command. */
+const PARENT_SEGMENT = /(?:^|[\s;&|"'=(\\/])\.\.(?=$|[\s;&|"')\\/])/;
+const LINK_COMMAND = /(?:^|[\s;&|(])(?:ln|mklink|junction)(?:\.exe)?(?=\s|$)|\bSymbolicLink\b|\bJunction\b|\bHardLink\b/i;
+
+function pathsIn(pattern: RegExp, command: string): string[] {
+  return [...command.matchAll(pattern)].map((match) => match[1]!);
+}
+
+function bashDenied(role: FactoryRole, worktree: string, command: string, windowsStyle: boolean): string | null {
   if (isReadOnlyFactoryRole(role)) return "read-only factory role cannot run a shell or submit changes";
   if (!command.trim()) return "shell command is missing; refusing";
-  if (/[`$]/.test(command) || command.includes("~")) return "shell command uses expansion; refusing";
-  if (/(^|[\s;&|])(\.\.|\.\/\.\.)(\/|$)/.test(command)) return "shell command leaves the worktree; refusing";
+  if (/[`$]/.test(command) || command.includes("~") || /%[A-Za-z_][A-Za-z0-9_]*%/.test(command)) return "shell command uses expansion; refusing";
+  if (PARENT_SEGMENT.test(command)) return "shell command leaves the worktree; refusing";
   if (/\bgit\s+push\b/i.test(command) || /\bgh\s+/i.test(command) || /\bgit\s+merge\b/i.test(command)) {
     return "factory implementer cannot push or merge";
   }
-  const abs = command.match(/(?:^|[\s"'=])(\/[^\s"'`;|&<>]+)/g) ?? [];
-  for (const raw of abs) {
-    const path = raw.trim().replace(/^[\s"'=]+/, "");
+  if (LINK_COMMAND.test(command)) return "shell command creates links, which could point outside the worktree; refusing";
+  const unc = command.match(UNC_PATH);
+  if (unc) return `shell path is outside the worktree: ${unc[1]}`;
+  const candidates = [
+    ...pathsIn(ROOTED_PATH, command),
+    ...pathsIn(DRIVE_PATH, command),
+    ...(windowsStyle ? pathsIn(ROOTED_BACKSLASH_PATH, command) : []),
+  ];
+  for (const path of candidates) {
     if (!pathInsideWorktree(worktree, path)) return `shell path is outside the worktree: ${path}`;
   }
   if (/[<>]/.test(command)) {
@@ -113,12 +180,14 @@ export function evaluateFactoryTool(args: {
     if (!pathInsideWorktree(args.worktree, path)) {
       return { allow: false, reason: `implementer write is outside its worktree: ${path}` };
     }
+    const linked = symlinkEscapeReason(args.worktree, path);
+    if (linked) return { allow: false, reason: `implementer write is refused: ${linked}` };
     return { allow: true };
   }
   if (SHELL_TOOLS.has(tool)) {
     const command = typeof input.command === "string" ? input.command : "";
     if (!command) return { defer: true };
-    const why = bashDenied(args.role, args.worktree, command);
+    const why = bashDenied(args.role, args.worktree, command, tool === "powershell" || process.platform === "win32");
     return why ? { allow: false, reason: why } : { allow: true };
   }
   if (READ_ONLY_TOOLS.has(tool)) return { allow: true };

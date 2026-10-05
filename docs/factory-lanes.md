@@ -310,3 +310,11 @@ separate, reviewable change:
 3. Until then, server-side code can import the module directly, one writer at
    a time (see *Storage*); tests do so in `server/factory-lanes.test.ts` and
    `server/factory-lanes.harvest.test.ts`.
+
+## Required checks and the implementer fence
+
+- `.omb/required-tests` is read from the recorded base commit, never from the task worktree. If the head copy differs, OMB does not run it and the task is blocked. A base with no definition is "uncertain", not a pass.
+- The check runs from a scratch copy with an allowlisted environment (no OMB or provider credentials; HOME and TEMP point at the scratch dir), a 10 minute timeout, and on POSIX its own process group, which is killed afterwards. On Windows the direct child is killed and `taskkill /T` is attempted; a detached descendant may survive.
+- Residual risk: the check still runs in the worktree, so code it invokes from task files is not OS-sandboxed. Do not treat it as a sandbox.
+- HEAD and a clean worktree are rechecked after the checks and before sealing; a drifted worktree blocks without sealing, and a committed symlink that leaves the tree blocks the seal.
+- The shell and file-tool boundary refuses drive, UNC, rooted and `..` paths in both separator styles on every platform, link-creating commands, and writes through any symlink or junction. The link check is a point-in-time check, and a missing worktree fails closed. Drive-relative `C:foo` in shell text is not parsed.

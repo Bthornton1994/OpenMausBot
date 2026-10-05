@@ -245,7 +245,7 @@ describe("factory recovery and harvest", () => {
 
 describe("reviewer read-only", () => {
   it("denies file writes and shells for reviewers and writes outside the worktree for the implementer", () => {
-    const worktree = "/workspace/factory-smoke/example";
+    const worktree = mkdtempSync(join(tmpdir(), "omb-fence-"));
     expect(enforceFactoryTool({ role: "reviewer", worktree, tool: "Write", input: { file_path: join(worktree, "a.txt") } }).allow).toBe(false);
     expect(enforceFactoryTool({ role: "qa", worktree, tool: "Edit", input: { file_path: join(worktree, "a.txt") } }).allow).toBe(false);
     expect(enforceFactoryTool({ role: "reviewer", worktree, tool: "Bash", input: { command: "git status" } }).allow).toBe(false);
