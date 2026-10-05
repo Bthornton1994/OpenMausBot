@@ -147,6 +147,36 @@ describe("bounded runner", () => {
     expect(alive).toBe(false);
   });
 
+  async function grandchildSurvivesTimeout(detached: boolean): Promise<boolean> {
+    const dir = mkdtempSync(join(tmpdir(), "omb-fence-win-"));
+    const pidFile = join(dir, "pid");
+    const grandchild = "setTimeout(() => {}, 60000)";
+    const parent = `const c = require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore', detached: ${detached} });` +
+      `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); setTimeout(() => {}, 60000);`;
+    const run = runBounded(process.execPath, ["-e", parent], { cwd: dir, env: checkEnvironment(dir), timeoutMs: 1500 });
+    expect(run.timedOut).toBe(true);
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    expect(pid).toBeGreaterThan(1);
+    let alive = true;
+    for (let i = 0; i < 40 && alive; i++) {
+      try { process.kill(pid, 0); await new Promise((resolve) => setTimeout(resolve, 100)); } catch { alive = false; }
+    }
+    if (alive) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+    return alive;
+  }
+
+  it.skipIf(POSIX)("kills an ordinary grandchild on Windows, not just the direct child", async () => {
+    expect(await grandchildSurvivesTimeout(false)).toBe(false);
+  });
+
+  // Known gap, measured on Windows: a descendant that detaches from the check
+  // survives the timeout, with or without the taskkill fallback. `it.fails`
+  // flips to a failure when that is fixed, so this record cannot go stale.
+  // Nothing spawns without an OS sandbox, so it is not reachable today.
+  it.skipIf(POSIX).fails("does not yet kill a detached grandchild on Windows", async () => {
+    expect(await grandchildSurvivesTimeout(true)).toBe(false);
+  });
+
   it("hands a check only an allowlisted environment", () => {
     const env = checkEnvironment("/scratch", { PATH: "/bin", OMB_AUTH_TOKEN: "secret", ANTHROPIC_API_KEY: "secret", HOME: "/home/real" });
     expect(env.PATH).toBe("/bin");
