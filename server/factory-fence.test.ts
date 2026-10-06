@@ -368,7 +368,7 @@ function commitLink(repo: string, name: string, target: string): string {
   return execSync("git rev-parse HEAD", { cwd: repo }).toString().trim();
 }
 
-async function seatedWriter(script: string, inheritedLink?: { name: string; target: string }) {
+async function seatedWriter(script: string | null, inheritedLink?: { name: string; target: string }) {
   const repoBase = repoWithScript(script);
   const repo = repoBase.repo;
   const base = inheritedLink ? commitLink(repo, inheritedLink.name, inheritedLink.target) : repoBase.base;
@@ -436,6 +436,41 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
     expect(done.task?.blocker).toBe(NO_SANDBOX_REASON);
     expect(existsSync(marker)).toBe(false);
     expect(done.task?.revisions?.some((item) => item.kind === "implementation")).toBe(false);
+  });
+
+  // Ordinary completion has no older review revision. It is the common path, and
+  // it must not seal past a base that defines required-tests with no sandbox.
+  it("does not spawn the script or seal on ordinary completion when no sandbox exists", async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
+    const { deps, task, launched, built } = await seatedWriter(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    setSandbox(null);
+    harvestFactoryTask(task.id, {
+      sessionId: launched.task.sessionId,
+      worktree: task.worktree,
+      resultSha: built,
+      evidence: [{ kind: "commit", ref: built }],
+    });
+    const done = await completion(launched.task.ombThreadId!, deps);
+    expect(done.task?.status).toBe("blocked");
+    expect(done.task?.blocker).toBe(NO_SANDBOX_REASON);
+    expect(existsSync(marker)).toBe(false);
+    expect(done.task?.resultSha).toBeUndefined();
+    expect(done.task?.revisions?.some((item) => item.kind === "candidate" || item.kind === "implementation")).toBe(false);
+  });
+
+  it("still seals on ordinary completion without a sandbox when the base defines no required-tests", async () => {
+    const { deps, task, launched, built } = await seatedWriter(null);
+    setSandbox(null);
+    harvestFactoryTask(task.id, {
+      sessionId: launched.task.sessionId,
+      worktree: task.worktree,
+      resultSha: built,
+      evidence: [{ kind: "commit", ref: built }],
+    });
+    const done = await completion(launched.task.ombThreadId!, deps);
+    expect(done.task?.blocker).toBeUndefined();
+    expect(done.task?.resultSha).toBe(built);
+    expect(done.task?.revisions?.some((item) => item.kind === "implementation")).toBe(true);
   });
 
   it("blocks stale-SHA adoption without spawning the script when no sandbox exists", async () => {

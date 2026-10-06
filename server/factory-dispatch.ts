@@ -1247,7 +1247,9 @@ function completeImplementation(row: FactoryTask, input: { resultSha: string; ch
   } else if (row.reviewSha && row.reviewSha !== input.resultSha) {
     clearReviewPointers(row, input.resultSha);
   }
-  const tests: ReturnType<typeof runRequiredTests> = hadOtherReview ? runRequiredTests(row, input.resultSha) : { ran: false, ok: true, checks: [] };
+  // Every seal path checks the base definition. With one and no OS sandbox the
+  // script is not spawned and the seal is refused; with none, nothing runs.
+  const tests = runRequiredTests(row, input.resultSha);
   if (tests.unsandboxed) {
     blockTask(row, tests.reason!);
     return;

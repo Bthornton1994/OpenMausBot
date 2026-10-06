@@ -173,7 +173,8 @@ describe("implementation-only pipeline", () => {
     expect(task.assignedReleaseId).toBeUndefined();
     expect(() => createFactoryTask(intake(repo, sha, { dispatchKey: "second" }), deps())).toThrow(/writer/);
     const launched = await launchFactoryTask(task.id, { start: () => {} });
-    const built = commit(task.worktree!, "base\nharmless\n");
+    // The base required-tests script now runs on every seal, so it must pass.
+    const built = commit(task.worktree!, "base\nharmless\nfixed\n");
 
     const desk = harvestFactoryTask(task.id, {
       sessionId: launched.task.sessionId,
