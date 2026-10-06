@@ -169,12 +169,14 @@ describe("bounded runner", () => {
     expect(await grandchildSurvivesTimeout(false)).toBe(false);
   });
 
-  // Known gap, measured on Windows: a descendant that detaches from the check
-  // survives the timeout, with or without the taskkill fallback. `it.fails`
-  // flips to a failure when that is fixed, so this record cannot go stale.
-  // Nothing spawns without an OS sandbox, so it is not reachable today.
-  it.skipIf(POSIX).fails("does not yet kill a detached grandchild on Windows", async () => {
-    expect(await grandchildSurvivesTimeout(true)).toBe(false);
+  // KNOWN GAP, not a guarantee: measured on Windows, a descendant that detaches
+  // from the check survives the timeout, with or without the taskkill fallback.
+  // This asserts the observed survival, so a setup or pid-read error fails the
+  // test (the helper asserts the timeout and pid first), and so does fixing the
+  // gap; whoever fixes it should flip this to expect cleanup. Nothing spawns
+  // without an OS sandbox, so the gap is not reachable today.
+  it.skipIf(POSIX)("KNOWN GAP: a detached grandchild survives the timeout on Windows", async () => {
+    expect(await grandchildSurvivesTimeout(true)).toBe(true);
   });
 
   it("hands a check only an allowlisted environment", () => {
