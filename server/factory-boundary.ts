@@ -131,6 +131,10 @@ function pathsIn(pattern: RegExp, command: string): string[] {
   return [...command.matchAll(pattern)].map((match) => match[1]!);
 }
 
+/** Pattern checks on command text. This is NOT a security boundary: a program
+ * such as `node -e` or `npm test` builds paths at run time and passes every
+ * check here. Containment is the writer-launch gate on an OS sandbox in
+ * factory-dispatch.ts; this only catches honest mistakes. */
 function bashDenied(role: FactoryRole, worktree: string, command: string, windowsStyle: boolean): string | null {
   if (isReadOnlyFactoryRole(role)) return "read-only factory role cannot run a shell or submit changes";
   if (!command.trim()) return "shell command is missing; refusing";

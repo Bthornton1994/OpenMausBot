@@ -10,6 +10,7 @@ import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_p
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { NO_SANDBOX_REASON, detectFactorySandbox } from "./factory-sandbox.ts";
 
 export const REQUIRED_TESTS_PATH = ".omb/required-tests";
 export const REQUIRED_TESTS_TIMEOUT_MS = 10 * 60_000;
@@ -92,33 +93,6 @@ function definitionAt(worktree: string, sha: string): string | null {
   return match ? `${match[1]} ${match[2]}` : null;
 }
 
-/** An OS-level confinement for the check process: it must not be able to read
- * or write host resources outside its assigned workspace. `wrap` rewrites the
- * command so it runs inside that confinement. */
-export interface RequiredTestsSandbox {
-  name: string;
-  wrap(command: string, args: string[], dirs: { workspace: string; scratch: string }): { command: string; args: string[] };
-}
-
-/** No sandbox has been demonstrated on any supported host, so none is
- * returned and required-tests never spawn. A real one must be added here only
- * together with a test that proves the process cannot touch the host outside
- * its workspace. */
-export function detectRequiredTestsSandbox(): RequiredTestsSandbox | null {
-  return testSandbox;
-}
-
-let testSandbox: RequiredTestsSandbox | null = null;
-
-/** Test-only hook so the runner mechanics can be exercised. Refused outside vitest. */
-export function _setRequiredTestsSandboxForTests(sandbox: RequiredTestsSandbox | null): void {
-  if (!process.env.VITEST) throw new Error("test-only");
-  testSandbox = sandbox;
-}
-
-export const NO_SANDBOX_REASON =
-  "blocked: required-tests need an OS sandbox and none is available on this host; the script was not run";
-
 export type RequiredTestsOutcome =
   | { state: "undefined" }
   | { state: "unsandboxed"; reason: string }
@@ -137,7 +111,7 @@ export function runRequiredTestsPinned(
 ): RequiredTestsOutcome {
   const pinned = definitionAt(worktree, baseSha);
   if (!pinned) return { state: "undefined" };
-  const sandbox = detectRequiredTestsSandbox();
+  const sandbox = detectFactorySandbox();
   if (!sandbox) return { state: "unsandboxed", reason: NO_SANDBOX_REASON };
   if (!/^100(644|755) /.test(pinned)) {
     return { state: "modified", reason: "required-tests at the recorded base is not a regular file" };

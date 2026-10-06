@@ -7,19 +7,12 @@ import { execSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import { enforceFactoryTool, symlinkEscapeReason } from "./factory-boundary.ts";
-import {
-  NO_SANDBOX_REASON,
-  _setRequiredTestsSandboxForTests,
-  checkEnvironment,
-  detectRequiredTestsSandbox,
-  runBounded,
-  runRequiredTestsPinned,
-  type RequiredTestsSandbox,
-} from "./factory-checks.ts";
+import { checkEnvironment, runBounded, runRequiredTestsPinned } from "./factory-checks.ts";
+import { NO_SANDBOX_REASON, NO_WRITER_SANDBOX_REASON, detectFactorySandbox, type FactorySandbox } from "./factory-sandbox.ts";
 import {
   IMPLEMENTER_ID,
   completeFactoryTurn,
@@ -31,6 +24,17 @@ import {
   type FactoryBot,
   type FactoryCompletionDeps,
 } from "./factory-dispatch.ts";
+
+// Pass-through stand-in. It confines nothing; it only lets the tests below
+// exercise the runner mechanics. Production code has no way to install one:
+// this replaces the detection module for this test file only.
+const sandbox = vi.hoisted(() => ({ current: null as FactorySandbox | null }));
+vi.mock("./factory-sandbox.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./factory-sandbox.ts")>()),
+  detectFactorySandbox: () => sandbox.current,
+}));
+const PASS_THROUGH: FactorySandbox = { name: "test-pass-through", wrap: (command, args) => ({ command, args }) };
+const setSandbox = (value: FactorySandbox | null) => { sandbox.current = value; };
 
 const B = "\\";
 const HAS_SH = spawnSync("sh", ["-c", "exit 0"]).status === 0;
@@ -94,19 +98,20 @@ describe("boundary: Windows and POSIX path forms", () => {
 });
 
 describe("boundary: links", () => {
-  function plant(wt: string, name: string, target: string): boolean {
+  // A junction (Windows) or directory symlink needs no privilege on a supported
+  // host. If it cannot be made, the test has proved nothing, so it fails.
+  function plant(wt: string, name: string, target: string): void {
     try {
       symlinkSync(target, join(wt, name), process.platform === "win32" ? "junction" : "dir");
-      return true;
-    } catch {
-      return false;
+    } catch (error) {
+      throw new Error(`could not create the test link ${name} -> ${target}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   it("refuses a write that goes through a link that leaves the worktree", () => {
     const wt = tempWorktree();
     const outside = mkdtempSync(join(tmpdir(), "omb-fence-out-"));
-    if (!plant(wt, "escape", outside)) return;
+    plant(wt, "escape", outside);
     const decision = write(wt, join(wt, "escape", "x.txt"));
     expect(decision.allow).toBe(false);
     expect(symlinkEscapeReason(wt, join("escape", "x.txt"))).toMatch(/link/);
@@ -115,7 +120,7 @@ describe("boundary: links", () => {
   it("refuses any link component, even one that points back inside the worktree", () => {
     const wt = tempWorktree();
     mkdirSync(join(wt, "real"));
-    if (!plant(wt, "alias", join(wt, "real"))) return;
+    plant(wt, "alias", join(wt, "real"));
     expect(write(wt, join(wt, "alias", "x.txt")).allow).toBe(false);
     expect(write(wt, join(wt, "real", "x.txt")).allow).toBe(true);
   });
@@ -179,6 +184,19 @@ describe("bounded runner", () => {
     expect(await grandchildSurvivesTimeout(true)).toBe(true);
   });
 
+  // A descendant that inherits the output pipes and outlives the check must not
+  // stall the runner. The parent exits at once; the grandchild holds the pipes
+  // for 15s. The runner has to return at its own timeout, not at EOF.
+  it.skipIf(POSIX)("returns at the timeout when a descendant keeps the output handles open on Windows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-fence-pipe-"));
+    const grandchild = "setTimeout(() => {}, 15000)";
+    const parent = `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'inherit' });`;
+    const started = Date.now();
+    const run = runBounded(process.execPath, ["-e", parent], { cwd: dir, env: checkEnvironment(dir), timeoutMs: 1500 });
+    expect(run.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
   it("hands a check only an allowlisted environment", () => {
     const env = checkEnvironment("/scratch", { PATH: "/bin", OMB_AUTH_TOKEN: "secret", ANTHROPIC_API_KEY: "secret", HOME: "/home/real" });
     expect(env.PATH).toBe("/bin");
@@ -210,14 +228,34 @@ function commitFile(repo: string, name: string, body: string): string {
   return execSync("git rev-parse HEAD", { cwd: repo }).toString().trim();
 }
 
-// Pass-through stand-in. It confines nothing; it only lets the tests below
-// exercise the runner mechanics. It is never a real sandbox and is refused
-// outside vitest.
-const PASS_THROUGH: RequiredTestsSandbox = { name: "test-pass-through", wrap: (command, args) => ({ command, args }) };
+describe("required tests and writers fail closed without an OS sandbox", () => {
+  beforeEach(() => {
+    try { unlinkSync(join(DATA_DIR, "factory-tasks.json")); } catch { /* fresh */ }
+    _resetFactoryDispatch();
+    setSandbox(null);
+  });
 
-describe("required tests fail closed without an OS sandbox", () => {
-  it("has no sandbox by default, because none has been demonstrated", () => {
-    expect(detectRequiredTestsSandbox()).toBeNull();
+  it("has no sandbox in production code, because none has been demonstrated", async () => {
+    const real = await vi.importActual<typeof import("./factory-sandbox.ts")>("./factory-sandbox.ts");
+    expect(real.detectFactorySandbox()).toBeNull();
+    expect(detectFactorySandbox()).toBeNull();
+  });
+
+  it("gives production code no way to install a sandbox, with or without VITEST", async () => {
+    const real = await vi.importActual<Record<string, unknown>>("./factory-sandbox.ts");
+    const checks = await vi.importActual<Record<string, unknown>>("./factory-checks.ts");
+    for (const mod of [real, checks]) {
+      for (const name of Object.keys(mod)) expect(name, name).not.toMatch(/^_?set.*sandbox|ForTests$/i);
+    }
+    const saved = process.env.VITEST;
+    try {
+      for (const value of [saved, undefined]) {
+        if (value === undefined) delete process.env.VITEST; else process.env.VITEST = value;
+        expect((real.detectFactorySandbox as () => unknown)()).toBeNull();
+      }
+    } finally {
+      if (saved !== undefined) process.env.VITEST = saved;
+    }
   });
 
   it("never spawns the base script when no sandbox is available", () => {
@@ -234,21 +272,34 @@ describe("required tests fail closed without an OS sandbox", () => {
     expect(runRequiredTestsPinned(repo, base, head)).toEqual({ state: "undefined" });
   });
 
-  it("refuses to install a test sandbox outside vitest", () => {
-    const saved = process.env.VITEST;
-    delete process.env.VITEST;
-    try {
-      expect(() => _setRequiredTestsSandboxForTests(PASS_THROUGH)).toThrow(/test-only/);
-    } finally {
-      process.env.VITEST = saved;
-    }
-    expect(detectRequiredTestsSandbox()).toBeNull();
+  it("starts no implementer writer when no sandbox is available", async () => {
+    const { repo, base } = repoWithScript(null);
+    const deps = local();
+    const task = createFactoryTask({
+      objective: "Add a harmless line",
+      specialistId: IMPLEMENTER_ID,
+      model: "claude-opus-5-5",
+      permissions: "auto",
+      repo,
+      baseSha: base,
+      acceptance: "README contains fixed",
+      dependencies: [],
+      requiredEvidence: ["commit"],
+      owner: "Bryant Thornton",
+      authority: "fence proof",
+    }, deps).task;
+    let started = 0;
+    await expect(launchFactoryTask(task.id, { start: () => { started += 1; } })).rejects.toThrow(NO_WRITER_SANDBOX_REASON);
+    expect(started).toBe(0);
+    const stored = getFactoryTask(task.id)!;
+    expect(stored.status).toBe("blocked");
+    expect(stored.sessionId).toBeUndefined();
   });
 });
 
 describe.skipIf(!HAS_SH)("base-pinned required tests (runner mechanics under a test stand-in)", () => {
-  beforeEach(() => _setRequiredTestsSandboxForTests(PASS_THROUGH));
-  afterEach(() => _setRequiredTestsSandboxForTests(null));
+  beforeEach(() => setSandbox(PASS_THROUGH));
+  afterEach(() => setSandbox(null));
 
   it("runs the base copy and passes it the head SHA", () => {
     const { repo, base } = repoWithScript("#!/bin/sh\n[ \"$1\" = \"$(git rev-parse HEAD)\" ] || exit 1\ngrep -q fixed README || exit 1\nexit 0\n");
@@ -328,9 +379,9 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
   beforeEach(() => {
     try { unlinkSync(join(DATA_DIR, "factory-tasks.json")); } catch { /* fresh */ }
     _resetFactoryDispatch();
-    _setRequiredTestsSandboxForTests(PASS_THROUGH);
+    setSandbox(PASS_THROUGH);
   });
-  afterEach(() => _setRequiredTestsSandboxForTests(null));
+  afterEach(() => setSandbox(null));
 
   const drifts: [string, string, RegExp][] = [
     ["dirties the worktree", "#!/bin/sh\necho stray > stray.txt\nexit 0\n", /not clean/],
@@ -362,7 +413,7 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
   it("blocks the legacy hadOtherReview seal without spawning the script when no sandbox exists", async () => {
     const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
     const { deps, task, launched, base } = await seatedWriter(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
-    _setRequiredTestsSandboxForTests(null);
+    setSandbox(null);
     withLegacyReview(task.id, base, launched.task.sessionId);
     const done = await completion(launched.task.ombThreadId!, deps);
     expect(done.task?.status).toBe("blocked");
@@ -374,7 +425,7 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
   it("blocks stale-SHA adoption without spawning the script when no sandbox exists", async () => {
     const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
     const { deps, task, launched, base } = await seatedWriter(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
-    _setRequiredTestsSandboxForTests(null);
+    setSandbox(null);
     harvestFactoryTask(task.id, {
       sessionId: launched.task.sessionId,
       worktree: task.worktree,
@@ -406,8 +457,8 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
     });
   }
 
-  it("blocks sealing a HEAD whose committed symlink points outside the tree", async () => {
-    if (!POSIX) return;
+  // File symlinks need privilege on Windows, so this case is an explicit skip there.
+  it.skipIf(!POSIX)("blocks sealing a HEAD whose committed symlink points outside the tree", async () => {
     const { deps, task, launched } = await seatedWriter("#!/bin/sh\nexit 0\n");
     symlinkSync("../../etc", join(task.worktree!, "leak"));
     execSync("git add -A && git commit -m link", { cwd: task.worktree });

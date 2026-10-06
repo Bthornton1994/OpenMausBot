@@ -9,7 +9,9 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { FactorySandbox } from "./factory-sandbox.ts";
 
 import { DATA_DIR } from "./config.ts";
 import { FACTORY_SPECIALISTS, type FactorySpecialistId } from "./factory-boundary.ts";
@@ -186,7 +188,18 @@ async function expectQaOutsideAsync(promise: Promise<unknown>): Promise<void> {
   expect((error as FactoryDispatchError).code).toBe("qa_outside_omb");
 }
 
+// These tests are about dispatch, not confinement. The stand-in confines
+// nothing; it replaces the detection module for this test file only, because
+// production code has no way to install one. Without any sandbox, writers fail
+// closed (see factory-fence.test.ts).
+const sandbox = vi.hoisted(() => ({ current: null as FactorySandbox | null }));
+vi.mock("./factory-sandbox.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./factory-sandbox.ts")>()),
+  detectFactorySandbox: () => sandbox.current,
+}));
+const PASS_THROUGH: FactorySandbox = { name: "test-pass-through", wrap: (command, args) => ({ command, args }) };
 beforeEach(() => {
+  sandbox.current = PASS_THROUGH;
   try { unlinkSync(store()); } catch { /* fresh */ }
   _resetFactoryDispatch();
 });

@@ -16,6 +16,7 @@ import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
 import { REQUIRED_TESTS_PATH, runRequiredTestsPinned } from "./factory-checks.ts";
+import { NO_WRITER_SANDBOX_REASON, detectFactorySandbox } from "./factory-sandbox.ts";
 import {
   FACTORY_ENGINE_MODEL,
   FACTORY_SPECIALISTS,
@@ -649,6 +650,16 @@ export async function launchFactoryTask(id: string, deps: FactoryLaunchDeps): Pr
   }
   if (unavailableFactoryRoles().some((row) => row.specialistId === task.specialistId)) {
     throw new FactoryDispatchError("role_unavailable", "specialist role is unavailable", task);
+  }
+  // The writer's shell can run arbitrary programs, and the command-text guard
+  // cannot confine them. Without a real OS sandbox no writer is started.
+  if (task.role === "implementer" && !detectFactorySandbox()) {
+    const blocked = mutate(id, (row) => {
+      row.status = "blocked";
+      row.blocker = NO_WRITER_SANDBOX_REASON;
+      row.nextAction = "blocked";
+    });
+    throw new FactoryDispatchError("blocked", NO_WRITER_SANDBOX_REASON, blocked);
   }
   const sessionId = randomUUID();
   const intent = mutate(id, (row) => {
