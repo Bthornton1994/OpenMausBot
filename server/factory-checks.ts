@@ -84,17 +84,29 @@ function gitText(worktree: string, args: string[]): { ok: boolean; stdout: strin
   return { ok: result.status === 0, stdout: result.stdout ?? "" };
 }
 
-/** `mode blob` of the definition at a commit, or null when absent. */
-function definitionAt(worktree: string, sha: string): string | null {
+type Definition =
+  | { kind: "absent" }
+  | { kind: "present"; entry: string }
+  | { kind: "unreadable"; reason: string };
+
+/** The definition at a commit as `mode blob`. Only a successful lookup that
+ * lists nothing is "absent"; a failed, malformed or unexpected lookup is
+ * "unreadable" and is never read as "no script". */
+function definitionAt(worktree: string, sha: string): Definition {
   const listed = gitText(worktree, ["ls-tree", sha, "--", REQUIRED_TESTS_PATH]);
-  if (!listed.ok) return null;
-  const line = listed.stdout.split("\n")[0]?.trim() ?? "";
-  const match = line.match(/^(\d{6}) blob ([0-9a-f]{40})\t/);
-  return match ? `${match[1]} ${match[2]}` : null;
+  if (!listed.ok) return { kind: "unreadable", reason: `required-tests could not be looked up at ${sha}` };
+  const lines = listed.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return { kind: "absent" };
+  const match = lines.length === 1 ? lines[0]!.match(/^(\d{6}) blob ([0-9a-f]{40})\t(.*)$/) : null;
+  if (!match || match[3] !== REQUIRED_TESTS_PATH) {
+    return { kind: "unreadable", reason: `required-tests at ${sha} is not a single file entry` };
+  }
+  return { kind: "present", entry: `${match[1]} ${match[2]}` };
 }
 
 export type RequiredTestsOutcome =
   | { state: "undefined" }
+  | { state: "unreadable"; reason: string }
   | { state: "unsandboxed"; reason: string }
   | { state: "modified"; reason: string }
   | { state: "ran"; ok: boolean; reason?: string };
@@ -109,14 +121,18 @@ export function runRequiredTestsPinned(
   headSha: string,
   opts: { timeoutMs?: number } = {},
 ): RequiredTestsOutcome {
-  const pinned = definitionAt(worktree, baseSha);
-  if (!pinned) return { state: "undefined" };
+  const base = definitionAt(worktree, baseSha);
+  if (base.kind === "unreadable") return { state: "unreadable", reason: base.reason };
+  if (base.kind === "absent") return { state: "undefined" };
+  const pinned = base.entry;
   const sandbox = detectFactorySandbox();
   if (!sandbox) return { state: "unsandboxed", reason: NO_SANDBOX_REASON };
   if (!/^100(644|755) /.test(pinned)) {
     return { state: "modified", reason: "required-tests at the recorded base is not a regular file" };
   }
-  if (definitionAt(worktree, headSha) !== pinned) {
+  const head = definitionAt(worktree, headSha);
+  if (head.kind === "unreadable") return { state: "unreadable", reason: head.reason };
+  if (head.kind === "absent" || head.entry !== pinned) {
     return { state: "modified", reason: "required-tests differs from the recorded base; the base copy is the only one OMB runs" };
   }
   const blob = spawnSync("git", ["-C", worktree, "cat-file", "blob", pinned.split(" ")[1]!], { maxBuffer: MAX_OUTPUT_BYTES });

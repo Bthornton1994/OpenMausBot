@@ -272,6 +272,29 @@ describe("required tests and writers fail closed without an OS sandbox", () => {
     expect(runRequiredTestsPinned(repo, base, head)).toEqual({ state: "undefined" });
   });
 
+  it("treats a failed or malformed definition lookup as unreadable, not as no script", () => {
+    setSandbox(PASS_THROUGH);
+    try {
+      const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
+      const { repo, base } = repoWithScript(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+      const head = commitFile(repo, "README", "base\nmore\n");
+      // Failed lookup: the recorded base does not exist, so ls-tree errors.
+      expect(runRequiredTestsPinned(repo, "0".repeat(40), head)).toMatchObject({ state: "unreadable" });
+      // Failed head lookup after a good base lookup.
+      expect(runRequiredTestsPinned(repo, base, "1".repeat(40))).toMatchObject({ state: "unreadable" });
+      // Malformed: the definition path is a directory, not a file entry.
+      const dirRepo = repoWithScript(null);
+      mkdirSync(join(dirRepo.repo, ".omb", "required-tests"), { recursive: true });
+      writeFileSync(join(dirRepo.repo, ".omb", "required-tests", "inner"), "x\n");
+      execSync("git add -A && git commit -m dir", { cwd: dirRepo.repo });
+      const dirBase = execSync("git rev-parse HEAD", { cwd: dirRepo.repo }).toString().trim();
+      expect(runRequiredTestsPinned(dirRepo.repo, dirBase, dirBase)).toMatchObject({ state: "unreadable" });
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      setSandbox(null);
+    }
+  });
+
   it("starts no implementer writer when no sandbox is available", async () => {
     const { repo, base } = repoWithScript(null);
     const deps = local();
@@ -453,6 +476,26 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
     const done = await completion(launched.task.ombThreadId!, deps);
     expect(done.task?.status).toBe("blocked");
     expect(done.task?.blocker).toBe(NO_SANDBOX_REASON);
+    expect(existsSync(marker)).toBe(false);
+    expect(done.task?.resultSha).toBeUndefined();
+    expect(done.task?.revisions?.some((item) => item.kind === "candidate" || item.kind === "implementation")).toBe(false);
+  });
+
+  // Failure injection: the definition lookup fails (the recorded base cannot be
+  // resolved), even with a sandbox present. That is not "no script".
+  it("does not spawn the script or seal when the definition lookup fails", async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
+    const { deps, task, launched, built } = await seatedWriter(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    harvestFactoryTask(task.id, {
+      sessionId: launched.task.sessionId,
+      worktree: task.worktree,
+      resultSha: built,
+      evidence: [{ kind: "commit", ref: built }],
+    });
+    const row = getFactoryTask(task.id)!;
+    row.baseSha = "0".repeat(40);
+    const done = await completion(launched.task.ombThreadId!, deps);
+    expect(done.task?.status).toBe("blocked");
     expect(existsSync(marker)).toBe(false);
     expect(done.task?.resultSha).toBeUndefined();
     expect(done.task?.revisions?.some((item) => item.kind === "candidate" || item.kind === "implementation")).toBe(false);

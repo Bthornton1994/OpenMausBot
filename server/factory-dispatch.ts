@@ -1001,11 +1001,13 @@ function pushRevision(row: FactoryTask, rev: Omit<FactoryRevision, "id" | "creat
 
 /** Runs the base-pinned required-tests for `sha`. The writer's own copy is
  * never executed; one that differs from the recorded base is a failure. */
-function runRequiredTests(row: FactoryTask, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[]; reason?: string; unsandboxed?: true } {
+function runRequiredTests(row: FactoryTask, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[]; reason?: string; refused?: true } {
   if (!row.worktree) return { ran: false, ok: true, checks: [] };
   const outcome = runRequiredTestsPinned(row.worktree, row.baseSha, sha);
   if (outcome.state === "undefined") return { ran: false, ok: true, checks: [] };
-  if (outcome.state === "unsandboxed") return { ran: false, ok: false, checks: [], reason: outcome.reason, unsandboxed: true };
+  // Refused: the script was not run and the seal must not proceed (no sandbox,
+  // or the definition could not be read reliably).
+  if (outcome.state === "unsandboxed" || outcome.state === "unreadable") return { ran: false, ok: false, checks: [], reason: outcome.reason, refused: true };
   const ok = outcome.state === "ran" && outcome.ok;
   const reason = outcome.state === "modified" || (outcome.state === "ran" && !outcome.ok) ? outcome.reason : undefined;
   return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }], ...(reason ? { reason } : {}) };
@@ -1167,7 +1169,7 @@ function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: Factor
   if ((row.revisions ?? []).some((item) => item.kind === "review")) row.generation = (row.generation ?? 1) + 1;
   clearReviewPointers(row, head);
   const tests = runRequiredTests(row, head);
-  if (tests.unsandboxed) {
+  if (tests.refused) {
     blockTask(row, tests.reason!);
     return;
   }
@@ -1250,7 +1252,7 @@ function completeImplementation(row: FactoryTask, input: { resultSha: string; ch
   // Every seal path checks the base definition. With one and no OS sandbox the
   // script is not spawned and the seal is refused; with none, nothing runs.
   const tests = runRequiredTests(row, input.resultSha);
-  if (tests.unsandboxed) {
+  if (tests.refused) {
     blockTask(row, tests.reason!);
     return;
   }
