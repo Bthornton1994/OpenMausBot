@@ -10,11 +10,13 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
+import { REQUIRED_TESTS_PATH, runRequiredTestsPinned } from "./factory-checks.ts";
+import { NO_WRITER_SANDBOX_REASON, detectFactorySandbox } from "./factory-sandbox.ts";
 import {
   FACTORY_ENGINE_MODEL,
   FACTORY_SPECIALISTS,
@@ -514,6 +516,12 @@ function mutate(id: string, change: (task: FactoryTask) => void): FactoryTask {
   return task;
 }
 
+/** No writer is created, launched, or resumed without a real OS sandbox. Every
+ * writer entry point calls this before it touches a worktree, thread, or pin. */
+function requireWriterSandbox(task?: FactoryTask): void {
+  if (!detectFactorySandbox()) throw new FactoryDispatchError("blocked", NO_WRITER_SANDBOX_REASON, task);
+}
+
 export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCreateDeps): { task: FactoryTask; duplicate: boolean } {
   const permissions = parseFactoryPermissions(raw.permissions ?? raw.approvalMode);
   const specialistId = raw.specialistId;
@@ -572,6 +580,8 @@ export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCre
   if (writer) {
     throw new FactoryDispatchError("conflict", `repository already has writer ${writer.id}`, writer);
   }
+  // Before the worktree, the task record, the thread, and the pin.
+  requireWriterSandbox();
   const now = (deps.now ?? Date.now)();
   const id = newId();
   const worktree = join(DATA_DIR, "factory-worktrees", id);
@@ -648,6 +658,16 @@ export async function launchFactoryTask(id: string, deps: FactoryLaunchDeps): Pr
   }
   if (unavailableFactoryRoles().some((row) => row.specialistId === task.specialistId)) {
     throw new FactoryDispatchError("role_unavailable", "specialist role is unavailable", task);
+  }
+  // The writer's shell can run arbitrary programs, and the command-text guard
+  // cannot confine them. Without a real OS sandbox no writer is started.
+  if (task.role === "implementer" && !detectFactorySandbox()) {
+    const blocked = mutate(id, (row) => {
+      row.status = "blocked";
+      row.blocker = NO_WRITER_SANDBOX_REASON;
+      row.nextAction = "blocked";
+    });
+    throw new FactoryDispatchError("blocked", NO_WRITER_SANDBOX_REASON, blocked);
   }
   const sessionId = randomUUID();
   const intent = mutate(id, (row) => {
@@ -849,6 +869,15 @@ export function recoverFactoryTasks(): { restored: string[]; blocked: string[] }
       changed = true;
       continue;
     }
+    if (!detectFactorySandbox()) {
+      // Not resumed. The session, binding, and writer lock stay as stored.
+      task.status = "blocked";
+      task.blocker = NO_WRITER_SANDBOX_REASON;
+      task.nextAction = "blocked";
+      blocked.push(task.id);
+      changed = true;
+      continue;
+    }
     const proven = Boolean(task.sessionId && task.provenSessionId === task.sessionId && worktreeMatches(task));
     if (proven) {
       task.status = "running";
@@ -881,6 +910,9 @@ export function factoryTurnGuard(threadId: string): {
   const role = isFactorySpecialistId(specialistId) ? factoryRole(specialistId) : task.role;
   // No QA or review turn starts on a factory thread, whatever its stored state.
   if (isQaTask(task) || role !== "implementer") throw qaOutside(task);
+  // A stored launch_intent or running task cannot start or resume a turn
+  // either. This only reads: the stored record and session are left alone.
+  requireWriterSandbox();
   if (task.status === "blocked" || task.status === "failed_closed" || task.status === "cancelled") {
     throw new FactoryDispatchError("blocked", task.blocker || "factory task is blocked");
   }
@@ -967,22 +999,24 @@ function pushRevision(row: FactoryTask, rev: Omit<FactoryRevision, "id" | "creat
 }
 
 
-/** A repo-owned check script. POSIX execs it. Windows cannot start a shebang
- * file, so Git's sh runs the same bytes; if sh is missing the spawn fails
- * and the gate stays closed. */
-function runRepoScript(script: string, args: string[], cwd: string): { status: number | null; stdout: string } {
-  const result = process.platform === "win32"
-    ? spawnSync("sh", [script, ...args], { cwd, encoding: "utf8" })
-    : spawnSync(script, args, { cwd, encoding: "utf8" });
-  return { status: result.status, stdout: result.stdout ?? "" };
+/** Runs the base-pinned required-tests for `sha`. The writer's own copy is
+ * never executed; one that differs from the recorded base is a failure. */
+function runRequiredTests(row: FactoryTask, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[]; reason?: string; refused?: true } {
+  if (!row.worktree) return { ran: false, ok: true, checks: [] };
+  const outcome = runRequiredTestsPinned(row.worktree, row.baseSha, sha);
+  if (outcome.state === "undefined") return { ran: false, ok: true, checks: [] };
+  // Refused: the script was not run and the seal must not proceed (no sandbox,
+  // or the definition could not be read reliably).
+  if (outcome.state === "unsandboxed" || outcome.state === "unreadable") return { ran: false, ok: false, checks: [], reason: outcome.reason, refused: true };
+  const ok = outcome.state === "ran" && outcome.ok;
+  const reason = outcome.state === "modified" || (outcome.state === "ran" && !outcome.ok) ? outcome.reason : undefined;
+  return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }], ...(reason ? { reason } : {}) };
 }
 
-function runRequiredTests(worktree: string, sha: string): { ran: boolean; ok: boolean; checks: FactoryCheck[] } {
-  const script = join(worktree, ".omb", "required-tests");
-  if (!worktree || !existsSync(script)) return { ran: false, ok: true, checks: [] };
-  const result = runRepoScript(script, [sha], worktree);
-  const ok = result.status === 0;
-  return { ran: true, ok, checks: [{ name: "required-tests", result: ok ? "pass" : "fail", sha }] };
+/** The pinned definition exists at the recorded base. */
+function requiredTestsDefinedAtBase(row: FactoryTask): boolean {
+  if (!row.worktree || !row.baseSha) return false;
+  return git(["-C", row.worktree, "ls-tree", row.baseSha, "--", REQUIRED_TESTS_PATH]).stdout.trim() !== "";
 }
 
 /** Drops legacy review pointers. Revisions already stored keep their sha. */
@@ -999,6 +1033,47 @@ function clearReviewPointers(row: FactoryTask, sha: string): void {
 function worktreeClean(worktree: string): boolean {
   const status = git(["-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"]);
   return status.ok && status.stdout.trim() === "";
+}
+
+/** Paths of every symlink in the tree at `head`, including links inherited
+ * unchanged from the base, whose target is absolute or climbs out of the tree.
+ * Null when the tree cannot be read. */
+function escapingSymlinks(worktree: string, head: string): string[] | null {
+  const tree = spawnSync("git", ["-C", worktree, "ls-tree", "-r", "-z", "--full-tree", head], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (tree.status !== 0) return null;
+  const escaping: string[] = [];
+  for (const entry of (tree.stdout ?? "").split("\0")) {
+    const meta = entry.match(/^120000 blob ([0-9a-f]+)\t/);
+    if (!meta) continue;
+    const path = entry.slice(entry.indexOf("\t") + 1);
+    const blob = git(["-C", worktree, "cat-file", "blob", meta[1]!]);
+    if (!blob.ok) return null;
+    const target = blob.stdout.replace(/\\/g, "/");
+    const resolved = posix.normalize(posix.join(posix.dirname(path), target));
+    if (/^([A-Za-z]:|\/)/.test(target) || resolved === ".." || resolved.startsWith("../")) escaping.push(path);
+  }
+  return escaping;
+}
+
+/** What must still hold right before a candidate is sealed or the writer lock
+ * is released: HEAD is the SHA being sealed, the worktree is clean, and no
+ * symlink in the sealed tree, inherited or committed, points out of it. */
+function worktreeStateProblem(row: FactoryTask, head: string): string | null {
+  if (!row.worktree) return "blocked: task has no assigned writer";
+  const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
+  if (!current.ok || current.stdout.trim().toLowerCase() !== head.toLowerCase()) return "blocked: HEAD changed while it was being checked";
+  if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean";
+  const links = escapingSymlinks(row.worktree, head);
+  if (links === null) return "blocked: committed symlinks could not be inspected";
+  if (links.length) return `blocked: committed symlink points outside the worktree: ${links[0]}`;
+  return null;
+}
+
+function blockTask(row: FactoryTask, reason: string): void {
+  row.status = "blocked";
+  row.phase = "blocked";
+  row.blocker = reason;
+  row.nextAction = reason;
 }
 
 function descendsFrom(worktree: string, ancestor: string, head: string): boolean {
@@ -1025,10 +1100,7 @@ function writerHeadUncertain(row: FactoryTask, head: string, sessionEnded: boole
   if (!SHA.test(head) || head === row.writerShaAtAssign) return "blocked: HEAD was not produced by the latest assigned writer";
   if (!descendsFrom(row.worktree, row.baseSha, head)) return "blocked: HEAD does not descend from the recorded base";
   if (!descendsFrom(row.worktree, row.writerShaAtAssign, head)) return "blocked: HEAD was not produced by the latest assigned writer";
-  const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
-  if (!current.ok || current.stdout.trim().toLowerCase() !== head) return "blocked: HEAD changed while it was being checked";
-  if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean";
-  return null;
+  return worktreeStateProblem(row, head);
 }
 
 function gitTree(worktree: string, sha: string): string | null {
@@ -1090,17 +1162,23 @@ function finishImplementation(row: FactoryTask, head: string): void {
 }
 
 function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: FactoryEvidence[]): void {
-  const script = join(row.worktree ?? "", ".omb", "required-tests");
-  if (!row.worktree || !existsSync(script)) {
-    row.status = "blocked";
-    row.phase = "blocked";
-    row.blocker = "uncertain: required checks are not present for the verified HEAD";
-    row.nextAction = row.blocker;
+  if (!row.worktree || !requiredTestsDefinedAtBase(row)) {
+    blockTask(row, "uncertain: required checks are not defined at the recorded base");
     return;
   }
   if ((row.revisions ?? []).some((item) => item.kind === "review")) row.generation = (row.generation ?? 1) + 1;
   clearReviewPointers(row, head);
-  const tests = runRequiredTests(row.worktree, head);
+  const tests = runRequiredTests(row, head);
+  if (tests.refused) {
+    blockTask(row, tests.reason!);
+    return;
+  }
+  const drift = worktreeStateProblem(row, head);
+  if (drift) {
+    row.checkResults = [...(row.checkResults ?? []).filter((check) => check.sha === head), ...tests.checks].slice(-100);
+    blockTask(row, `${drift} (after required checks ran; not sealed)`);
+    return;
+  }
   const tree = gitTree(row.worktree, head);
   if (!tree || !row.writerSessionId || !row.implementerId) {
     row.status = "blocked";
@@ -1127,7 +1205,7 @@ function adoptVerifiedCandidate(row: FactoryTask, head: string, evidence: Factor
     row.status = "blocked";
     row.phase = "blocked";
     row.writerLock = "implementer";
-    row.blocker = `required checks failed for ${head}`;
+    row.blocker = `required checks failed for ${head}${tests.reason ? `: ${tests.reason}` : ""}`;
     row.nextAction = row.blocker;
     return;
   }
@@ -1171,11 +1249,23 @@ function completeImplementation(row: FactoryTask, input: { resultSha: string; ch
   } else if (row.reviewSha && row.reviewSha !== input.resultSha) {
     clearReviewPointers(row, input.resultSha);
   }
+  // Every seal path checks the base definition. With one and no OS sandbox the
+  // script is not spawned and the seal is refused; with none, nothing runs.
+  const tests = runRequiredTests(row, input.resultSha);
+  if (tests.refused) {
+    blockTask(row, tests.reason!);
+    return;
+  }
+  const drift = worktreeStateProblem(row, input.resultSha);
+  if (drift) {
+    if (tests.checks.length) row.checkResults = [...(row.checkResults ?? []), ...tests.checks].slice(-100);
+    blockTask(row, tests.ran ? `${drift} (after required checks ran; not sealed)` : `${drift} (not sealed)`);
+    return;
+  }
   if (!persistSealedCandidate(row, input.resultSha, input.evidence)) return;
-  const tests = hadOtherReview ? runRequiredTests(row.worktree ?? "", input.resultSha) : { ran: false, ok: true, checks: [] as FactoryCheck[] };
   row.resultSha = input.resultSha;
   const nextAction = tests.ran && !tests.ok
-    ? `required tests failed for ${input.resultSha}`
+    ? `required tests failed for ${input.resultSha}${tests.reason ? `: ${tests.reason}` : ""}`
     : `implementation sealed at ${input.resultSha}`;
   pushRevision(row, {
     kind: "implementation",
@@ -1293,6 +1383,9 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps, opts?
   if (task.writerLock !== "implementer") {
     throw new FactoryDispatchError("blocked", "the implementer handoff waits until the writer lock transfers", task);
   }
+  // Before the thread, the pin, and any change to the task record. The
+  // handoff stays pending, so a retry works once a sandbox exists.
+  requireWriterSandbox(task);
   const rejectedSessions = new Set((task.revisions ?? []).filter((item) => item.kind === "rejection").map((item) => item.sessionId));
   const snapshot = structuredClone(task);
   const handoffId = pending.id;

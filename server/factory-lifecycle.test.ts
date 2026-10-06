@@ -2,9 +2,10 @@ import { execFileSync, execSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
+import type { FactorySandbox } from "./factory-sandbox.ts";
 import {
   IMPLEMENTER_ID,
   QA_OUTSIDE_OMB,
@@ -66,10 +67,22 @@ function completion(threadId: string, deps: ReturnType<typeof local>, starts: { 
   return completeFactoryTurn(threadId, host);
 }
 
+// These tests are about the lifecycle, not confinement. The stand-in confines
+// nothing; it replaces the detection module for this test file only, because
+// production code has no way to install one. Without any sandbox, writers and
+// required-tests fail closed (see factory-fence.test.ts).
+const sandbox = vi.hoisted(() => ({ current: null as FactorySandbox | null }));
+vi.mock("./factory-sandbox.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./factory-sandbox.ts")>()),
+  detectFactorySandbox: () => sandbox.current,
+}));
+const PASS_THROUGH: FactorySandbox = { name: "test-pass-through", wrap: (command, args) => ({ command, args }) };
 beforeEach(() => {
   try { unlinkSync(join(DATA_DIR, "factory-tasks.json")); } catch { /* fresh */ }
   _resetFactoryDispatch();
+  sandbox.current = PASS_THROUGH;
 });
+afterEach(() => { sandbox.current = null; });
 
 describe("server-owned factory lifecycle", () => {
   it("adopts a clean descendant HEAD only after the writer session ends", async () => {

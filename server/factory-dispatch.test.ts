@@ -2,7 +2,9 @@ import { execSync } from "node:child_process";
 import { mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { FactorySandbox } from "./factory-sandbox.ts";
 
 import { enforceFactoryTool } from "./factory-boundary.ts";
 import { DATA_DIR } from "./config.ts";
@@ -73,7 +75,18 @@ function intake(repo: string, sha: string, specialistId = IMPLEMENTER, extra: Re
   };
 }
 
+// These tests are about dispatch, not confinement. The stand-in confines
+// nothing; it replaces the detection module for this test file only, because
+// production code has no way to install one. Without any sandbox, writers fail
+// closed (see factory-fence.test.ts).
+const sandbox = vi.hoisted(() => ({ current: null as FactorySandbox | null }));
+vi.mock("./factory-sandbox.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./factory-sandbox.ts")>()),
+  detectFactorySandbox: () => sandbox.current,
+}));
+const PASS_THROUGH: FactorySandbox = { name: "test-pass-through", wrap: (command, args) => ({ command, args }) };
 beforeEach(() => {
+  sandbox.current = PASS_THROUGH;
   try { unlinkSync(join(DATA_DIR, "factory-tasks.json")); } catch { /* fresh home */ }
   _resetFactoryDispatch();
 });
@@ -245,7 +258,7 @@ describe("factory recovery and harvest", () => {
 
 describe("reviewer read-only", () => {
   it("denies file writes and shells for reviewers and writes outside the worktree for the implementer", () => {
-    const worktree = "/workspace/factory-smoke/example";
+    const worktree = mkdtempSync(join(tmpdir(), "omb-fence-"));
     expect(enforceFactoryTool({ role: "reviewer", worktree, tool: "Write", input: { file_path: join(worktree, "a.txt") } }).allow).toBe(false);
     expect(enforceFactoryTool({ role: "qa", worktree, tool: "Edit", input: { file_path: join(worktree, "a.txt") } }).allow).toBe(false);
     expect(enforceFactoryTool({ role: "reviewer", worktree, tool: "Bash", input: { command: "git status" } }).allow).toBe(false);
