@@ -275,6 +275,9 @@ describe("required tests and writers fail closed without an OS sandbox", () => {
   it("starts no implementer writer when no sandbox is available", async () => {
     const { repo, base } = repoWithScript(null);
     const deps = local();
+    // Intake itself refuses without a sandbox, so a stored bound task (as a
+    // pre-gate store held one) is built under the stand-in first.
+    setSandbox(PASS_THROUGH);
     const task = createFactoryTask({
       objective: "Add a harmless line",
       specialistId: IMPLEMENTER_ID,
@@ -288,6 +291,7 @@ describe("required tests and writers fail closed without an OS sandbox", () => {
       owner: "Bryant Thornton",
       authority: "fence proof",
     }, deps).task;
+    setSandbox(null);
     let started = 0;
     await expect(launchFactoryTask(task.id, { start: () => { started += 1; } })).rejects.toThrow(NO_WRITER_SANDBOX_REASON);
     expect(started).toBe(0);

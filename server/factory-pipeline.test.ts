@@ -8,16 +8,19 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
-import type { FactorySandbox } from "./factory-sandbox.ts";
+import { NO_WRITER_SANDBOX_REASON, type FactorySandbox } from "./factory-sandbox.ts";
 import {
   FactoryDispatchError,
   IMPLEMENTER_ID,
   completeFactoryTurn,
   createFactoryTask,
   deliverHandoff,
+  factoryTurnGuard,
   getFactoryTask,
   harvestFactoryTask,
   launchFactoryTask,
+  listFactoryTasks,
+  noteFactorySession,
   recoverFactoryTasks,
   shipFactoryTask,
   _resetFactoryDispatch,
@@ -285,5 +288,73 @@ describe("implementation-only pipeline", () => {
     const retry = await deliverHandoff(legacy.task.id, deliverDeps(legacy.local, starts));
     expect(retry.duplicate).toBe(true);
     expect(starts.n).toBe(1);
+  });
+});
+
+describe("with no OS sandbox, no writer is created, launched, or resumed", () => {
+  const worktreesOf = (repo: string) => execSync("git worktree list --porcelain", { cwd: repo }).toString().split("\n").filter((line) => line.startsWith("worktree "));
+
+  it("refuses intake before any worktree, task record, or thread exists", () => {
+    const { repo, sha } = initRepo();
+    const local = deps();
+    sandbox.current = null;
+    expect(() => createFactoryTask(intake(repo, sha), local)).toThrow(NO_WRITER_SANDBOX_REASON);
+    expect(local.threads).toEqual([]);
+    expect(listFactoryTasks()).toEqual([]);
+    expect(worktreesOf(repo)).toHaveLength(1);
+  });
+
+  it("refuses an implementation handoff before a thread, a pin, or any change to the task", async () => {
+    const legacy = await legacyRemediation();
+    const before = JSON.stringify(getFactoryTask(legacy.task.id));
+    const threads = legacy.local.threads.length;
+    const starts = { n: 0 };
+    sandbox.current = null;
+    await expect(deliverHandoff(legacy.task.id, deliverDeps(legacy.local, starts))).rejects.toThrow(NO_WRITER_SANDBOX_REASON);
+    expect(starts.n).toBe(0);
+    expect(legacy.local.threads).toHaveLength(threads);
+    expect(JSON.stringify(getFactoryTask(legacy.task.id))).toBe(before);
+    expect(getFactoryTask(legacy.task.id)?.handoffs?.every((item) => !item.deliveredAt)).toBe(true);
+  });
+
+  it.each(["launch_intent", "running"] as const)("does not start a turn for a stored %s task, and leaves its record alone", async (status) => {
+    const { repo, sha } = initRepo();
+    const local = deps();
+    const task = createFactoryTask(intake(repo, sha), local).task;
+    const launched = await launchFactoryTask(task.id, { start: () => {} });
+    const threadId = launched.task.ombThreadId!;
+    noteFactorySession(threadId, launched.task.sessionId!);
+    rewriteStored(task.id, (row) => { row.status = status; });
+    const before = JSON.stringify(getFactoryTask(task.id));
+
+    // Control: with a sandbox the same stored task is a valid turn.
+    expect(factoryTurnGuard(threadId)?.sessionId).toBe(launched.task.sessionId);
+    sandbox.current = null;
+    expect(() => factoryTurnGuard(threadId)).toThrow(NO_WRITER_SANDBOX_REASON);
+    expect(JSON.stringify(getFactoryTask(task.id))).toBe(before);
+  });
+
+  it("does not restore a proven stored writer to running, and keeps its session and binding", async () => {
+    const { repo, sha } = initRepo();
+    const local = deps();
+    const task = createFactoryTask(intake(repo, sha), local).task;
+    const launched = await launchFactoryTask(task.id, { start: () => {} });
+    noteFactorySession(launched.task.ombThreadId!, launched.task.sessionId!);
+    const stored = getFactoryTask(task.id)!;
+    expect(stored.provenSessionId).toBe(stored.sessionId);
+
+    sandbox.current = null;
+    _resetFactoryDispatch();
+    const result = recoverFactoryTasks();
+    expect(result.restored).toEqual([]);
+    expect(result.blocked).toEqual([task.id]);
+    const after = getFactoryTask(task.id)!;
+    expect(after.status).toBe("blocked");
+    expect(after.blocker).toBe(NO_WRITER_SANDBOX_REASON);
+    expect(after.sessionId).toBe(stored.sessionId);
+    expect(after.provenSessionId).toBe(stored.provenSessionId);
+    expect(after.worktree).toBe(stored.worktree);
+    expect(after.writerLock).toBe("implementer");
+    expect(() => factoryTurnGuard(launched.task.ombThreadId!)).toThrow();
   });
 });

@@ -516,6 +516,12 @@ function mutate(id: string, change: (task: FactoryTask) => void): FactoryTask {
   return task;
 }
 
+/** No writer is created, launched, or resumed without a real OS sandbox. Every
+ * writer entry point calls this before it touches a worktree, thread, or pin. */
+function requireWriterSandbox(task?: FactoryTask): void {
+  if (!detectFactorySandbox()) throw new FactoryDispatchError("blocked", NO_WRITER_SANDBOX_REASON, task);
+}
+
 export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCreateDeps): { task: FactoryTask; duplicate: boolean } {
   const permissions = parseFactoryPermissions(raw.permissions ?? raw.approvalMode);
   const specialistId = raw.specialistId;
@@ -574,6 +580,8 @@ export function createFactoryTask(raw: Record<string, unknown>, deps: FactoryCre
   if (writer) {
     throw new FactoryDispatchError("conflict", `repository already has writer ${writer.id}`, writer);
   }
+  // Before the worktree, the task record, the thread, and the pin.
+  requireWriterSandbox();
   const now = (deps.now ?? Date.now)();
   const id = newId();
   const worktree = join(DATA_DIR, "factory-worktrees", id);
@@ -861,6 +869,15 @@ export function recoverFactoryTasks(): { restored: string[]; blocked: string[] }
       changed = true;
       continue;
     }
+    if (!detectFactorySandbox()) {
+      // Not resumed. The session, binding, and writer lock stay as stored.
+      task.status = "blocked";
+      task.blocker = NO_WRITER_SANDBOX_REASON;
+      task.nextAction = "blocked";
+      blocked.push(task.id);
+      changed = true;
+      continue;
+    }
     const proven = Boolean(task.sessionId && task.provenSessionId === task.sessionId && worktreeMatches(task));
     if (proven) {
       task.status = "running";
@@ -893,6 +910,9 @@ export function factoryTurnGuard(threadId: string): {
   const role = isFactorySpecialistId(specialistId) ? factoryRole(specialistId) : task.role;
   // No QA or review turn starts on a factory thread, whatever its stored state.
   if (isQaTask(task) || role !== "implementer") throw qaOutside(task);
+  // A stored launch_intent or running task cannot start or resume a turn
+  // either. This only reads: the stored record and session are left alone.
+  requireWriterSandbox();
   if (task.status === "blocked" || task.status === "failed_closed" || task.status === "cancelled") {
     throw new FactoryDispatchError("blocked", task.blocker || "factory task is blocked");
   }
@@ -1359,6 +1379,9 @@ export async function deliverHandoff(id: string, deps: FactoryDeliverDeps, opts?
   if (task.writerLock !== "implementer") {
     throw new FactoryDispatchError("blocked", "the implementer handoff waits until the writer lock transfers", task);
   }
+  // Before the thread, the pin, and any change to the task record. The
+  // handoff stays pending, so a retry works once a sandbox exists.
+  requireWriterSandbox(task);
   const rejectedSessions = new Set((task.revisions ?? []).filter((item) => item.kind === "rejection").map((item) => item.sessionId));
   const snapshot = structuredClone(task);
   const handoffId = pending.id;
