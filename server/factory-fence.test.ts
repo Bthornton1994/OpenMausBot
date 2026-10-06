@@ -33,6 +33,22 @@ vi.mock("./factory-sandbox.ts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./factory-sandbox.ts")>()),
   detectFactorySandbox: () => sandbox.current,
 }));
+// Test-only failure injection: while armed, the one `git ls-tree <sha> -- .omb/required-tests`
+// definition lookup fails; every other git call passes through. No production hook exists.
+const lookup = vi.hoisted(() => ({ fail: false, hits: 0 }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawnSync: ((command: string, args?: readonly string[], ...rest: unknown[]) => {
+      if (lookup.fail && command === "git" && args?.includes("ls-tree") && !args.includes("-r") && args.at(-1) === ".omb/required-tests") {
+        lookup.hits += 1;
+        return { status: 128, stdout: "", stderr: "injected lookup failure", pid: 0, output: [], signal: null };
+      }
+      return (actual.spawnSync as (...a: unknown[]) => unknown)(command, args, ...rest);
+    }) as typeof actual.spawnSync,
+  };
+});
 const PASS_THROUGH: FactorySandbox = { name: "test-pass-through", wrap: (command, args) => ({ command, args }) };
 const setSandbox = (value: FactorySandbox | null) => { sandbox.current = value; };
 
@@ -481,24 +497,33 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
     expect(done.task?.revisions?.some((item) => item.kind === "candidate" || item.kind === "implementation")).toBe(false);
   });
 
-  // Failure injection: the definition lookup fails (the recorded base cannot be
-  // resolved), even with a sandbox present. That is not "no script".
-  it("does not spawn the script or seal when the definition lookup fails", async () => {
+  // The base stays a valid ancestor and the worktree is clean, so completion
+  // passes the ancestry and cleanliness checks and reaches the required-tests
+  // check; only the definition lookup fails. No sandbox is installed.
+  it("blocks ordinary completion without spawning the script when only the definition lookup fails", async () => {
     const marker = join(mkdtempSync(join(tmpdir(), "omb-fence-marker-")), "ran").split(B).join("/");
     const { deps, task, launched, built } = await seatedWriter(`#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    setSandbox(null);
     harvestFactoryTask(task.id, {
       sessionId: launched.task.sessionId,
       worktree: task.worktree,
       resultSha: built,
       evidence: [{ kind: "commit", ref: built }],
     });
-    const row = getFactoryTask(task.id)!;
-    row.baseSha = "0".repeat(40);
-    const done = await completion(launched.task.ombThreadId!, deps);
-    expect(done.task?.status).toBe("blocked");
-    expect(existsSync(marker)).toBe(false);
-    expect(done.task?.resultSha).toBeUndefined();
-    expect(done.task?.revisions?.some((item) => item.kind === "candidate" || item.kind === "implementation")).toBe(false);
+    lookup.hits = 0;
+    lookup.fail = true;
+    try {
+      const done = await completion(launched.task.ombThreadId!, deps);
+      expect(lookup.hits).toBeGreaterThan(0);
+      expect(done.task?.status).toBe("blocked");
+      expect(done.task?.blocker).toMatch(/could not be looked up/);
+      expect(done.task?.blocker).not.toBe(NO_SANDBOX_REASON);
+      expect(existsSync(marker)).toBe(false);
+      expect(done.task?.resultSha).toBeUndefined();
+      expect(done.task?.revisions?.some((item) => item.kind === "candidate" || item.kind === "implementation")).toBe(false);
+    } finally {
+      lookup.fail = false;
+    }
   });
 
   it("still seals on ordinary completion without a sandbox when the base defines no required-tests", async () => {
