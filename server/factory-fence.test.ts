@@ -358,8 +358,20 @@ function completion(threadId: string, deps: ReturnType<typeof local>) {
   return completeFactoryTurn(threadId, host);
 }
 
-async function seatedWriter(script: string) {
-  const { repo, base } = repoWithScript(script);
+/** Commits a symlink entry with git plumbing, so it needs no filesystem
+ * symlink privilege, then restores it in the working tree. */
+function commitLink(repo: string, name: string, target: string): string {
+  const blob = execSync("git hash-object -w --stdin", { cwd: repo, input: target }).toString().trim();
+  execSync(`git update-index --add --cacheinfo 120000,${blob},${name}`, { cwd: repo });
+  execSync("git commit -m link", { cwd: repo });
+  execSync(`git checkout -- ${name}`, { cwd: repo });
+  return execSync("git rev-parse HEAD", { cwd: repo }).toString().trim();
+}
+
+async function seatedWriter(script: string, inheritedLink?: { name: string; target: string }) {
+  const repoBase = repoWithScript(script);
+  const repo = repoBase.repo;
+  const base = inheritedLink ? commitLink(repo, inheritedLink.name, inheritedLink.target) : repoBase.base;
   const deps = local();
   const task = createFactoryTask({
     objective: "Add a harmless line",
@@ -477,5 +489,32 @@ describe.skipIf(!HAS_SH)("recheck after required tests", () => {
     expect(done.task?.status).toBe("blocked");
     expect(done.task?.blocker).toMatch(/symlink points outside/);
     expect(done.task?.revisions?.some((item) => item.kind === "candidate")).toBe(false);
+  });
+
+  // The link is already in the base and the writer never touches it, so a scan
+  // of only the changed paths would not see it.
+  async function sealWithInheritedLink(target: string) {
+    const { deps, task, launched, built } = await seatedWriter("#!/bin/sh\nexit 0\n", { name: "inherited-link", target });
+    harvestFactoryTask(task.id, {
+      sessionId: launched.task.sessionId,
+      worktree: task.worktree,
+      resultSha: built,
+      evidence: [{ kind: "commit", ref: built }],
+    });
+    return completion(launched.task.ombThreadId!, deps);
+  }
+
+  for (const target of ["../../etc", "/etc/passwd", "C:/outside/f.txt", "sub/../../up"]) {
+    it(`blocks sealing a HEAD that inherits an escaping link to ${target} from the base`, async () => {
+      const done = await sealWithInheritedLink(target);
+      expect(done.task?.status).toBe("blocked");
+      expect(done.task?.blocker).toMatch(/symlink points outside the worktree: inherited-link/);
+      expect(done.task?.revisions?.some((item) => item.kind === "candidate")).toBe(false);
+    });
+  }
+
+  it("does not block on an inherited link whose target stays inside the tree", async () => {
+    const done = await sealWithInheritedLink("README");
+    expect(done.task?.blocker ?? "").not.toMatch(/symlink/);
   });
 });

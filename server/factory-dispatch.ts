@@ -1033,18 +1033,18 @@ function worktreeClean(worktree: string): boolean {
   return status.ok && status.stdout.trim() === "";
 }
 
-/** Paths of symlinks the writer added or changed since the base whose target
- * is absolute or climbs out of the tree. Null when the diff cannot be read. */
-function escapingSymlinks(worktree: string, baseSha: string, head: string): string[] | null {
-  const diff = spawnSync("git", ["-C", worktree, "diff", "--raw", "--no-abbrev", "--no-renames", "-z", baseSha, head], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  if (diff.status !== 0) return null;
-  const fields = (diff.stdout ?? "").split("\0");
+/** Paths of every symlink in the tree at `head`, including links inherited
+ * unchanged from the base, whose target is absolute or climbs out of the tree.
+ * Null when the tree cannot be read. */
+function escapingSymlinks(worktree: string, head: string): string[] | null {
+  const tree = spawnSync("git", ["-C", worktree, "ls-tree", "-r", "-z", "--full-tree", head], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  if (tree.status !== 0) return null;
   const escaping: string[] = [];
-  for (let i = 0; i + 1 < fields.length; i += 2) {
-    const meta = fields[i]!.match(/^:\d{6} (\d{6}) [0-9a-f]+ ([0-9a-f]+) /);
-    if (!meta || meta[1] !== "120000") continue;
-    const path = fields[i + 1]!;
-    const blob = git(["-C", worktree, "cat-file", "blob", meta[2]!]);
+  for (const entry of (tree.stdout ?? "").split("\0")) {
+    const meta = entry.match(/^120000 blob ([0-9a-f]+)\t/);
+    if (!meta) continue;
+    const path = entry.slice(entry.indexOf("\t") + 1);
+    const blob = git(["-C", worktree, "cat-file", "blob", meta[1]!]);
     if (!blob.ok) return null;
     const target = blob.stdout.replace(/\\/g, "/");
     const resolved = posix.normalize(posix.join(posix.dirname(path), target));
@@ -1055,13 +1055,13 @@ function escapingSymlinks(worktree: string, baseSha: string, head: string): stri
 
 /** What must still hold right before a candidate is sealed or the writer lock
  * is released: HEAD is the SHA being sealed, the worktree is clean, and no
- * symlink the writer committed points out of the tree. */
+ * symlink in the sealed tree, inherited or committed, points out of it. */
 function worktreeStateProblem(row: FactoryTask, head: string): string | null {
   if (!row.worktree) return "blocked: task has no assigned writer";
   const current = git(["-C", row.worktree, "rev-parse", "HEAD"]);
   if (!current.ok || current.stdout.trim().toLowerCase() !== head.toLowerCase()) return "blocked: HEAD changed while it was being checked";
   if (!worktreeClean(row.worktree)) return "blocked: worktree is not clean";
-  const links = escapingSymlinks(row.worktree, row.baseSha, head);
+  const links = escapingSymlinks(row.worktree, head);
   if (links === null) return "blocked: committed symlinks could not be inspected";
   if (links.length) return `blocked: committed symlink points outside the worktree: ${links[0]}`;
   return null;
