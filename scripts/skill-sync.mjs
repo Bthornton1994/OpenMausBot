@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Generates provenance-tracked host adapters of a shared skill into another
 // repository. The canonical skill lives in standards/shared-skills/<name>/ and
 // is never edited in a target repo: a target copy is an adapter, stamped with
