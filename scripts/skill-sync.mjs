@@ -100,7 +100,7 @@ function classifyAdapter(adapterDir, canonical) {
   return { status: "STALE", detail: `generated from ${prov.version ?? "?"} (${String(prov.canonicalSha256).slice(0, 12)}), canonical is ${canonical.contentSha256.slice(0, 12)}` };
 }
 
-function writeAdapter(adapterDir, canonical, canonicalPath, host, version, sourceRef) {
+function writeAdapter(adapterDir, canonical, canonicalPath, version, sourceRef) {
   fs.rmSync(adapterDir, { recursive: true, force: true });
   for (const rel of Object.keys(canonical.files)) {
     const dest = path.join(adapterDir, rel);
@@ -113,7 +113,6 @@ function writeAdapter(adapterDir, canonical, canonicalPath, host, version, sourc
     version,
     canonicalSha256: canonical.contentSha256,
     source: { repo: SOURCE_REPO, path: `standards/shared-skills/${SKILL_NAME}`, ref: sourceRef },
-    host,
     files: canonical.files,
     notice: "Generated adapter. Do not edit; change the canonical skill and re-run skill-sync.",
   };
@@ -151,7 +150,7 @@ export function syncSkill({ target, hosts, apply = false, updateStale = false, s
     const result = { host, path: rel, ...classifyAdapter(adapterDir, canonical) };
     const writes = result.status === "CREATE" || (result.status === "STALE" && updateStale);
     if (apply && writes) {
-      writeAdapter(adapterDir, canonical, canonicalPath, host, version, sourceRef);
+      writeAdapter(adapterDir, canonical, canonicalPath, version, sourceRef);
       result.written = true;
     }
     report.adapters.push(result);

@@ -15,7 +15,7 @@ node scripts/skill-sync.mjs --check-source                                      
 ```
 
 - Hosts default to the skill folders the target already has (`.agents/skills`, `.claude/skills`, `.grok/skills`, `.cursor/skills`). Pass `--hosts` to choose.
-- Each adapter gets `PROVENANCE.json` (skill, version, canonical content hash, source repo/ref, per-file hashes).
+- Each adapter gets `PROVENANCE.json` (skill, version, canonical content hash, source repo/ref, per-file hashes). It is identical across hosts, so mirrored copies compare equal.
 - No clobber: an existing folder without `PROVENANCE.json` is a COLLISION, and a copy edited after generation is MODIFIED. Neither is touched. An older generated copy is STALE and is replaced only with `--update-stale`. Re-running with nothing changed writes nothing.
 - Copies of the skill in host folders that were not selected are listed as UNMANAGED and left alone.
 - A short pointer block is appended to the target's `AGENTS.md`, outside any managed policy block. It is skipped when the repository has no `AGENTS.md`.

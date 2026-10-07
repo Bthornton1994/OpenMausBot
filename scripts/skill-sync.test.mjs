@@ -37,7 +37,9 @@ describe("skill-sync", () => {
     syncSkill({ target: dir, apply: true, sourceRef: "abc123" });
     const prov = JSON.parse(fs.readFileSync(path.join(dir, ".claude/skills/product-discovery-build/PROVENANCE.json"), "utf8"));
     expect(prov.source.ref).toBe("abc123");
-    expect(prov.host).toBe("claude");
+    expect(prov.host).toBeUndefined();
+    const agentsProv = fs.readFileSync(path.join(dir, ".agents/skills/product-discovery-build/PROVENANCE.json"), "utf8");
+    expect(agentsProv).toBe(fs.readFileSync(path.join(dir, ".claude/skills/product-discovery-build/PROVENANCE.json"), "utf8"));
     const before = fs.readFileSync(path.join(dir, "AGENTS.md"), "utf8");
     expect(before).toContain(POINTER_BODY);
     const second = syncSkill({ target: dir, apply: true, sourceRef: "abc123" });
