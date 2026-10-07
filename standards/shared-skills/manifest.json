@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "skills": {
+    "product-discovery-build": {
+      "version": "1.0.0",
+      "origin": "Codex 'Product Discovery & Build' skill, supplied as product-discovery-build.zip",
+      "originArchiveSha256": "5C20634958C6F20ED00A8AF94367C3F294ACC59C1A2660D9EA9276F3A8A3C22E",
+      "changesFromOrigin": "Four typographic double quotes (U+201C/U+201D) in SKILL.md and references/host-adapters.md replaced with ASCII quotes. The archive bytes are valid UTF-8; the mojibake seen when it was read is a console decoding artifact, so no byte repair was needed.",
+      "contentSha256": "13c9bbb591040a900373539413c82334f294b8ffcab6a7855cedd96d4b077d24"
+    }
+  }
+}
