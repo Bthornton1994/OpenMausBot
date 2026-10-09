@@ -6,7 +6,16 @@
       "origin": "Codex 'Product Discovery & Build' skill, supplied as product-discovery-build.zip",
       "originArchiveSha256": "5C20634958C6F20ED00A8AF94367C3F294ACC59C1A2660D9EA9276F3A8A3C22E",
       "changesFromOrigin": "Four typographic double quotes (U+201C/U+201D) in SKILL.md and references/host-adapters.md replaced with ASCII quotes. The archive bytes are valid UTF-8; the mojibake seen when it was read is a console decoding artifact, so no byte repair was needed.",
-      "contentSha256": "13c9bbb591040a900373539413c82334f294b8ffcab6a7855cedd96d4b077d24"
+      "contentSha256": "13c9bbb591040a900373539413c82334f294b8ffcab6a7855cedd96d4b077d24",
+      "pointer": "## Product Discovery & Build\n\nFor new products and substantial user-facing work, use the `product-discovery-build` workflow. Read the repository-local skill (a generated adapter under this repository's `.agents/skills/`, `.claude/skills/` or `.grok/skills/` folder, where present) before implementation; the canonical source is `Bthornton1994/OpenMausBot` `standards/shared-skills/product-discovery-build/`. Follow this repository's vision, design authority, architecture, privacy, security, and release gates; the workflow does not override them. For narrow maintenance work, use the smallest relevant parts. If the skill is unavailable, use the task's explicit research, design, acceptance, and verification brief and report the missing adapter. This workflow is guidance, not permission enforcement."
+    },
+    "universal-pre-launch-gate": {
+      "version": "1.0.0",
+      "origin": "CoS draft 'Universal Pre-Launch Gate' skill folder (SKILL.md, references/, agents/openai.yaml), supplied 2026-10-08; not an archive",
+      "originContentSha256": "7ef7162f261f7e12a4267c1b4f911ed8347cf22893e55c5ef34dd6ccf9e99220",
+      "changesFromOrigin": "references/host-adapters.md: dropped 'as of this draft' wording and named scripts/skill-sync.mjs as the adapter generator; host loader evidence left UNKNOWN for every host. SKILL.md: 'Minimise' spelled 'Minimize'. references/platform-modules.md: platform-dependent check list ordered numerically. No check, tier, status rule, or UNKNOWN label was removed or weakened.",
+      "contentSha256": "4c9cdceaab1c145ab9f188e1875dc95b86e4d3bf5260531bec878c235df6ab47",
+      "pointer": "## Universal Pre-Launch Gate\n\nBefore an owner release decision, use the `universal-pre-launch-gate` skill to audit the exact release-candidate SHA against its 20-check, evidence-based gate. Read the repository-local skill (a generated adapter under this repository's `.agents/skills/`, `.claude/skills/` or `.grok/skills/` folder, where present); the canonical source is `Bthornton1994/OpenMausBot` `standards/shared-skills/universal-pre-launch-gate/`. This repository's own release, security, and privacy gates apply and win where stricter. The gate reports READY FOR OWNER RELEASE DECISION, NOT READY, or BLOCKED; it never grants permission to merge, deploy, spend, or launch. If the skill is unavailable, report the missing adapter. This workflow is guidance, not permission enforcement."
     }
   }
 }

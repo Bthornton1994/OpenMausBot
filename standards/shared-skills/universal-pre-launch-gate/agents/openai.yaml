@@ -1,0 +1,7 @@
+interface:
+  display_name: Universal Pre-Launch Gate
+  short_description: Audit a release candidate against a 20-check launch gate
+  default_prompt: Use $universal-pre-launch-gate to audit this release candidate and
+    report READY FOR OWNER RELEASE DECISION, NOT READY, or BLOCKED with evidence.
+policy:
+  allow_implicit_invocation: false
