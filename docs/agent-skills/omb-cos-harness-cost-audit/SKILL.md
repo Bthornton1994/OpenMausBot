@@ -30,11 +30,11 @@ Mark every item Verified, Inferred, or Unknown, with its source:
 | Quality | Existing representative evaluation, success criteria, safety checks, and the owner-approved no-regression bar |
 | Authority | Owner, permitted files and actions, spend limit, and review gates |
 
-If a required item is Unknown, keep the work read-only. Gather evidence or return a precise collection plan. Do not invent prices, task success, quality thresholds, or authorization.
+If a required item is Unknown, keep the work read-only. Gather evidence or return a precise collection plan. Do not invent prices, task success, quality thresholds, or authorization. Do not issue new provider requests, enable a live flag, install a tool, or incur spend to establish a baseline. A new paid evaluation requires explicit owner approval with a cost ceiling and data-handling plan.
 
 ## Measure tasks, not requests
 
-For every task, sum cached input, uncached input, and output usage across all requests, retries, and rework until completion. Report failed and abandoned task costs too.
+For every task, sum cached input, uncached input, and output usage across all requests, retries, and rework until completion. Collect only minimal aggregate usage counters; do not persist raw prompts or task content. Report failed and abandoned task costs too.
 
 For a cohort, report total spend across all attempted tasks divided by the number of completed tasks, alongside completion rate and the distribution per completed task. This makes failed attempts visible instead of hiding their cost. Use observed token counters and a dated price source. Label proxies and estimates explicitly; do not call them account-verified cost.
 

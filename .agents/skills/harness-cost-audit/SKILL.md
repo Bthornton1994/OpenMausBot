@@ -19,11 +19,11 @@ Build an evidence table with Verified, Inferred, or Unknown for:
 - Representative quality evaluation, success criteria, safety checks, and owner-approved no-regression threshold.
 - Owner, allowed files/actions, spend limit, and review gates.
 
-If any required evidence or gate is Unknown, do not edit. Return a read-only findings report and the smallest evidence-gathering plan. Do not invent rates, quality thresholds, or permissions.
+If any required evidence or gate is Unknown, do not edit. Return a read-only findings report and the smallest evidence-gathering plan. Do not invent rates, quality thresholds, or permissions. Do not issue new provider requests, enable a live flag, install a tool, or incur spend to establish a baseline. A new paid evaluation requires explicit owner approval with a cost ceiling and data-handling plan.
 
 ## Compute task-level cost
 
-Sum cached input, uncached input, and output tokens over all requests, retries, and rework for each task. Include every attempted task’s cost in cohort spend, including failed or abandoned work. Report cohort spend divided by completed tasks, completion rate, and per-task cost distribution. Mark estimated or proxy figures clearly; use no fabricated invoice certainty.
+Sum cached input, uncached input, and output tokens over all requests, retries, and rework for each task. Collect only minimal aggregate usage counters; do not persist raw prompts or task content. Include every attempted task’s cost in cohort spend, including failed or abandoned work. Report cohort spend divided by completed tasks, completion rate, and per-task cost distribution. Mark estimated or proxy figures clearly; use no fabricated invoice certainty.
 
 Compare baseline and candidate using the same fixed task set and the existing quality evaluation. Include correctness, completion rate, safety and authority regressions, and task-specific quality. Without a valid evaluation and agreed quality bar, stop before any change.
 
