@@ -32,6 +32,10 @@ Mark every item Verified, Inferred, or Unknown, with its source:
 
 If a required item is Unknown, keep the work read-only. Gather evidence or return a precise collection plan. Do not invent prices, task success, quality thresholds, or authorization. Do not issue new provider requests, enable a live flag, install a tool, or incur spend to establish a baseline. A new paid evaluation requires explicit owner approval with a cost ceiling and data-handling plan.
 
+## Frame the outcome before dispatch
+
+Include a bounded outcome beyond the immediate token-edit request. Ask the implementer to identify the rawest approved evidence and the real domain methods/tools needed to work at practitioner depth, then name the existing independent evaluation or outside signal that will judge the result. Add another discipline only when it contributes a distinct, relevant check; do not request role-play or extra agents for appearance. Keep access, tools, spend, and authority within existing approvals. If the evidence, tools, or independent judge is Unknown, keep the work read-only and do not dispatch implementation.
+
 ## Measure tasks, not requests
 
 For every task, sum cached input, uncached input, and output usage across all requests, retries, and rework until completion. Collect only minimal aggregate usage counters; do not persist raw prompts or task content. Report failed and abandoned task costs too.
