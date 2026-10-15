@@ -23,6 +23,17 @@ Record each fact as Verified, Inferred, or Unknown, with evidence:
 
 If a required fact is Unknown, do a read-only inventory and return a collection plan. Do not edit prompts, tool schemas, routing, or static context. Do not make up pricing, quality thresholds, or permission. Do not issue new provider requests, enable a live flag, install a tool, or incur spend to establish a baseline. A new paid evaluation requires explicit owner approval with a cost ceiling and data-handling plan.
 
+### Frame the outcome and evidence
+
+Before proposing a savings change:
+
+- State the bounded task outcome behind the request. Optimize cost per completion only within that outcome and the authorized scope.
+- Identify the rawest approved evidence and real domain methods/tools a capable practitioner would use. Verify that data and tools are available and authorized; do not substitute persona role-play for method.
+- Name the accepted independent evaluation or external signal that can reject a wrong or lower-quality result. A model or implementer self-score is not enough.
+- Add another discipline only when it contributes a distinct method or check relevant to the outcome; do not add decorative roles or extra agents by default.
+
+If the evidence, approved tools, or outside judge is Unknown, keep the work read-only. Do not obtain it through new provider requests, installs, access, or spend. Freeze the task set and evaluation before measuring.
+
 ## 3. Measure task cost and quality
 
 Sum cached input, uncached input, and output tokens across all requests, retries, and rework for each task. Collect only minimal aggregate usage counters; do not persist raw prompts or task content. Include failed and abandoned task spend in the cohort total. Report total cohort spend divided by completed tasks, completion rate, and per-task distribution. Label estimates and proxies; never present them as invoice-verified.
