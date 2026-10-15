@@ -189,6 +189,7 @@ export function grokAcceptsUnadvertisedImages(init: unknown): boolean {
 const support: AcpSupport = {
   driverKind: "grokAgent",
   displayName: "Grok",
+  readOnlyReview: true,
   images: true,
   acceptsUnadvertisedImages: grokAcceptsUnadvertisedImages,
   models: STATIC_GROK_MODELS,

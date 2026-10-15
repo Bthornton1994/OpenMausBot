@@ -118,6 +118,10 @@ export interface SendTurnInput {
   /** Per-bot approval policy, reasserted by providers on every turn so a
    * resumed native session cannot retain a stale, more permissive mode. */
   approvalMode?: ApprovalMode;
+  /** A strategic CoS review is a read-only provider turn: native tools may
+   * inspect project files, but writes, shell commands, MCP integrations, and
+   * approval escalation are unavailable until the person selects an option. */
+  toolPolicy?: "read-only";
   /** A guest drives this turn on an OMB Cloud home: it runs with no shell
    * or command execution and reads nothing outside its own folder. Sent
    * only to a driver whose capabilities.guestTurns is "confined"; the harness
@@ -265,6 +269,9 @@ export interface ProviderAdapter {
   readonly provider: DriverKind;
   readonly capabilities: {
     sessionModelSwitch: "in-session" | "unsupported";
+    /** This driver enforces SendTurnInput.toolPolicy="read-only" at its
+     * provider boundary, including native tools and configured MCP servers. */
+    readOnlyReview?: boolean;
     /** True when the driver mounts turn.integrations.agents as MCP tools —
      * the harness only offers agents tooling (and prompts about it) to
      * drivers that can actually hand it to the agent. */

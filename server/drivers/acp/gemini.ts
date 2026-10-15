@@ -76,7 +76,8 @@ export function geminiIsAuthenticated(env: Record<string, string | undefined>): 
 /** Gemini CLI's approval modes, passed through: `--approval-mode auto_edit`
  * approves file edits, `--yolo` approves everything; Gemini has no
  * automatic reviewer, so Auto stays Ask. Ask sends nothing. */
-export function geminiApprovalArgs(fullAuto: boolean, approvalMode: string | undefined): string[] {
+export function geminiApprovalArgs(fullAuto: boolean, approvalMode: string | undefined, readOnlyReview = false): string[] {
+  if (readOnlyReview) return ["--approval-mode", "default"];
   if (fullAuto) return ["--yolo"];
   if (approvalMode === "edits") return ["--approval-mode", "auto_edit"];
   return [];
@@ -85,6 +86,7 @@ export function geminiApprovalArgs(fullAuto: boolean, approvalMode: string | und
 const support: AcpSupport = {
   driverKind: "geminiAgent",
   displayName: "Gemini",
+  readOnlyReview: true,
   models: {
     default: "gemini-2.5-pro",
     options: [
@@ -99,7 +101,7 @@ const support: AcpSupport = {
 
   // --acp is the stable Gemini CLI surface. --experimental-acp remains an
   // alias for older releases, but using it now emits a deprecation warning.
-  spawnArgs: (config, turn) => ["--acp", ...geminiApprovalArgs(config.fullAuto, turn.approvalMode), ...(turn.model ? ["-m", turn.model] : [])],
+  spawnArgs: (config, turn) => ["--acp", ...geminiApprovalArgs(config.fullAuto, turn.approvalMode, turn.toolPolicy === "read-only"), ...(turn.model ? ["-m", turn.model] : [])],
   credentialEnv: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
 
   pickAuthMethod: (methods) => {

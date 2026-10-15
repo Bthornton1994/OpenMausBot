@@ -121,6 +121,37 @@ with an available engine; it does not claim a browser navigation or a real
 provider response. Only server names and bounded fixture messages were retained,
 not the capability tokens in the raw MCP configuration.
 
+## Ambition Review hold
+
+An eligible Chief of Staff request is dispatched with a read-only provider
+surface while the user chooses Altitude, Depth, or Range. The isolated fixture
+checks the exact Claude CLI arguments and system prompt for a project-scale
+request. Provider-specific unit tests cover other verified read-only adapters,
+and gate tests cover pending-state persistence and explicit selection.
+
+```sh
+pnpm exec vitest run server/ambition-review-gate.e2e.test.ts server/ambition-review-gate.test.ts
+pnpm exec vitest run server/drivers/codex.test.ts server/drivers/claude.test.ts server/drivers/pi.test.ts server/drivers/openai-chat-tools.test.ts -t 'Ambition Review|read-only hold|read-only turn' --maxWorkers=1
+pnpm exec vitest run server/drivers/acp/approval-matrix.test.ts -t 'read-only hold|user-configured ACP' --maxWorkers=1
+```
+
+The fixture creates its own bot, marks it as Chief of Staff, sends an
+architecture and migration request through `control:omb`, waits for settlement,
+and checks that the captured CLI runs in restricted/default permission mode
+with only read tools and no MCP configuration. It removes its temporary server
+data and retains bounded command and provider evidence beside the fixture log.
+
+### Last exercised
+
+2026-10-15, isolated control-omb fixture with fake Claude Code 2.1.284. The
+project-scale Chief request settled, and the captured provider invocation used
+restricted/default mode with only `Read,Grep,Glob` and no MCP config. The fixture
+removed its temporary server data. This does not exercise a real provider model.
+
+The separate room-management fixture was launched but did not reach its room
+assertions in this environment: its Ask-mode Claude setup failed to open the
+fixture's Unix permission socket (`listen EPERM`).
+
 ## Queued follow-up recovery
 
 Accepted bot and channel follow-ups are committed to the transcript database

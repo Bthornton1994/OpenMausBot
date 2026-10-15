@@ -216,6 +216,7 @@ const MODELS = {
 const support: AcpSupport = {
   driverKind: "droidAgent",
   displayName: "Droid",
+  readOnlyReview: true,
   models: MODELS,
   defaultCli: "droid",
   nativeSource: "droid.acp",

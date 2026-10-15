@@ -37,8 +37,11 @@ it("creates and manages an own-section room through the mounted Chief MCP proxy"
     }
     const [chief, peer, second, foreign] = bots;
     await api("PATCH", `/api/bots/${chief.id}`, { chiefOfStaff: true });
-    await control(["send", "--bot", chief.id, "--text", "Set up a small room for the team."]);
+    await control(["send", "--bot", chief.id, "--text", "What is your role in one sentence?"]);
     await expect.poll(() => existsSync(fixture.fixtureDumpPath), { timeout: 15_000 }).toBe(true);
+    const firstTurn = JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")) as { systemPrompt?: string };
+    expect(firstTurn.systemPrompt).toContain("For strategic, ambiguous, repeated, or multi-step project work");
+    expect(firstTurn.systemPrompt).toContain("Then stop and wait for the user's selection.");
     const { mcpConfig } = z.object({ mcpConfig: z.object({ mcpServers: z.object({
       agents: z.object({ command: z.string(), args: z.array(z.string()), env: z.record(z.string(), z.string()) }),
     }) }) }).parse(JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")));

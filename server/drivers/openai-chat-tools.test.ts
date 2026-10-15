@@ -326,6 +326,20 @@ describe("OpenAI-compatible computer images", () => {
 });
 
 describe.each<Provider>(["openai-compat", "grok", "minimax"])("%s structured tool contract", (provider) => {
+  it("does not mount or execute configured MCP integrations during a read-only hold", async () => {
+    const f = await fixture((body, response, round) => {
+      if (round === 1) {
+        expect(body.tools?.map((tool) => tool.function.name)).toEqual(["ask_user"]);
+        sse(response, [chunk({ tool_calls: [toolCall("audit_write")] }, "tool_calls")]);
+      } else answer(response, "No operation was performed.");
+    }, provider);
+    await f.start({ approvalMode: "full", toolPolicy: "read-only" });
+    expect(await f.completed()).toMatchObject({ ok: false });
+    expect(f.effects()).toEqual([]);
+    expect(existsSync(join(f.directory, "pid"))).toBe(false);
+    expect(f.requests).toHaveLength(2);
+  });
+
   it("handles content:null tool calls when a compatible endpoint returns a JSON completion", async () => {
     const f = await fixture((_body, response, round) => {
       response.setHeader("content-type", "application/json");

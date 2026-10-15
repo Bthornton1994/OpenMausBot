@@ -198,7 +198,8 @@ export function resolveQwenTurnModel(model: string | undefined, env: Record<stri
  * ones, and `--yolo` approves everything. Ask sends nothing, so an older
  * CLI without the flag keeps working at the level it always had; the ACP
  * client still answers residual permission asks itself under Full. */
-export function qwenApprovalArgs(fullAuto: boolean, approvalMode: string | undefined): string[] {
+export function qwenApprovalArgs(fullAuto: boolean, approvalMode: string | undefined, readOnlyReview = false): string[] {
+  if (readOnlyReview) return ["--approval-mode", "default"];
   if (fullAuto) return ["--yolo"];
   if (approvalMode === "auto") return ["--approval-mode", "auto"];
   if (approvalMode === "edits") return ["--approval-mode", "auto-edit"];
@@ -208,6 +209,7 @@ export function qwenApprovalArgs(fullAuto: boolean, approvalMode: string | undef
 const support: AcpSupport = {
   driverKind: "qwenAgent",
   displayName: "Qwen",
+  readOnlyReview: true,
   access: "custom",
   models: EMPTY,
   resolveModels,
@@ -225,7 +227,7 @@ const support: AcpSupport = {
   },
   // A raw -m only changes the model within the saved provider. ACP switches
   // the complete route and confirms it before any prompt leaves OMB.
-  spawnArgs: (config, turn) => ["--acp", ...qwenApprovalArgs(config.fullAuto, turn.approvalMode)],
+  spawnArgs: (config, turn) => ["--acp", ...qwenApprovalArgs(config.fullAuto, turn.approvalMode, turn.toolPolicy === "read-only")],
   // Qwen's live session/load returns its cached MCP clients, ignoring fresh
   // credentials. Cold-load the same conversation when those inputs change.
   restartOnMcpChange: true,

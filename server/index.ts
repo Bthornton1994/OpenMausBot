@@ -115,6 +115,11 @@ import {
 import * as composio from "./composio.ts";
 import { connectorCallFromFrame, connectorRefusalText, connectorUnrecognizedText, evaluateConnectorTools } from "./connector-verdict.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
+import {
+  precedingCoSAssistantText,
+  shouldBlockAmbitionReviewAction,
+  transitionAmbitionReview,
+} from "./ambition-review-gate.ts";
 import { buildRecall } from "./recall.ts";
 import { createMemoryUpkeep, upkeepEnabled } from "./memory-upkeep.ts";
 import { appendAboutMe, commitLearned, planLearned } from "./profile-learned.ts";
@@ -8809,7 +8814,41 @@ async function startTurn(
     }
   }
 
-  const agentsMounted = (commsDepth < MAX_COMMS_DEPTH || Boolean(opts?.coordination)) && instance.adapter.capabilities.agentsMcp === true;
+  const reviewTask = store.taskByThread(bot.id, threadId);
+  const hadAmbitionReviewPending = reviewTask?.ambitionReviewPending === true;
+  const humanUserTurn = commsDepth === 0 && !opts?.coordination && !opts?.peerAsk && !userMessage.peerAsk &&
+    !opts?.automationSource && !opts?.unattended && !opts?.cardContinuation && !opts?.computerSelectionContinuation;
+  const precedingAssistantText = precedingCoSAssistantText(
+    store.activePath(threadId),
+    userMessage.id,
+    bot.id,
+    store.groupByThread(threadId) !== undefined,
+    hadAmbitionReviewPending ? reviewTask?.ambitionReviewPendingMessageId ?? null : undefined,
+  );
+  const reviewTransition = transitionAmbitionReview({
+    pending: hadAmbitionReviewPending,
+    chiefOfStaff: bot.chiefOfStaff === true,
+    humanTurn: humanUserTurn,
+    text: providerText,
+    precedingAssistantText,
+  });
+  const ambitionReviewPolicyChanged = reviewTransition.pending !== hadAmbitionReviewPending;
+  if (ambitionReviewPolicyChanged) {
+    store.patchTask(bot.id, threadId, {
+      ambitionReviewPending: reviewTransition.pending ? true : undefined,
+      ambitionReviewPendingMessageId: reviewTransition.pending
+        ? (hadAmbitionReviewPending ? reviewTask?.ambitionReviewPendingMessageId : userMessage.id)
+        : undefined,
+      // A native session keeps its tool surface. Drop old cursors when the
+      // hold starts or ends so a more permissive session cannot be resumed.
+      resumeCursors: {},
+    });
+  }
+  const ambitionReviewUnsupported = reviewTransition.pending && instance.adapter.capabilities.readOnlyReview !== true;
+  // No OMB integrations, computers, or browsers are prepared while the
+  // person considers the three options.
+  const agentsMounted = !reviewTransition.pending &&
+    (commsDepth < MAX_COMMS_DEPTH || Boolean(opts?.coordination)) && instance.adapter.capabilities.agentsMcp === true;
 
   // busy flips immediately so the composer locks; the dispatch itself runs
   // in the background — boat provisioning can take ~90s and must never
@@ -8842,7 +8881,7 @@ async function startTurn(
   directTurnDispatchClaims.set(threadId, { id: dispatchClaimId, botId, threadId, phase: "setup" });
   directTurnBots.set(threadId, bot);
   beginInternalCapabilityGeneration(threadId, dispatchClaimId);
-  if (!opts?.computerSelectionContinuation && !opts?.cardContinuation && !opts?.automationSource && !opts?.unattended &&
+  if (!reviewTransition.pending && !opts?.computerSelectionContinuation && !opts?.cardContinuation && !opts?.automationSource && !opts?.unattended &&
       !opts?.commsDepth && !opts?.coordination && !inheritedTeamComputer(bot) && bot.computer !== "off" && agentsMounted) {
     const source = store.activePath(threadId).findLast(message => message.id === userMessage?.id && message.role === "user" && !message.peerAsk);
     if (source) computerSelectionTurns.set(threadId, { generation: dispatchClaimId, botId: bot.id, source, text });
@@ -8868,6 +8907,9 @@ async function startTurn(
 
   void (async () => {
     try {
+      if (ambitionReviewUnsupported) {
+        throw new Error("This engine cannot enforce the Ambition Review read-only hold. Switch this CoS to Claude Code, Codex, Pi, Grok Agent, Gemini, Qwen Code, Droid, Antigravity, or an OpenAI-compatible engine, then ask again.");
+      }
       // Readiness can wait on the network. Admit the task first so its busy
       // state, Stop action and watchdog own that wait just like VM setup.
       if (opts?.runOn === "cloud") {
@@ -8933,10 +8975,11 @@ async function startTurn(
       const externalContextMarker = isExternalContextMarker(task.lastInstanceId)
         ? task.lastInstanceId
         : undefined;
-      const fresh =
+      const fresh = ambitionReviewPolicyChanged || (
         !rewound &&
         !externalContextMarker &&
-        engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript: replayable });
+        engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript: replayable })
+      );
       // An engine that records what its session was handed resumes it with only
       // the context messages outside that record. A record of another session
       // (the one it replaced) or one that no longer lines up with the branch is
@@ -9039,29 +9082,37 @@ async function startTurn(
 
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
       let browser: Awaited<ReturnType<typeof browserIntegration>> = null;
+      const allSkills = availableSkills();
       const selectedSkills = selectBundledSkills(
         providerText,
         [
           ...(instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : []),
           ...(skillAuthoring ? ["skillAuthoring"] : []),
         ],
-        availableSkills(),
+        allSkills,
       );
-      if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
+      // Keep the complete skill in the prompt while the review is pending,
+      // including the short follow-up where the person selects an option.
+      if ((reviewTransition.pending || reviewTransition.selected) &&
+          !selectedSkills.some((skill) => skill.manifest.id === "ambition-review")) {
+        const reviewSkill = allSkills.find((skill) => skill.manifest.id === "ambition-review");
+        if (reviewSkill) selectedSkills.push(reviewSkill);
+      }
+      if (!reviewTransition.pending && selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
         integrations.phone = phoneIntegration(bot.id, threadId, dispatchClaimId);
       }
       // the user's connected apps, but only to a driver that can mount
       // them — a key in the config says the connections exist, not that
       // this engine can reach them — and only to a bot the user has not
       // switched off: the key is workspace-wide, the grant is per bot.
-      if (bot.composio !== false && composio.configured(cfg) && instance.adapter.capabilities.composioMcp === true) {
+      if (!reviewTransition.pending && bot.composio !== false && composio.configured(cfg) && instance.adapter.capabilities.composioMcp === true) {
         const connection = await connectedAppsIntegration(bot, threadId, dispatchClaimId);
         if (connection) integrations.composio = connection;
       }
       // user-configured MCP servers (config.json mcpServers): same rule as
       // composio — only to a driver that can mount them. Their tools are
       // never pre-allowed, so every call rides the normal permission flow.
-      if (instance.adapter.capabilities.customMcp === true) {
+      if (!reviewTransition.pending && instance.adapter.capabilities.customMcp === true) {
         const custom = engineMcpServers(bot);
         if (Object.keys(custom).length) integrations.custom = custom;
       }
@@ -9098,7 +9149,7 @@ async function startTurn(
           ? store.pinTaskCwd(bot.id, threadId, privateWorkspace, { privateOnly: cloudGuestOpened(threadId) })
           : null;
       const cwd = pinnedCwd ?? undefined;
-      if (cwd && !claimTurnResource(resourceOwner, workspaceResource(cwd))) {
+      if (cwd && !reviewTransition.pending && !claimTurnResource(resourceOwner, workspaceResource(cwd))) {
         throw Object.assign(new Error("another thread is working in this project folder — wait for it to finish or choose a separate folder"), { status: 409, code: "workspace_busy" });
       }
       // Checkpoint explicit project folders, where a bot can overwrite the
@@ -9109,7 +9160,7 @@ async function startTurn(
       // dweb is opt-in: without an explicit daemon URL, do not advertise
       // tools that would fail on every call or spawn an unnecessary proxy.
       const dwebUrl = process.env.DWEB_URL?.trim();
-      if (dwebUrl) integrations.dweb = { url: dwebUrl };
+      if (!reviewTransition.pending && dwebUrl) integrations.dweb = { url: dwebUrl };
       // Cloud routines always use Boat/BoatAgent. The per-bot backend applies
       // only to ordinary turns that mount a computer into the local agent.
       const teamComputer = inheritedTeamComputer(bot);
@@ -9126,14 +9177,14 @@ async function startTurn(
       // landed. A team computer or a cloud routine is not this conversation's
       // choice, so those ignore the pin.
       const dispatchTask = store.taskByThread(bot.id, threadId);
-      if (plan.clearPin && dispatchTask) store.patchTask(bot.id, threadId, { surface: undefined });
-      if (plan.computer !== undefined && plan.computer !== "cloud" && instance.adapter.capabilities.remoteAgent === true) {
+      if (!reviewTransition.pending && plan.clearPin && dispatchTask) store.patchTask(bot.id, threadId, { surface: undefined });
+      if (!reviewTransition.pending && plan.computer !== undefined && plan.computer !== "cloud" && instance.adapter.capabilities.remoteAgent === true) {
         throw new Error("the Computer engine works on the cloud computer — set Works on to Cloud, or choose another engine");
       }
-      const wants = plan.computer;
+      const wants = reviewTransition.pending ? "review-only" as const : plan.computer;
       // A place the organisation disallows, or a Cloud home never offers, is
       // refused before anything is prepared; Auto below simply skips them.
-      const wantedKind = teamComputer ? "box" : wants === "local" ? "thisComputer" : wants === "vm" ? "localVm"
+      const wantedKind = reviewTransition.pending ? undefined : teamComputer ? "box" : wants === "local" ? "thisComputer" : wants === "vm" ? "localVm"
         : wants === "cloud" ? (cloudBackend === "vps" ? "vps" : "box") : undefined;
       const placeRefusal = wantedKind && computerPlaceRefusal(wantedKind);
       if (placeRefusal) throw Object.assign(new Error(placeRefusal.message), { status: 409, code: placeRefusal.code });
@@ -9430,7 +9481,7 @@ async function startTurn(
 
       // Cloud is strict when selected. Native Boat and drivers with a Boat
       // bridge may also reuse an already-ready Boat on Auto.
-      if (teamComputer) {
+      if (teamComputer && !reviewTransition.pending) {
         const attached = await attachTeamBoat(teamComputer, bot.id, resourceOwner,
           instance.adapter.capabilities.usesCloudComputer === true, instance.adapter.capabilities.remoteAgent === true);
         integrations.computer = attached.integration;
@@ -9540,7 +9591,7 @@ async function startTurn(
         const ownThreadCreation = boundedCoordination && !opts?.coordination && Boolean(origin && !origin.peerAsk);
         integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, skillAuthoring, dispatchClaimId, opts?.coordination?.id, boundedCoordination, ownThreadCreation);
       }
-      if (instance.adapter.capabilities.hooks === true && hooksEnabled()) {
+      if (!reviewTransition.pending && instance.adapter.capabilities.hooks === true && hooksEnabled()) {
         integrations.hooks = hooksIntegration(bot.id, threadId, dispatchClaimId);
       }
       // @mentions in the user's message (the composer's tagging UI) become
@@ -9579,7 +9630,7 @@ async function startTurn(
       // the engine cannot edit the project until the snapshot has settled.
       // snapshot() absorbs failures, so checkpointing may delay but never fail
       // a turn.
-      if (checkpointCwd) {
+      if (checkpointCwd && !reviewTransition.pending) {
         const before = await checkpoints.snapshot(bot.id, checkpointCwd, `turn ${threadId.slice(0, 8)}`);
         if (!directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId)) {
           throw new DirectTurnSetupCancelled("turn stopped during checkpoint");
@@ -9609,6 +9660,7 @@ async function startTurn(
       // happens in that computer's own browser, where the person can see it.
       const mountedComputer = surfaceOfComputerKind(computerKind);
       if (
+        !reviewTransition.pending &&
         liveBot &&
         plan.browser &&
         !(plan.computer === undefined && mountedComputer) &&
@@ -9747,6 +9799,7 @@ async function startTurn(
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: approvalModeForTurn(bot, commsDepth > 0, threadId),
+        ...(reviewTransition.pending ? { toolPolicy: "read-only" as const } : {}),
         ...(guestConfined ? { guestConfined: true, confinedWhy: confinedWhy(threadId) } : {}),
         model,
         effort,
@@ -9765,8 +9818,8 @@ async function startTurn(
         // the mentions half describes this turn: identical consecutive tags
         // must still deliver their note (SendTurnInput.mentionTurn)
         mentionTurn: tagged.length > 0,
-        integrations,
-        mcpFromUserConfig: claudeUserMcpEnabled(cfg) && !managedPolicy.restrictsMcp(),
+        integrations: reviewTransition.pending ? {} : integrations,
+        mcpFromUserConfig: !reviewTransition.pending && claudeUserMcpEnabled(cfg) && !managedPolicy.restrictsMcp(),
         cwd,
       }), () => !directTurnClaimExists(bot.id, dispatchClaimId, threadId), async () => {
         await instance.adapter.interruptTurn(threadId).catch(() => {});
@@ -15024,6 +15077,16 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const claimedThread = url.searchParams.get("fromThreadId");
       if (claimedThread !== null && claimedThread !== internalCapability.threadId) {
         return json(res, 403, { error: "the internal capability belongs to a different conversation" });
+      }
+      if (shouldBlockAmbitionReviewAction({
+        pending: store.taskByThread(internalSender.id, internalCapability.threadId)?.ambitionReviewPending === true,
+        capabilityKind: internalCapability.kind,
+        method,
+        path,
+      })) {
+        return json(res, 409, {
+          error: "The CoS is waiting for your Altitude, Depth, or Range selection. This OMB action was blocked until you choose.",
+        });
       }
       const readInternalBody = async () => {
         const body = await readBody(req);

@@ -1242,7 +1242,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // `bypassPermissions`; Ask/Auto must restore Claude's interactive
       // broker instead of inheriting that silent bypass. Calls without a
       // per-turn mode keep the legacy adapter behavior.
-      const permissionMode = turn.approvalMode === undefined
+      const permissionMode = turn.toolPolicy === "read-only" ? "default" : turn.approvalMode === undefined
         ? config.permissionMode
         : turn.approvalMode === "full" ? "bypassPermissions"
           : turn.approvalMode === "auto" ? "auto"
@@ -1288,13 +1288,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (turn.guestConfined && permissionMode !== "default") {
         throw new Error("A guest's turn on this Cloud runs only in Ask.");
       }
-      if (turn.guestConfined) args.push("--restricted", "--tools", GUEST_CLAUDE_TOOLS.join(","));
+      if (turn.guestConfined) args.push("--restricted");
+      if (turn.toolPolicy === "read-only") args.push("--tools", "Read,Grep,Glob");
+      else if (turn.guestConfined) args.push("--tools", GUEST_CLAUDE_TOOLS.join(","));
       else if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
       if (config.disallowedTools?.length) {
         args.push("--disallowedTools", config.disallowedTools.join(","));
       }
       const turnEnvironment = environment();
-      if ((turn.refreshSystemPrompt || turn.guestConfined) && !cliVersionChecked) {
+      if ((turn.refreshSystemPrompt || turn.guestConfined || turn.toolPolicy === "read-only") && !cliVersionChecked) {
         const version = await readCliVersion(turnEnvironment);
         if (version) {
           cliVersion = parseClaudeCliVersion(version);
@@ -1305,7 +1307,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         throw new Error(withWhy("This Claude Code is too old to run this turn without a shell. Update Claude Code.", turn.confinedWhy));
       }
       const isolated = !inheritsUserConfig(turnEnvironment);
-      if (isolated) {
+      if (turn.toolPolicy === "read-only") {
+        if (!claudeCliSupports(cliVersion, "--restricted")) {
+          throw new Error("This Claude Code version cannot isolate native tools and project settings for an Ambition Review. Update Claude Code, then retry.");
+        }
+        if (!claudeCliSupports(cliVersion, "--strict-mcp-config")) {
+          throw new Error("This Claude Code version cannot disable native MCP servers for an Ambition Review. Update Claude Code, then retry.");
+        }
+        // --restricted removes shell-capable tools and ignores user/project
+        // settings. The explicit tools list below keeps file inspection only.
+        args.push("--restricted");
+        args.push("--strict-mcp-config");
+      } else if (isolated) {
         // A bot gets the tools and instructions its owner gave it, not
         // whatever this machine's Claude Code happens to be set up with.
         // Without these the CLI silently adds, to EVERY turn of every bot:
@@ -1351,11 +1364,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // acceptEdits run silently denies anything unlisted)
       const mcpServers: Record<string, unknown> = {};
       const allowed: string[] = [];
-      if (turn.integrations?.composio) {
+      if (turn.toolPolicy !== "read-only" && turn.integrations?.composio) {
         mcpServers.composio = { ...turn.integrations.composio };
         allowed.push("mcp__composio");
       }
-      if (turn.integrations?.localComputer) {
+      if (turn.toolPolicy !== "read-only" && turn.integrations?.localComputer) {
         const local = turn.integrations.localComputer;
         mcpServers.computer = {
           command: local.command,
@@ -1370,23 +1383,23 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // spawn contract (command/args/env incl. the boot token) in
       // agentsIntegration(); pre-allowing matters doubly here, or the CLI's
       // own ListAgents look-alike shadows it and "@Bot" asks go nowhere
-      if (turn.integrations?.agents) {
+      if (turn.toolPolicy !== "read-only" && turn.integrations?.agents) {
         // Coordination is foundational, not an optional deferred lookup.
         // Claude waits for always-loaded tools before building the prompt.
         mcpServers.agents = { ...turn.integrations.agents, alwaysLoad: true };
         allowed.push("mcp__agents");
       }
-      if (turn.integrations?.phone) {
+      if (turn.toolPolicy !== "read-only" && turn.integrations?.phone) {
         mcpServers.phone = { ...turn.integrations.phone };
         allowed.push("mcp__phone");
       }
-      if (turn.integrations?.browser) {
+      if (turn.toolPolicy !== "read-only" && turn.integrations?.browser) {
         mcpServers.browser = { ...turn.integrations.browser };
         allowed.push("mcp__browser");
       }
       // dweb network daemon (status / repo / opencode model access) via
       // server/drivers/dweb-proxy.ts — points at the configured dweb instance
-      if (turn.integrations?.dweb) {
+      if (turn.toolPolicy !== "read-only" && turn.integrations?.dweb) {
         mcpServers.dweb = {
           command: process.execPath,
           args: [DWEB_PROXY_PATH],
@@ -1408,7 +1421,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // Bot-owned servers, gated below: they are the ones that answer for a
       // machine rather than for a context window.
       const botOwned = new Set<string>();
-      for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+      for (const [name, server] of Object.entries(turn.toolPolicy === "read-only" ? {} : turn.integrations?.custom ?? {})) {
         if (Object.hasOwn(mcpServers, name)) continue;
         mcpServers[name] = { ...server };
         botOwned.add(name);
@@ -1419,7 +1432,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // can add servers but never shadow a harness-owned mount.
       // Never for a guest's turn: its folder is its own to write, and a
       // server declared there would run a command.
-      if (isolated && turn.cwd && !turn.guestConfined) {
+      if (turn.toolPolicy !== "read-only" && isolated && turn.cwd && !turn.guestConfined) {
         for (const [name, server] of Object.entries(projectMcpServers(turn.cwd))) {
           if (Object.hasOwn(mcpServers, name)) continue;
           mcpServers[name] = server;
@@ -1442,11 +1455,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // permission prompts, not questions requiring a person's answer.
       let broker: Awaited<ReturnType<typeof createPermissionBroker>> | undefined;
       const socketPath = permissionSocketPath(threadId, botId);
-      if (permissionMode !== "bypassPermissions") {
+      if (turn.toolPolicy !== "read-only" && permissionMode !== "bypassPermissions") {
         args.push("--permission-prompt-tool", "mcp__ogb__approve");
       }
-      mcpServers.ogb = { command: process.execPath, args: [PERM_PROXY_PATH, socketPath], env: { ...NODE_ENV_FLAG }, alwaysLoad: true };
-      allowed.push("mcp__ogb");
+      if (turn.toolPolicy !== "read-only") {
+        mcpServers.ogb = { command: process.execPath, args: [PERM_PROXY_PATH, socketPath], env: { ...NODE_ENV_FLAG }, alwaysLoad: true };
+        allowed.push("mcp__ogb");
+      }
       // A guest's turn pre-allows only the harness's own tools: anything
       // else (the browser can open a file: address) asks the owner first.
       if (turn.guestConfined) allowed.splice(0, allowed.length, ...allowed.filter((name) => name === "mcp__ogb" || name === "mcp__agents"));
@@ -1591,7 +1606,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
         // Only create a broker for a new process. A compatible retained
         // process keeps its existing proxy connection and broker across turns.
-        if (socketPath) {
+        if (socketPath && turn.toolPolicy !== "read-only") {
           // remembers which tool each pending ask came from, so the resolved
           // event can scope approvals to real desktop-control tools only
           const askTools = new Map<string, string | undefined>();
@@ -2295,6 +2310,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         provider: DRIVER_KIND,
         capabilities: {
           sessionModelSwitch: "in-session",
+          readOnlyReview: true,
           // A guest's turn runs with no command-running tool and no read
           // outside its folder (guestConfined, GUEST_CLAUDE_TOOLS).
           guestTurns: "confined",

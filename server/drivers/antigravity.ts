@@ -58,6 +58,7 @@ const managedAsset = resolveAntigravityReleaseAsset();
 const support: AcpSupport = {
   driverKind: "antigravityAgent",
   displayName: "Antigravity",
+  readOnlyReview: true,
   models: STATIC_ANTIGRAVITY_MODELS,
   defaultCli: "agy", // migration alias: resolveAntigravityRuntime treats it as managed
   nativeSource: "antigravity.acp",

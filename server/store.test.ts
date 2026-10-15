@@ -206,6 +206,39 @@ describe("Store", () => {
     expect(saved[0].tasks[0]).toMatchObject({ surface: "local", surfaceSource: "user" });
   });
 
+  it("persists the ambition-review hold privately until selection", () => {
+    const store = new Store(selection);
+    const bot = store.createBot({}, { seedMessages: false });
+    store.patchTask(bot.id, bot.threadId, {
+      ambitionReviewPending: true,
+      ambitionReviewPendingMessageId: "review-start-message",
+    });
+    const reloaded = new Store(selection);
+    expect(reloaded.taskByThread(bot.id, bot.threadId)).toMatchObject({
+      ambitionReviewPending: true,
+      ambitionReviewPendingMessageId: "review-start-message",
+    });
+    expect(toWireTask(reloaded.taskByThread(bot.id, bot.threadId)!)).not.toHaveProperty("ambitionReviewPending");
+    expect(toWireTask(reloaded.taskByThread(bot.id, bot.threadId)!)).not.toHaveProperty("ambitionReviewPendingMessageId");
+    const saved = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8")) as any[];
+    expect(saved[0].tasks[0]).toMatchObject({
+      ambitionReviewPending: true,
+      ambitionReviewPendingMessageId: "review-start-message",
+    });
+
+    reloaded.patchTask(bot.id, bot.threadId, {
+      ambitionReviewPending: undefined,
+      ambitionReviewPendingMessageId: undefined,
+    });
+    const afterSelection = new Store(selection);
+    expect(afterSelection.taskByThread(bot.id, bot.threadId)?.ambitionReviewPending).toBeUndefined();
+    expect(afterSelection.taskByThread(bot.id, bot.threadId)?.ambitionReviewPendingMessageId).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"))[0].tasks[0])
+      .not.toHaveProperty("ambitionReviewPending");
+    expect(JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"))[0].tasks[0])
+      .not.toHaveProperty("ambitionReviewPendingMessageId");
+  });
+
   it("clears only auto surface pins that conflict with a Works on change", () => {
     const store = new Store(selection);
     const bot = store.createBot({}, { seedMessages: false });

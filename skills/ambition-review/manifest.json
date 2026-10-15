@@ -1,0 +1,19 @@
+{
+  "id": "ambition-review",
+  "name": "Ambition Review",
+  "version": "0.1.0",
+  "description": "Generate three evidence-based Altitude, Depth, and Range choices before strategic, ambiguous, repeated, or multi-step project work.",
+  "defaultEnabled": true,
+  "triggerTerms": [
+    "ambition-review",
+    "strategic",
+    "ambiguous",
+    "repeated",
+    "multi-step",
+    "multi step",
+    "three bolder goals",
+    "long-term goal",
+    "long term goal"
+  ],
+  "requiredCapabilities": []
+}
