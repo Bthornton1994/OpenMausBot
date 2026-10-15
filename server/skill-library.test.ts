@@ -102,3 +102,31 @@ describe("bundled verification skill", () => {
     }
   });
 });
+
+
+describe("bundled ambition-review skill", () => {
+  const skills = loadBundledSkills(join(process.cwd(), "skills"));
+  const skill = skills.find((candidate) => candidate.manifest.id === "ambition-review");
+
+  it("loads for all engines when the review language appears", () => {
+    expect(skill?.manifest).toMatchObject({ defaultEnabled: true, requiredCapabilities: [] });
+    expect(selectBundledSkills(
+      "This is strategic multi-step project work; run ambition-review before editing.",
+      [],
+      skills,
+    ).map((candidate) => candidate.manifest.id)).toContain("ambition-review");
+  });
+
+  it("does not mount for a clear narrow fix", () => {
+    expect(selectBundledSkills("Fix the typo in this one-line label.", [], skills)
+      .map((candidate) => candidate.manifest.id)).not.toContain("ambition-review");
+  });
+
+  it("instructs the agent to wait and gives the three requested lenses", () => {
+    expect(skill?.instructions).toContain("Then stop and wait for the user's selection.");
+    expect(skill?.instructions).toContain("1. **Altitude**");
+    expect(skill?.instructions).toContain("2. **Depth**");
+    expect(skill?.instructions).toContain("3. **Range**");
+    expect(skill?.instructions).toContain("do not role-play");
+  });
+});
