@@ -103,7 +103,6 @@ describe("bundled verification skill", () => {
   });
 });
 
-
 describe("bundled ambition-review skill", () => {
   const skills = loadBundledSkills(join(process.cwd(), "skills"));
   const skill = skills.find((candidate) => candidate.manifest.id === "ambition-review");
