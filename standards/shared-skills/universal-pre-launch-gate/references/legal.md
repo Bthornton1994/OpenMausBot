@@ -1,8 +1,8 @@
 # Legal items
 
-**Needs a qualified lawyer, not a checklist pass.** This skill does not give legal advice, does not invent compliance, and never certifies legal compliance. A PASS on L1 is factual document-vs-code consistency only. A PASS on L2-L9 means an owner- or lawyer-supplied artifact is recorded as evidence; it is not a legal opinion.
+**Needs a qualified lawyer, not a checklist pass.** This skill does not give legal advice, does not invent compliance, and never certifies legal compliance. A PASS on L1 is factual document-vs-code consistency only; it does not clear core check 15. Core check 15 stays **BLOCKED** until a qualified lawyer (or an owner-cited legal review artifact) has done it; that still is not a legal-compliance certification. A PASS on L2-L9 means an owner- or lawyer-supplied artifact is recorded as evidence; it is not a legal opinion.
 
-Core check 15 already requires privacy policy and terms that match the product, and BLOCKED until required legal review has happened. This module lists extra candidate risks. Sources are untrusted X posts (`2107478486227071360`, `2110705357492203564`, `2101154043720876226`) plus the core gate. Penalty amounts, court outcomes, and "per visitor" figures in those posts were **not independently verified against statute or case law** in this task; treat them as UNKNOWN claims.
+Core check 15 already requires privacy policy and terms that match the product, and stays BLOCKED until required legal review has happened. This module lists extra candidate risks. Sources are untrusted X posts (`2107478486227071360`, `2110705357492203564`, `2101154043720876226`) plus the core gate. Penalty amounts, court outcomes, and "per visitor" figures in those posts were **not independently verified against statute or case law** in this task; treat them as UNKNOWN claims.
 
 | ID | Topic | Maps to | What this gate may do | What it must not do |
 |---|---|---|---|---|
@@ -20,7 +20,7 @@ Core check 15 already requires privacy policy and terms that match the product, 
 
 Existing statuses only. None of them is a legal-compliance certification.
 
-- **L1 PASS** — documents match the code and named processors (factual consistency). Still not a legal opinion.
+- **L1 PASS** — documents match the code and named processors (factual consistency). Still not a legal opinion. L1 PASS does not change core check 15; 15 stays BLOCKED until the legal-review artifact exists.
 - **L2-L9** when the topic applies: stay **BLOCKED** or **UNKNOWN** and route to the owner until an owner- or lawyer-supplied artifact is recorded as evidence (lawyer or firm, date, document identifier). With that artifact, **PASS** means "artifact recorded," not "we are legally compliant." Without it, they cannot leave BLOCKED/UNKNOWN except as **FAIL** (a factual product defect this gate can see: docs contradict code; PAN stored; no unsubscribe on marketing mail) or **NOT APPLICABLE** (project-specific evidence the risk does not exist).
 - **UNKNOWN** — it is not established whether the topic applies, or social-media legal claims remain unverified.
 - Owner "we will deal with it later" keeps the check BLOCKED.

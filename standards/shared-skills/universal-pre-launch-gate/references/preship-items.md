@@ -37,7 +37,7 @@ Legend: **mapped** = required under that check when the feature exists; **suppor
 | Model spend cap | Core 3/7, A3 | 3, 7, A3 |
 | CORS not `allow everything` on authenticated APIs | Header readback | S5 |
 | Security headers | Header readback | S8 |
-| Logs without passwords/tokens/PAN | Log sample | S8, S11, P9 |
+| Logs without passwords/tokens/PAN | Log sample | S11, P9 |
 
 ## Feature- or contract-dependent (supporting unless the project requires them)
 
