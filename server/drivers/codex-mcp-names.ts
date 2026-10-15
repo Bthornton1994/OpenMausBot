@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const HEADER = /^[ \t]*\[[ \t]*mcp_servers[ \t]*\.[ \t]*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))[ \t]*[.\]]/gm;
+const PLUGIN_HEADER = /^[ \t]*\[[ \t]*plugins[ \t]*\.[ \t]*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))(?=[ \t.\]])/gm;
 
 /** Names declared as `[mcp_servers.<name>]` (or a sub-table of one). Inline
  * tables are not scanned; a collision there still surfaces as codex's own
@@ -24,14 +25,49 @@ export function mcpServerNamesInToml(toml: string): Set<string> {
   return names;
 }
 
-/** Server names in the config.toml of the Codex home this child will use. */
-export function codexConfigMcpServerNames(env: Record<string, string | undefined>): Set<string> {
-  const codexHome = env.CODEX_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".codex");
-  try {
-    return mcpServerNamesInToml(readFileSync(join(codexHome, "config.toml"), "utf8"));
-  } catch {
-    return new Set();
+/** Plugin names from plugin settings and nested plugin MCP tables. */
+export function pluginNamesInToml(toml: string): Set<string> {
+  const names = new Set<string>();
+  for (const match of toml.matchAll(PLUGIN_HEADER)) {
+    const name = match[1] !== undefined ? match[1].replace(/\\(.)/g, "$1") : match[2] ?? match[3];
+    if (name) names.add(name);
   }
+  return names;
+}
+
+function codexConfigPaths(env: Record<string, string | undefined>, cwd?: string): string[] {
+  const codexHome = env.CODEX_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".codex");
+  return [...new Set([
+    join(codexHome, "config.toml"),
+    ...(cwd ? [join(cwd, ".codex", "config.toml")] : []),
+  ])];
+}
+
+function configNames(
+  env: Record<string, string | undefined>,
+  cwd: string | undefined,
+  parse: (toml: string) => Set<string>,
+): Set<string> {
+  const names = new Set<string>();
+  for (const path of codexConfigPaths(env, cwd)) {
+    try {
+      for (const name of parse(readFileSync(path, "utf8"))) names.add(name);
+    } catch {
+      // Missing global or project config is normal; effective config is
+      // checked by the app-server before a read-only turn starts.
+    }
+  }
+  return names;
+}
+
+/** Server names in global and project config.toml files for this turn. */
+export function codexConfigMcpServerNames(env: Record<string, string | undefined>, cwd?: string): Set<string> {
+  return configNames(env, cwd, mcpServerNamesInToml);
+}
+
+/** Plugin names in global and project config.toml files for this turn. */
+export function codexConfigPluginNames(env: Record<string, string | undefined>, cwd?: string): Set<string> {
+  return configNames(env, cwd, pluginNamesInToml);
 }
 
 /** The name to mount a custom server under: its own, unless the user's Codex

@@ -19,7 +19,7 @@ Return all three options, grounded in what the project is trying to achieve:
 
 1. **Altitude** — Infer the durable outcome behind the repeated one-off tasks. Phrase it as a long-term goal the user could hand to you, with a clear result to maintain or improve.
 2. **Depth** — Choose the one thing that most needs to be done well. Identify what a leading practitioner in the relevant field would do, the rawest useful material to start from, and the specific tools and methods. Set a measurable stretch target that looks unreasonable but is still testable. Name an independent test, script, benchmark, or evaluator; do not ask the model that produced the work to grade itself.
-3. **Range** — Describe what the project is trying to accomplish using verbs. Identify the useful fields and, for each, one concrete practice people in that field use and how it applies here. Describe the work, not fictional experts or role-play.
+3. **Range** — Describe what the project is trying to accomplish using verbs. Identify the useful fields and, for each, one concrete practice people in that field use and how it applies here. Describe what people do; do not role-play experts.
 
 For each option, state:
 

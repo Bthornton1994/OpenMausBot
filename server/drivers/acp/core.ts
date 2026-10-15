@@ -242,6 +242,10 @@ export interface AcpSupport {
   /** Whether models behind this ACP harness can consume a referenced image.
    * Most coding agents can open local files; opt out for text-only agents. */
   images?: boolean;
+  /** This runtime has a provider-native Ask/read-only policy that OMB can
+   * force for every held review turn. User-configurable ACP commands must
+   * leave this false. */
+  readOnlyReview?: boolean;
   /** Narrow compatibility exception for a CLI with verified native image
    * transport but a defective initialize capability (never a path fallback). */
   acceptsUnadvertisedImages?(initializeResult: unknown): boolean;
@@ -972,7 +976,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           return candidate;
         };
 
-        const handleClientFileRequest = async (msg: any): Promise<void> => {
+        const handleClientFileRequest = async (msg: any, current: AcpTurn): Promise<void> => {
           const fail = (error: unknown) => send({
             jsonrpc: "2.0",
             id: msg.id,
@@ -980,6 +984,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           });
           try {
             if (!support.clientFileSystem) throw new Error("Client file access is disabled.");
+            if (msg.method === "fs/write_text_file" && current.turn.toolPolicy === "read-only") {
+              throw new Error("File writes are disabled during the Ambition Review selection hold.");
+            }
             const params = msg.params ?? {};
             const path = await resolveClientPath(params.path);
             if (msg.method === "fs/read_text_file") {
@@ -1019,7 +1026,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const handleServerRequest = (msg: any, current: AcpTurn) => {
           current.state.startupActivity = true;
           if (msg.method === "fs/read_text_file" || msg.method === "fs/write_text_file") {
-            void handleClientFileRequest(msg);
+            void handleClientFileRequest(msg, current);
             return;
           }
           if (msg.method !== "session/request_permission") {
@@ -1044,6 +1051,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
           const toolCall = params.toolCall ?? {};
           const isQuestion = String(toolCall.toolCallId ?? "").startsWith("interaction_");
+          if (current.turn.toolPolicy === "read-only" && !isQuestion) {
+            const reject = optionFor("reject");
+            return send({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: reject ? { outcome: { outcome: "selected", optionId: reject } } : cancelled,
+            });
+          }
           if (current.turnConfig.fullAuto && current.turn.approvalMode === undefined && !isQuestion) {
             const allow = optionFor("allow");
             if (!allow) missing("allow");
@@ -1332,6 +1347,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const sendTurn = async (turn: SendTurnInput) => {
         const { threadId } = turn;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+        const turnId = newId();
+        if (turn.toolPolicy === "read-only" && support.readOnlyReview !== true) {
+          emit({ ...base(threadId, turnId), type: "turn.started" });
+          emit({
+            ...base(threadId, turnId),
+            type: "runtime.error",
+            message: `${support.displayName} cannot enforce the Ambition Review read-only hold. Switch to an engine with a verified read-only mode, then retry.`,
+            setup: true,
+          });
+          emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "setup_required", cost: null });
+          return { turnId };
+        }
         // Provider-instance `fullAuto` predates per-bot approval levels. Every
         // harness turn now carries the bot's mode, so Ask/Auto must explicitly
         // put the native agent back into its interactive mode. Otherwise a
@@ -1339,14 +1366,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // Antigravity yolo setting would silently outrank the selector. Calls
         // that omit approvalMode retain the old adapter-level behavior for
         // embedders and tests outside the harness.
-        const turnConfig = turn.approvalMode === undefined
+        const turnConfig = turn.toolPolicy === "read-only"
+          ? { ...config, fullAuto: false }
+          : turn.approvalMode === undefined
           ? config
           : { ...config, fullAuto: turn.approvalMode === "full" && supportsApprovalMode(DRIVER_KIND, "full") };
         const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
         if (controlsHost && turnConfig.fullAuto && turn.approvalMode !== "full") {
           throw new Error("local computer control requires interactive provider approvals");
         }
-        const turnId = newId();
         const cwd = turn.cwd ?? turnConfig.workspace ?? homedir();
         const env = childEnv(turnConfig);
         if (
@@ -1369,7 +1397,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
             : turn;
-        const mcpServers = acpMcpServers(turn);
+        if (turn.toolPolicy === "read-only") cliTurn = { ...cliTurn, approvalMode: "ask" };
+        const mcpServers = turn.toolPolicy === "read-only" ? null : acpMcpServers(turn);
         let launch: { command: string; args?: string[]; env?: Record<string, string | undefined> };
         try {
           launch = support.resolveCommand
@@ -1410,7 +1439,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // turn gets the same process whatever the mode: an approval change
         // is one RPC, not a cold start.
         const contractKey = JSON.stringify([
-          launch.command, launch.args ?? [], spawnArgs, cwd,
+          launch.command, launch.args ?? [], spawnArgs, cwd, turn.toolPolicy ?? null,
           support.sessionScopedApproval ? null : turnConfig.fullAuto === true, envFingerprint,
           support.spawnFingerprint?.(spawnEnv) ?? null,
         ]);
@@ -1643,7 +1672,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               // stdio is every agent's baseline; a url server rides only with
               // an agent that advertised its transport, so an agent without
               // http/sse never sees an entry it would refuse the session over
-              const sessionServers = mcpServers.filter((server) =>
+              const sessionServers = (mcpServers ?? []).filter((server) =>
                 !("type" in server) || init?.agentCapabilities?.mcpCapabilities?.[server.type] === true);
               let loaded = false;
               if (cursor) {
@@ -2029,8 +2058,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           provider: DRIVER_KIND,
           capabilities: {
             sessionModelSwitch: "unsupported",
+            readOnlyReview: support.readOnlyReview === true,
             agentsMcp: true,
-        customMcp: true,
+            customMcp: true,
             computerMcp: true,
             composioMcp: true,
             browserMcp: true,

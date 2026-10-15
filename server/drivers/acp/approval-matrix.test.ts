@@ -16,6 +16,7 @@ import type { AcpConfig } from "./core.ts";
 import { CustomAcpDriver } from "./custom.ts";
 import { DroidAgentDriver } from "./droid.ts";
 import { GeminiAgentDriver } from "./gemini.ts";
+import { GrokAgentDriver } from "./grok.ts";
 import { HermesAgentDriver } from "./hermes.ts";
 import { KimiAgentDriver } from "./kimi.ts";
 import { createOpenCodeDriver, openCodeOwnedDirectories } from "./opencode-go.ts";
@@ -135,6 +136,94 @@ describe("remaining ACP approval mappings", () => {
           .toMatchObject({ behavior: "deny", source: "user" });
         await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
       }
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      await removeTempDir(scratch);
+    }
+  });
+
+  const readOnlyCases = [
+    { driver: GrokAgentDriver, argv: ["--permission-mode", "default", "agent", "stdio"] },
+    { driver: GeminiAgentDriver, argv: ["--acp", "--approval-mode", "default"] },
+    { driver: QwenAgentDriver, argv: ["--acp", "--approval-mode", "default"] },
+    { driver: DroidAgentDriver, argv: ["exec", "-o", "acp"] },
+  ];
+
+  it.each(readOnlyCases)("$driver.driverKind enforces the read-only hold over Full", async ({ driver, argv }) => {
+    ensureDirs();
+    const scratch = mkdtempSync(join(tmpdir(), "omb-acp-read-only-"));
+    const dump = join(scratch, "spawn.json");
+    const answer = join(scratch, "permission-answer.txt");
+    const instance = await driver.create({
+      instanceId: `read-only-${driver.driverKind}`,
+      displayName: "Read-only fixture",
+      enabled: true,
+      environment: {
+        HOME: scratch,
+        USERPROFILE: scratch,
+        HERMES_HOME: join(scratch, ".hermes"),
+        KIMI_CODE_HOME: join(scratch, ".kimi"),
+        OPENMAUSBOT_PROBE_LOCAL_INJECT: "0",
+        FAKE_ACP_MODE: "permission",
+        FAKE_ACP_DUMP: dump,
+        FAKE_ACP_PERMISSION_ANSWER: answer,
+        OPENCODE_API_KEY: "fixture-only",
+      },
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      expect(instance.adapter.capabilities.readOnlyReview).toBe(true);
+      const { turnId } = await instance.adapter.sendTurn({
+        threadId: "acp-read-only-thread",
+        text: "Read project context without making changes.",
+        cwd: scratch,
+        approvalMode: "full",
+        toolPolicy: "read-only",
+        integrations: { agents: { command: process.execPath, args: ["must-not-be-mounted"], env: {} } },
+      });
+      expect(await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId)).toMatchObject({ ok: true });
+      expect(recorder.events.some((event) => event.type === "request.opened" && event.turnId === turnId)).toBe(false);
+      expect(readFileSync(answer, "utf8")).toBe("reject");
+      expect(JSON.parse(readFileSync(dump, "utf8")).argv).toEqual(argv);
+      expect(JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8"))).toEqual([]);
+      if (driver === DroidAgentDriver) {
+        expect(JSON.parse(readFileSync(`${dump}.config.json`, "utf8"))).toContainEqual({
+          method: "session/set_mode",
+          params: { sessionId: "fake-acp-session", modeId: "normal" },
+        });
+      }
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("fails closed before spawning a user-configured ACP command", async () => {
+    ensureDirs();
+    const scratch = mkdtempSync(join(tmpdir(), "omb-acp-unverified-read-only-"));
+    const dump = join(scratch, "spawn.json");
+    const instance = await CustomAcpDriver.create({
+      instanceId: "custom-acp-read-only",
+      displayName: "Custom ACP fixture",
+      enabled: true,
+      environment: { HOME: scratch, USERPROFILE: scratch, FAKE_ACP_DUMP: dump },
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      expect(instance.adapter.capabilities.readOnlyReview).toBe(false);
+      const { turnId } = await instance.adapter.sendTurn({
+        threadId: "custom-acp-read-only-thread",
+        text: "This must fail closed.",
+        approvalMode: "full",
+        toolPolicy: "read-only",
+      });
+      expect(await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId)).toMatchObject({ ok: false });
+      expect(recorder.events.some((event) => event.type === "runtime.error" && event.message.includes("cannot enforce the Ambition Review read-only hold"))).toBe(true);
+      expect(existsSync(dump)).toBe(false);
     } finally {
       recorder.stop();
       await instance.dispose();

@@ -2,7 +2,13 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { codexConfigMcpServerNames, mcpServerNamesInToml, mountedMcpServerName } from "./codex-mcp-names.ts";
+import {
+  codexConfigMcpServerNames,
+  codexConfigPluginNames,
+  mcpServerNamesInToml,
+  mountedMcpServerName,
+  pluginNamesInToml,
+} from "./codex-mcp-names.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { force: true, recursive: true }); });
@@ -33,6 +39,18 @@ trust_level = "trusted"
   });
 });
 
+describe("pluginNamesInToml", () => {
+  it("collects plugin tables, including nested MCP server settings", () => {
+    const toml = `
+[plugins."my-plugin"]
+enabled = true
+[plugins."company tools".mcp_servers."repo-writer"]
+enabled = true
+`;
+    expect([...pluginNamesInToml(toml)].sort()).toEqual(["company tools", "my-plugin"]);
+  });
+});
+
 describe("codexConfigMcpServerNames", () => {
   it("reads config.toml from CODEX_HOME, falling back to ~/.codex, and tolerates a missing file", () => {
     const home = mkdtempSync(join(tmpdir(), "omb-codex-names-"));
@@ -45,6 +63,21 @@ describe("codexConfigMcpServerNames", () => {
     expect([...codexConfigMcpServerNames({ HOME: home })]).toEqual(["home_one"]);
     expect([...codexConfigMcpServerNames({ HOME: home, CODEX_HOME: codexHome })]).toEqual(["explicit"]);
     expect(codexConfigMcpServerNames({ HOME: home, CODEX_HOME: join(home, "missing") }).size).toBe(0);
+  });
+
+  it("includes project MCP servers and plugins", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-codex-project-names-"));
+    dirs.push(home);
+    const project = join(home, "project");
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), [
+      '[mcp_servers."project.server"]',
+      'url = "https://example.test/mcp"',
+      '[plugins."project-plugin"]',
+      "enabled = true",
+    ].join("\n"));
+    expect([...codexConfigMcpServerNames({ HOME: home }, project)]).toEqual(["project.server"]);
+    expect([...codexConfigPluginNames({ HOME: home }, project)]).toEqual(["project-plugin"]);
   });
 });
 

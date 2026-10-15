@@ -14,7 +14,11 @@ import { existsSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { codexConfigMcpServerNames, mountedMcpServerName } from "./codex-mcp-names.ts";
+import {
+  codexConfigMcpServerNames,
+  codexConfigPluginNames,
+  mountedMcpServerName,
+} from "./codex-mcp-names.ts";
 
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { hostedWorkspaceConfigured } from "../enterprise.ts";
@@ -322,10 +326,61 @@ export const GUEST_CONFINED_CODEX_ARGS = [
   "-c", "features.shell_tool=false", "-c", "features.unified_exec=false", "-c", "features.view_image=false", "-c", 'web_search="disabled"',
 ] as const;
 
+/** Read-only review turns retain file inspection while removing command
+ * execution and provider-managed web search from the native tool surface. */
+const READ_ONLY_REVIEW_CODEX_ARGS = [
+  "-c", "features.shell_tool=false",
+  "-c", "features.unified_exec=false",
+  "-c", "features.view_image=false",
+  "-c", "features.shell_snapshot=false",
+  "-c", "features.hooks=false",
+  "-c", "features.multi_agent=false",
+  "-c", "features.apps=false",
+  "-c", "features.goals=false",
+  "-c", "features.remote_plugin=false",
+  "-c", "features.tool_search=false",
+  "-c", 'web_search="disabled"',
+] as const;
+
 /** Whether the effective config (config/read) shows the shell turned off. */
 export function codexShellDisabled(config: unknown): boolean {
   const features = plainRecord(plainRecord(config)?.features);
   return features?.shell_tool === false && features?.unified_exec === false && features?.view_image === false;
+}
+
+/** Require app-server's effective config to confirm every configured MCP
+ * server and plugin is disabled before a read-only turn reaches the model. */
+function codexReadOnlyToolConfigVerified(config: unknown): boolean {
+  const root = plainRecord(config);
+  if (!root) return false;
+  const features = plainRecord(root.features);
+  if (!features || [
+    "shell_tool", "unified_exec", "view_image", "shell_snapshot", "hooks",
+    "multi_agent", "apps", "goals", "remote_plugin", "tool_search",
+  ].some((name) => features[name] !== false)) return false;
+  if (root.web_search !== "disabled") return false;
+  for (const key of ["mcp_servers", "plugins"]) {
+    if (root[key] === undefined) continue;
+    const entries = plainRecord(root[key]);
+    if (!entries) return false;
+    if (Object.values(entries).some((entry) => plainRecord(entry)?.enabled !== false)) return false;
+  }
+  return codexShellDisabled(config);
+}
+
+function readOnlyApprovalParams(): CodexApprovalParams {
+  return {
+    thread: {
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      sandbox: "read-only",
+    },
+    turn: {
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      sandboxPolicy: { type: "readOnly" },
+    },
+  };
 }
 
 /** Codex persists these values on its native thread. Keep them explicit on
@@ -743,7 +798,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           throw new Error(`Custom MCP server “${name}” cannot set reserved environment variable “${reserved}”`);
         }
       }
-      let autoAcceptPermissions = approvalMode === "full";
+      let autoAcceptPermissions = turn.toolPolicy !== "read-only" && approvalMode === "full";
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
       const turnId = newId();
       // a retry relaunches the whole app-server; the backoff is scaled down in
@@ -757,27 +812,36 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           // A guest-driven turn (SendTurnInput.guestConfined): no shell and
           // no file reads, whatever the person's own config says (-c wins
           // over config files). The turn also starts with no environment.
-          ...(turn.guestConfined ? GUEST_CONFINED_CODEX_ARGS : [])];
-        if (turn.integrations?.composio) {
+          ...(turn.guestConfined ? GUEST_CONFINED_CODEX_ARGS : []),
+          ...(turn.toolPolicy === "read-only" ? READ_ONLY_REVIEW_CODEX_ARGS : [])];
+        const declaredInCodexConfig = codexConfigMcpServerNames(env, turn.cwd);
+        if (turn.toolPolicy === "read-only") {
+          for (const name of declaredInCodexConfig) {
+            appServerArgs.push("-c", `mcp_servers.${JSON.stringify(name)}.enabled=false`);
+          }
+          for (const name of codexConfigPluginNames(env, turn.cwd)) {
+            appServerArgs.push("-c", `plugins.${JSON.stringify(name)}.enabled=false`);
+          }
+        }
+        if (turn.toolPolicy !== "read-only" && turn.integrations?.composio) {
           mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
         }
-        if (turn.integrations?.agents) {
+        if (turn.toolPolicy !== "read-only" && turn.integrations?.agents) {
           mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents);
         }
-        if (turn.integrations?.localComputer) {
+        if (turn.toolPolicy !== "read-only" && turn.integrations?.localComputer) {
           // The host daemon and isolated Local VM both arrive as a direct Cua
           // Driver stdio MCP server. Codex sees the same computer tool surface.
           mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
         }
-        if (turn.integrations?.browser) {
+        if (turn.toolPolicy !== "read-only" && turn.integrations?.browser) {
           mountMcpServer(appServerArgs, env, "browser", turn.integrations.browser);
         }
         // A custom server named like one in the user's own config.toml would
         // be merged with it by the `-c` override — a stdio command over a
         // remote url is "invalid configuration" and kills the turn before the
         // model is asked. Such a server mounts under a name of its own.
-        const declaredInCodexConfig = codexConfigMcpServerNames(env);
-        for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+        for (const [name, server] of Object.entries(turn.toolPolicy === "read-only" ? {} : turn.integrations?.custom ?? {})) {
           // codex speaks streamable HTTP to a remote server, not the older
           // SSE transport: such an entry still reaches Claude bots, and is
           // left out here rather than mounted as something it is not
@@ -789,7 +853,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           if (mountName !== name) noteRenamedMcpServer(name, mountName);
           mountMcpServer(appServerArgs, env, mountName, server, false);
         }
-        if (turn.integrations?.phone) {
+        if (turn.toolPolicy !== "read-only" && turn.integrations?.phone) {
           const bridge = turn.integrations.phone;
           Object.assign(env, bridge.env);
           const prefix = "mcp_servers.openmausbot_phone";
@@ -1509,6 +1573,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         if (turn.guestConfined && !codexShellDisabled(effectiveConfig)) {
           throw new Error(`This Codex could not turn its shell off, so it can't run this turn. Update Codex, or switch this bot to Claude.${turn.confinedWhy ? ` ${turn.confinedWhy}` : ""}`);
         }
+        if (turn.toolPolicy === "read-only" && !codexReadOnlyToolConfigVerified(effectiveConfig)) {
+          throw new Error("Codex did not confirm a read-only tool surface with MCP servers and plugins disabled. Update Codex or disable those integrations, then retry the Ambition Review.");
+        }
         // Only the stable half of the prompt belongs in the developer slot:
         // it is the part that must survive compaction unchanged, and any
         // change to it invalidates the provider's cached prefix. The volatile
@@ -1525,7 +1592,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           stableInstructions ?? turn.system ?? "",
         );
         let approvalParams: CodexApprovalParams;
-        if (approvalMode === "custom") {
+        if (turn.toolPolicy === "read-only") {
+          approvalParams = readOnlyApprovalParams();
+        } else if (approvalMode === "custom") {
           // config/read returns the effective global + project config for this
           // cwd. Reasserting those values is essential: simply omitting them
           // on a resumed thread would keep the previous named mode sticky.
@@ -1537,7 +1606,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // requested permission". Only the user's explicit OpenMausBot Full
         // mode may synthesize approvals; Custom must preserve the sandbox
         // boundary from config.toml (for example never + read-only).
-        autoAcceptPermissions = approvalMode === "full";
+        autoAcceptPermissions = turn.toolPolicy !== "read-only" && approvalMode === "full";
         // Each turn launches a new app-server. Reassert current bot instructions
         // on start AND resume so Codex owns their lifetime through compaction.
         // Removed bot rules are cleared without dropping native configured rules.
@@ -1798,6 +1867,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       provider: DRIVER_KIND,
       capabilities: {
         sessionModelSwitch: "unsupported",
+        readOnlyReview: true,
         // A guest's turn runs with no environment and the shell off (guestConfined).
         guestTurns: "confined",
         queueing: true,

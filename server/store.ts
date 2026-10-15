@@ -94,12 +94,18 @@ export interface TaskRecord extends WireTask {
    * it landed. Absent means legacy/unknown: it may be a person's choice,
    * so only positively identified auto pins yield to Works on changes. */
   surfaceSource?: "user" | "auto";
+  /** A CoS Altitude/Depth/Range review is waiting for the person to choose
+   * before this task can use mutating provider or internal tools. */
+  ambitionReviewPending?: boolean;
+  /** The human message that opened the current review. Short confirmations
+   * may use only a CoS recommendation made after this message. */
+  ambitionReviewPendingMessageId?: string;
 }
 
 /** TaskRecord fields no client may see. Everything else must be on WireTask:
  * the exactness assertion below fails to compile when either side drifts,
  * so a new server field forces a decision — wire-visible or private here. */
-export type TaskWirePrivateKeys = "resumeCursors" | "lastInstanceId" | "handedMessages" | "appliedCompactionId" | "contextFloor" | "lastContextModel" | "surfaceSource";
+export type TaskWirePrivateKeys = "resumeCursors" | "lastInstanceId" | "handedMessages" | "appliedCompactionId" | "contextFloor" | "lastContextModel" | "surfaceSource" | "ambitionReviewPending" | "ambitionReviewPendingMessageId";
 export type TaskWireProjection = Pick<TaskRecord, Exclude<keyof TaskRecord, TaskWirePrivateKeys>>;
 type AssertExact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
 type AssertSameKeys<A, B> = [keyof A] extends [keyof B] ? ([keyof B] extends [keyof A] ? true : never) : never;
@@ -113,7 +119,8 @@ export const taskWireProjectionIsExact: TaskWireProjectionIsExact = true;
 export function toWireTask(task: TaskRecord): WireTask {
   const { resumeCursors: _resumeCursors, lastInstanceId: _lastInstanceId, handedMessages: _handedMessages,
     appliedCompactionId: _appliedCompactionId, contextFloor: _contextFloor, lastContextModel: _lastContextModel,
-    surfaceSource: _surfaceSource, ...wire } = task;
+    surfaceSource: _surfaceSource, ambitionReviewPending: _ambitionReviewPending,
+    ambitionReviewPendingMessageId: _ambitionReviewPendingMessageId, ...wire } = task;
   return wire;
 }
 
@@ -121,6 +128,8 @@ const TASK_PATCH_FIELDS = [
   "title", "projectId", "modelSelection", "approvalMode", "autoApprove", "alwaysAllow",
   "unread", "rewound", "archivedAt", "pinned", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
   "routineRunId", "surface", "surfaceSource", "snoozedUntil", "appliedCompactionId", "contextFloor", "lastContextModel",
+  "ambitionReviewPending",
+  "ambitionReviewPendingMessageId",
 ] as const satisfies readonly (keyof TaskRecord)[];
 export type TaskPatch = Partial<Pick<TaskRecord, typeof TASK_PATCH_FIELDS[number]>>;
 

@@ -37,7 +37,7 @@ it("creates and manages an own-section room through the mounted Chief MCP proxy"
     }
     const [chief, peer, second, foreign] = bots;
     await api("PATCH", `/api/bots/${chief.id}`, { chiefOfStaff: true });
-    await control(["send", "--bot", chief.id, "--text", "This is a strategic, multi-step project; before doing any work, show the ambition-review options."]);
+    await control(["send", "--bot", chief.id, "--text", "What is your role in one sentence?"]);
     await expect.poll(() => existsSync(fixture.fixtureDumpPath), { timeout: 15_000 }).toBe(true);
     const firstTurn = JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")) as { systemPrompt?: string };
     expect(firstTurn.systemPrompt).toContain("For strategic, ambiguous, repeated, or multi-step project work");

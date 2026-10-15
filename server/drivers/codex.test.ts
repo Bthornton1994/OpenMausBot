@@ -456,6 +456,74 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(calls.some((call: { method: string }) => call.method === "turn/start")).toBe(false);
   });
 
+  it("pins the read-only hold over Full and disables every native side-effect path", async () => {
+    const codexHome = join(scratch, ".codex");
+    const project = join(scratch, "project");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(codexHome, "config.toml"), [
+      "[mcp_servers.harmless_name]",
+      'url = "https://example.test/mcp"',
+      '[plugins."harmless-plugin"]',
+      "enabled = true",
+    ].join("\n"));
+    writeFileSync(join(project, ".codex", "config.toml"), [
+      "[mcp_servers.project_server]",
+      'url = "https://example.test/project-mcp"',
+      '[plugins."project-plugin"]',
+      "enabled = true",
+    ].join("\n"));
+    await create({ fullAuto: true, environment: { HOME: scratch, USERPROFILE: scratch, CODEX_HOME: codexHome } });
+    const dump = join(scratch, "ambition-read-only.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-ambition-read-only",
+      text: "Read the repository for review only.",
+      cwd: project,
+      approvalMode: "full",
+      toolPolicy: "read-only",
+      integrations: { agents: { command: process.execPath, args: ["must-not-be-mounted"], env: {} } },
+    });
+    await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+    expect(recorder.events.at(-1)).toMatchObject({ ok: true });
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    const args = seen.argv as string[];
+    for (const feature of [
+      "features.shell_tool=false", "features.unified_exec=false", "features.view_image=false",
+      "features.shell_snapshot=false", "features.hooks=false", "features.multi_agent=false",
+      "features.apps=false", "features.goals=false", "features.remote_plugin=false", "features.tool_search=false",
+      'web_search="disabled"',
+      'mcp_servers."harmless_name".enabled=false', 'mcp_servers."project_server".enabled=false',
+      'plugins."harmless-plugin".enabled=false', 'plugins."project-plugin".enabled=false',
+    ]) expect(args).toContain(feature);
+    const configRead = seen.calls.find((call: { method: string }) => call.method === "config/read");
+    expect(configRead.params).toMatchObject({ cwd: project, includeLayers: false });
+    const threadStart = seen.calls.find((call: { method: string }) => call.method === "thread/start");
+    expect(threadStart.params).toMatchObject({ approvalPolicy: "never", sandbox: "read-only" });
+    const turnStart = seen.calls.find((call: { method: string }) => call.method === "turn/start");
+    expect(turnStart.params).toMatchObject({ approvalPolicy: "never", sandboxPolicy: { type: "readOnly" } });
+  });
+
+  it("stops before starting a read-only turn if Codex does not confirm disabled features", async () => {
+    const dump = join(scratch, "ambition-read-only-unconfirmed.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await create({ fullAuto: true, environment: { FAKE_CODEX_IGNORE_FEATURES: "1" } });
+
+    const { turnId } = await instance.adapter.sendTurn({
+      threadId: "t-ambition-read-only-unconfirmed",
+      text: "Read only.",
+      approvalMode: "full",
+      toolPolicy: "read-only",
+    });
+    await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+    expect(recorder.events.at(-1)).toMatchObject({ ok: false });
+    expect(recorder.events.some((event) => event.type === "runtime.error" && event.message.includes("did not confirm a read-only tool surface"))).toBe(true);
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.calls.some((call: { method: string }) => call.method === "turn/start")).toBe(false);
+  });
+
   it.each(["gpt-5.6-sol", "gpt-5.4"])(
     "reapplies Full, Auto, and Ask across thread start and resume for %s",
     async (model) => {

@@ -358,8 +358,15 @@ process.stdin.on("data", (chunk) => {
                   approvals_reviewer: "auto_review",
                   sandbox_mode: "read-only",
                   mcp_servers: {
-                    harmless_name: { env: { DISPLAY_LABEL: "innocuous-config-secret-7a9c" } },
+                    harmless_name: {
+                      enabled: !process.argv.some((arg, index) => process.argv[index - 1] === "-c" && arg === 'mcp_servers."harmless_name".enabled=false'),
+                      env: { DISPLAY_LABEL: "innocuous-config-secret-7a9c" },
+                    },
                   },
+                  plugins: {
+                    "harmless-plugin": { enabled: !process.argv.some((arg, index) => process.argv[index - 1] === "-c" && arg === 'plugins."harmless-plugin".enabled=false') },
+                  },
+                  web_search: process.argv.find((arg, index) => process.argv[index - 1] === "-c" && arg.startsWith("web_search="))?.slice("web_search=".length).replace(/^"|"$/g, "") ?? "live",
                 }),
               developer_instructions: process.env.FAKE_CODEX_INSTRUCTIONS ?? null,
               // `-c features.<name>=<bool>` overrides, as the real config/read reports them.
@@ -371,6 +378,7 @@ process.stdin.on("data", (chunk) => {
             origins: {},
           },
         });
+        dump();
         break;
       case "thread/resume":
         dump();

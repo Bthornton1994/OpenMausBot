@@ -6,7 +6,7 @@
 // The fake CLI is a shebang script Windows cannot exec directly; spawnCli
 // resolves it to `node <script>`, so these run everywhere.
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -277,6 +277,35 @@ describe("PiDriver turns (fake CLI)", () => {
     const done = recorder.events.at(-1)!;
     expect(done).toMatchObject({ type: "turn.completed", ok: true, stopReason: "end_turn", usage: { input: 12, output: 3 } });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("limits Ambition Review turns to read tools even when the bot is set to Full", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-read-only-"));
+    const dump = join(dir, "dump.jsonl");
+    await create(undefined, { HOME: dir, FAKE_PI_DUMP: dump }, true);
+    try {
+      const { turnId } = await instance.adapter.sendTurn({
+        threadId: "t-ambition-read-only",
+        text: "Read project context only.",
+        approvalMode: "full",
+        toolPolicy: "read-only",
+        integrations: { agents: { command: process.execPath, args: ["must-not-be-mounted"], env: {} } },
+      });
+      await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+
+      const records = readFileSync(dump, "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line) as { argv?: string[]; mcpConfig?: unknown });
+      const seen = records.findLast((record) => Array.isArray(record.argv) && record.argv.includes("--no-extensions"));
+      if (!seen?.argv) throw new Error("pi did not record the Ambition Review launch");
+      expect(seen.argv).toContain("--no-extensions");
+      expect(seen.argv).toContain("--tools");
+      expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("read,grep,find,ls");
+      expect(seen.argv).not.toContain("-e");
+      expect(seen.mcpConfig).toBeNull();
+      expect(recorder.events.at(-1)).toMatchObject({ ok: true });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("sends images as native base64 prompt content without copying bytes into diagnostics", async () => {

@@ -570,7 +570,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       // integrations → stdio MCP servers for the pi-mcp-extension. The config
       // carries credentials (boat token, composio key, comms token), so it goes
       // into a 0600 temp file removed when the turn settles — never on argv.
-      const mcpServers = buildMcpServers(turn);
+      const mcpServers = turn.toolPolicy === "read-only" ? null : buildMcpServers(turn);
       let mcpTempDir: string | null = null;
       if (mcpServers) {
         mcpTempDir = mkdtempSync(join(tmpdir(), "omb-pi-mcp-"));
@@ -587,7 +587,9 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           throw err;
         }
       }
-      const childArgs = mcpServers ? [...PI_ARGS, "-e", SPAWNED_PROXIES.piMcpExtension] : PI_ARGS;
+      const childArgs = turn.toolPolicy === "read-only"
+        ? [...PI_ARGS, "--no-extensions", "--tools", "read,grep,find,ls"]
+        : mcpServers ? [...PI_ARGS, "-e", SPAWNED_PROXIES.piMcpExtension] : PI_ARGS;
 
       // spawnCli can throw synchronously (unresolvable CLI); if it does, the
       // 0600 temp file with the boat token / composio key / comms token must
@@ -1171,6 +1173,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         capabilities: {
           // model is set per turn via set_model before prompt
           sessionModelSwitch: "in-session",
+          readOnlyReview: true,
           // Integrations arrive as stdio MCP servers mounted by the
           // pi-mcp-extension (pi core has no MCP client of its own).
           agentsMcp: true,

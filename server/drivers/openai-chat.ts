@@ -361,7 +361,9 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
   const sendTurn = async (turn: SendTurnInput) => {
     if (!options.apiKey) throw new Error(options.missingKeyError);
     if (active.has(turn.threadId)) throw new Error("a turn is already running on this thread");
-    if (options.computerUse && (turn.images?.length || turn.integrations?.computer || turn.integrations?.localComputer || turn.integrations?.browser)) assertImageTransport(options.apiUrl);
+    const integrations = turn.toolPolicy === "read-only" ? undefined : turn.integrations;
+    if (options.computerUse && turn.toolPolicy !== "read-only" &&
+        (turn.images?.length || integrations?.computer || integrations?.localComputer || integrations?.browser)) assertImageTransport(options.apiUrl);
 
     const turnId = newId();
     const abort = new AbortController();
@@ -369,8 +371,8 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
     const retainImages = chatImageBudget();
     for (const message of messages) retainImages(message.content);
     const model = turn.model || options.models().default;
-    const secrets = [options.apiKey, turn.integrations?.computer?.token, turn.integrations?.computer?.control?.token].filter((value): value is string => Boolean(value));
-    for (const integration of Object.values(turn.integrations ?? {})) {
+    const secrets = [options.apiKey, integrations?.computer?.token, integrations?.computer?.control?.token].filter((value): value is string => Boolean(value));
+    for (const integration of Object.values(integrations ?? {})) {
       const entries = object(integration);
       const specs = entries && "command" in entries ? [entries] : Object.values(entries ?? {}).map(object);
       for (const spec of specs) {
@@ -431,7 +433,7 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
       const denials: string[] = [];
       const seenCalls = new Set<string>();
       try {
-        tools = await mountChatTools(options.tools === false ? undefined : turn.integrations, abort.signal, options.computerUse);
+        tools = await mountChatTools(options.tools === false ? undefined : integrations, abort.signal, options.computerUse);
         let optionalQuestionOnly = options.tools !== false && tools.definitions.length === 0;
         // The runtime's one built-in tool rides the same list: ask_user is
         // how a chat-completions engine reaches a person. An MCP server that
@@ -580,8 +582,10 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
                 // so it is honoured here: without it every single tool call on
                 // an OpenAI-compatible engine stops for a card, and a Chief's
                 // delegated Full access cannot help either.
-                const allowed = turn.approvalMode === "full"
-                  || await approval.ask(call.function.name, inputPreview ?? "This tool has no arguments.");
+                const allowed = turn.toolPolicy !== "read-only" && (
+                  turn.approvalMode === "full"
+                    || await approval.ask(call.function.name, inputPreview ?? "This tool has no arguments.")
+                );
                 abort.signal.throwIfAborted();
                 emit({ ...base(turn.threadId, turnId), type: "item.started", itemType: "tool", itemId: call.id,
                   title: call.function.name, ...(inputPreview ? { input: inputPreview } : {}),
@@ -669,7 +673,8 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
         // pins usesCloudComputer === (remoteAgent || cloudComputerMcp).
         usesCloudComputer: options.tools !== false, cloudComputerMcp: options.tools !== false, localComputerMcp: options.tools !== false,
         browserMcp: options.tools !== false, nativeImageInput: true, images: true } : {}),
-        sessionModelSwitch: "in-session", customMcp: options.tools !== false, agentsMcp: options.tools !== false, composioMcp: options.tools !== false,
+        sessionModelSwitch: "in-session", readOnlyReview: true,
+        customMcp: options.tools !== false, agentsMcp: options.tools !== false, composioMcp: options.tools !== false,
         // The runtime owns the whole tool loop, so it can always take a
         // user message mid-turn: park it, deliver before the next completion.
         queueing: true,

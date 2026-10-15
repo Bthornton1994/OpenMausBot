@@ -1290,6 +1290,41 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.argv[seen.argv.indexOf("--setting-sources") + 1]).toBe("project");
   });
 
+  it("keeps an Ambition Review read-only even when the bot is set to Full", async () => {
+    const dump = join(scratch, "ambition-read-only.json");
+    await create(undefined, { FAKE_CLAUDE_VERSION: "2.1.284", FAKE_CLAUDE_DUMP: dump });
+    await instance.adapter.sendTurn({
+      threadId: "t-ambition-read-only",
+      text: "Read files for a project review.",
+      approvalMode: "full",
+      toolPolicy: "read-only",
+      mcpFromUserConfig: true,
+      integrations: { custom: { harmless: { command: process.execPath, args: ["must-not-run"], env: {} } } },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).toContain("--permission-mode");
+    expect(seen.argv[seen.argv.indexOf("--permission-mode") + 1]).toBe("default");
+    expect(seen.argv).toContain("--restricted");
+    expect(seen.argv).toContain("--strict-mcp-config");
+    expect(seen.argv[seen.argv.indexOf("--tools") + 1]).toBe("Read,Grep,Glob");
+    expect(seen.argv).not.toContain("--permission-prompt-tool");
+    expect(seen.argv).not.toContain("--setting-sources");
+    expect(seen.mcpConfig).toBeNull();
+  });
+
+  it("fails closed when Claude Code is too old to isolate a read-only hold", async () => {
+    const dump = join(scratch, "ambition-old-cli.json");
+    await create(undefined, { FAKE_CLAUDE_VERSION: "2.1.232", FAKE_CLAUDE_DUMP: dump });
+    await expect(instance.adapter.sendTurn({
+      threadId: "t-ambition-old-cli",
+      text: "Read files for a project review.",
+      toolPolicy: "read-only",
+    })).rejects.toThrow("This Claude Code version cannot isolate native tools and project settings for an Ambition Review.");
+    expect(existsSync(dump)).toBe(false);
+  });
+
   it("inherits the machine's configuration again when the escape hatch is set", async () => {
     const dump = join(scratch, "inherit.json");
     await create(undefined, { FAKE_CLAUDE_DUMP: dump, OMB_CLAUDE_INHERIT_USER_CONFIG: "1" });
