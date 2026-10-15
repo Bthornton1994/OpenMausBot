@@ -7,11 +7,11 @@ Each module lists: how to detect it, and the evidence that fills the platform-de
 ## Web
 - Detect: `package.json` with a web framework, `index.html`, `vercel.json`, hosting config.
 - 1/2: scan built client bundles and source maps, not just source.
-- 11: real 404 and 500 pages served by the real host; confirm no stack traces in production mode.
+- 11: real 404 and 500 pages served by the real host; confirm no stack traces in production mode. Also E1-E4: empty, loading, and error states on every list, dashboard, search, notification, and profile view (`empty-loading-error-states.md`), verified with a fresh empty account.
 - 12: Android Chrome on a low-end device or emulator, with viewport and network throttling recorded.
 - 13: Lighthouse or equivalent on a throttled mobile profile; define "usable" (for example first interaction).
-- 14: titles, descriptions, canonical URL, Open Graph and Twitter tags, and the actual preview image fetched from its public URL.
-- Also check: CORS, security headers, cache headers for any data that may need removal.
+- 14: titles, descriptions, canonical URL, Open Graph and Twitter tags, and the actual preview image fetched from its public URL. Also `launch-seo.md` (sitemap, robots.txt, no accidental noindex).
+- Also check: CORS, security headers, cache headers for any data that may need removal (`security.md` S5, S8).
 
 ## iOS
 - Detect: `*.xcodeproj`, `*.xcworkspace`, `Package.swift`, `Info.plist`.
@@ -19,7 +19,7 @@ Each module lists: how to detect it, and the evidence that fills the platform-de
 - 12: a low-end iOS device class or oldest supported simulator (record device, OS). Android-specific wording becomes the oldest supported iPhone class; say so.
 - 13: cold launch and critical-flow time on a real or simulated device.
 - 14: App Store listing metadata and screenshots, link-preview metadata for any shared links.
-- Also check: privacy manifest and App Privacy answers, required permission strings, TestFlight/sandbox purchase flows, crash reporting. See the product-discovery-build `ios-apps.md` for build and UI verification practice where available.
+- Also check: privacy manifest and App Privacy answers, required permission strings, TestFlight/sandbox purchase flows, crash reporting. Empty/loading/error states on collection screens (E1-E4). See the product-discovery-build `ios-apps.md` for build and UI verification practice where available.
 
 ## Android
 - Detect: `build.gradle`, `AndroidManifest.xml`.
@@ -27,14 +27,14 @@ Each module lists: how to detect it, and the evidence that fills the platform-de
 - 12: a representative low-cost device or emulator profile (RAM, API level, screen); record device, OS, viewport.
 - 13: cold start and critical-flow timings on that profile.
 - 14: Play listing metadata; link-preview metadata for shared links.
-- Also check: Data safety form, permissions, signing key handling, staged rollout and rollback in Play Console (owner action).
+- Also check: Data safety form, permissions, signing key handling, staged rollout and rollback in Play Console (owner action). Empty/loading/error states on collection screens (E1-E4).
 
 ## Desktop (Electron, native)
 - Detect: `electron-builder.yml`, installer configs, native project files.
 - 1/2: scan packaged app contents (ASAR, resources) and update feed configuration.
 - 12: oldest supported OS and low-spec hardware or VM; record specs.
 - 13: cold start and critical-flow timings.
-- Also check: code signing and notarization, auto-update channel and rollback, local data and log redaction.
+- Also check: code signing and notarization, auto-update channel and rollback, local data and log redaction. Empty/loading/error states on collection screens (E1-E4) when the desktop UI lists data.
 
 ## Games
 - Detect: engine project files, build targets, store pages.
@@ -54,7 +54,7 @@ Each module lists: how to detect it, and the evidence that fills the platform-de
 - 3 and 7: per-user and global limits on model calls; a hard provider cap if offered, otherwise application-level caps and alerts (not a hard cap).
 - 6: prompt-injection and untrusted-content handling, output validation before use.
 - 15: disclose providers, data sent to them, retention, and training use; do not invent legal claims.
-- Also check: provider keys server-side only, abuse and cost monitoring, logging that redacts user content, safe fallbacks on provider failure, evaluation results for launch-critical behaviors.
+- Also check: provider keys server-side only, abuse and cost monitoring, logging that redacts user content, safe fallbacks on provider failure, evaluation results for launch-critical behaviors. Named red-team options (promptfoo, garak, microsoft/PyRIT) are listed in `ai-red-team.md`; do not install or run them from this skill.
 
 ## CLI, library, or other
 - Treat as a new module: apply the extension procedure below.

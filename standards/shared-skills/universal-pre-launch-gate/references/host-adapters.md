@@ -10,7 +10,7 @@ This skill is canonical text. A host adapter only makes it discoverable; it gran
 | Codex | repo `.agents/skills/universal-pre-launch-gate/` or the user skill library | UNKNOWN. Not tested. |
 | Cursor | repo `.cursor/skills/universal-pre-launch-gate/` or `.agents/skills/` | UNKNOWN. Not tested; local, cloud, and remote workers must be checked separately. |
 | Grok Build | project `.grok/skills/universal-pre-launch-gate/` | UNKNOWN. Not tested. |
-| Grok Bot | saved-skill library | UNKNOWN. Filesystem discovery not assumed. |
+| Grok Bot | saved-skill library | UNKNOWN. Filesystem discovery not assumed. Overlap source (not in this repository, do not edit): saved-skill `public-share-security-audit`. Security items in this gate may overlap that workflow; cite it, do not try to change it. |
 | OpenMausBot | no filesystem adapter assumed | UNKNOWN. If no skill importer exists, paste `SKILL.md` and the references into the task prompt. |
 
 Only add a host to "verified" after a harmless discovery test shows the host listed the skill and read its references.

@@ -18,13 +18,13 @@ Every check needs evidence for PASS. Applicability tiers:
 | 8 | Safe errors | Universal | Users never see stack traces, secrets, internal paths, or sensitive detail (tested error responses); logs redact sensitive values (log sample or code). |
 | 9 | Error tracking | Universal | Production errors reach the chosen monitoring system and alert delivery was tested; privacy implications recorded. A test in a non-production environment only is not live proof. |
 | 10 | Backups and restore | Feature (persistent data) | Schedule and retention readback, plus a restore test in a safe environment with the result recorded. Existence of backups is not enough. |
-| 11 | 404 and 500 states | Universal | Missing routes, screens, or endpoints and server errors show a usable, on-brand state and expose no internals. |
+| 11 | 404 and 500 states | Universal | Missing routes, screens, or endpoints and server errors show a usable, on-brand state and expose no internals. When the product has a UI that shows lists, dashboards, search, notifications, or profiles, also apply `empty-loading-error-states.md` (E1-E4); those are launch-critical and are not satisfied by 404/500 pages alone. |
 | 12 | Low-cost device test | Platform (Android; analogous low-end device for other targets) | Critical flow on a representative low-end device or emulator; record device, OS, viewport, and result. If it truly does not apply, explain why with evidence. |
 | 13 | Load time | Universal | Critical flows measured on a representative device and constrained network; define "loaded and usable". User-visible critical flows over three seconds are fixed, or the verified cause and remaining decision are documented. |
-| 14 | Sharing and metadata | Platform (web, store listings, shareable links) | Titles, descriptions, canonical URLs where relevant, Open Graph and social preview metadata, and the actual preview image checked. |
-| 15 | Privacy policy and terms | Universal where users or data exist | Documents exist where needed and accurately describe data, providers, retention, payments, and user choices. Do not invent legal claims; mark required legal review BLOCKED until done. |
+| 14 | Sharing and metadata | Platform (web, store listings, shareable links) | Titles, descriptions, canonical URLs where relevant, Open Graph and social preview metadata, and the actual preview image checked. Public web: also `launch-seo.md`. |
+| 15 | Privacy policy and terms | Universal where users or data exist | Documents exist where needed and accurately describe data, providers, retention, payments, and user choices. Do not invent legal claims; mark required legal review BLOCKED until a qualified lawyer (or an owner-cited legal review artifact) has done it. A checklist pass is not legal review. See `legal.md`. |
 | 16 | Analytics | Feature (analytics or funnel measurement) | Useful funnel events and drop-off points present; no unnecessary personal data; consent and privacy behavior verified where applicable. |
-| 17 | End-to-end critical flows | Feature (signup, payment, password reset, others as present) | Run with sandbox accounts and payment modes. Never charge a real user as a test. |
+| 17 | End-to-end critical flows | Feature (signup, payment, password reset, others as present) | Run with sandbox accounts and payment modes. Never charge a real user as a test. Payments: also `payments-stripe.md`. Empty-account walkthrough: also `empty-loading-error-states.md`. |
 | 18 | Email delivery | Feature (outbound email) | Sender-domain authentication (SPF, DKIM, DMARC) readback and delivery to authorized test inboxes. Report what was tested; inbox placement is never guaranteed. |
 | 19 | User contact | Universal | Users can find a support or contact path and it works; submissions reach the intended destination (tested). |
 | 20 | Rollback | Universal | Written trigger, exact steps, responsible operator, data or migration considerations, and how success is verified; rollback tested where safe. |
@@ -35,3 +35,5 @@ Every check needs evidence for PASS. Applicability tiers:
 - Live behavior (credentials, production settings, email, backups, analytics, deployment, cache and CDN behavior) needs a live or owner-supplied readback. CI does not prove it. If the readback is unavailable, the status is UNKNOWN or BLOCKED, never PASS.
 - Record the environment each piece of evidence came from (local, preview, staging, production).
 - A check belongs to exactly one status. Do not merge checks to hide a failing part.
+- A model judgment is an advisory flag. Pass and fail stay an exit code or cited evidence.
+- Extra evidence and added checks live in `extensions.md` and its modules. Do not copy, renumber, or weaken this 20-check table.
