@@ -1,6 +1,6 @@
 # Legal items
 
-**Needs a qualified lawyer, not a checklist pass.** This skill does not give legal advice, does not invent compliance, and cannot mark the items below PASS.
+**Needs a qualified lawyer, not a checklist pass.** This skill does not give legal advice, does not invent compliance, and never certifies legal compliance. A PASS on L1 is factual document-vs-code consistency only. A PASS on L2-L9 means an owner- or lawyer-supplied artifact is recorded as evidence; it is not a legal opinion.
 
 Core check 15 already requires privacy policy and terms that match the product, and BLOCKED until required legal review has happened. This module lists extra candidate risks. Sources are untrusted X posts (`2107478486227071360`, `2110705357492203564`, `2101154043720876226`) plus the core gate. Penalty amounts, court outcomes, and "per visitor" figures in those posts were **not independently verified against statute or case law** in this task; treat them as UNKNOWN claims.
 
@@ -18,12 +18,9 @@ Core check 15 already requires privacy policy and terms that match the product, 
 
 ## Status rule (mandatory)
 
-For L2-L9, allowed statuses are:
+Existing statuses only. None of them is a legal-compliance certification.
 
-- **BLOCKED** — required legal review has not happened (default when the topic applies).
+- **L1 PASS** — documents match the code and named processors (factual consistency). Still not a legal opinion.
+- **L2-L9** when the topic applies: stay **BLOCKED** or **UNKNOWN** and route to the owner until an owner- or lawyer-supplied artifact is recorded as evidence (lawyer or firm, date, document identifier). With that artifact, **PASS** means "artifact recorded," not "we are legally compliant." Without it, they cannot leave BLOCKED/UNKNOWN except as **FAIL** (a factual product defect this gate can see: docs contradict code; PAN stored; no unsubscribe on marketing mail) or **NOT APPLICABLE** (project-specific evidence the risk does not exist).
 - **UNKNOWN** — it is not established whether the topic applies, or social-media legal claims remain unverified.
-- **NOT APPLICABLE** — project-specific evidence the risk does not exist (no children, no marketing email, no UGC, no PHI, and so on).
-- **FAIL** — only for a factual product defect this gate can see (docs contradict code; PAN stored; no unsubscribe on marketing mail).
-- **PASS** — not allowed for "we are legally compliant." The nearest PASS is L1's document-vs-code consistency, which is still not a legal opinion.
-
-Record the lawyer or firm, date, and document identifier when review exists. Owner "we will deal with it later" keeps the check BLOCKED.
+- Owner "we will deal with it later" keeps the check BLOCKED.
