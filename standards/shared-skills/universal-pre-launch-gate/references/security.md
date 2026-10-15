@@ -14,7 +14,7 @@ Do not weaken core checks 1-8. Status and evidence rules are unchanged.
 | S6 | Cookie flags on session cookies | 4 | `HttpOnly`, `Secure`, and a documented `SameSite` value, read back from Set-Cookie or config. |
 | S7 | Password hashing | 4 | Algorithm and parameters read from code or IdP config (argon2 or bcrypt, or the project's IdP). Plaintext or reversible storage is FAIL. |
 | S8 | Security headers on web responses | 8 / web module | Live or staging response headers (for example CSP, HSTS). Missing headers on a public web app are FAIL or UNKNOWN if not fetched, never PASS. |
-| S9 | Dependency vulnerabilities | — (not core 1; core 1 is API keys) | Project's audit command (`npm audit`, `pip-audit`, `cargo audit`, or equivalent) exit code and summary counts. Critical/high without an owner-accepted residual list is FAIL. This skill does not install scanners. |
+| S9 | Dependency vulnerabilities | — (not core 1; core 1 is API keys) | Project's audit command (`npm audit`, `pip-audit`, `cargo audit`, or equivalent) exit code and summary counts. Any unresolved critical/high finding is FAIL. S9 is launch-critical in its own right: S9 FAIL selects **NOT READY**. An owner-accepted residual list does not turn FAIL into PASS; record it as an owner-accepted FAIL (owner release-decision note) and the outcome stays NOT READY. This skill does not install scanners. |
 | S10 | Uploads (if present) | 6 | Size limit, type allow-list, stored outside the executable web root, and a test of a rejected oversize or disallowed file. |
 | S11 | Logs do not record passwords, tokens, or card numbers | 8 | Log sample or redaction code. Card data in logs is FAIL (also see payments and legal). |
 

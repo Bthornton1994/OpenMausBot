@@ -21,7 +21,7 @@ Skip the fan-out only when all of the following are true: the change touches 2 f
 Paraphrase of `addyosmani/agent-skills` `skills/shipping-and-launch/SKILL.md` @ `aeac41d4d005999432bb7312f7ff06383a91d59d`. Map onto existing checks; do not treat the source checklist as a second gate.
 
 - Tests, lint, and typecheck: record commands and exit codes under end-to-end / verification (17 and the required suite).
-- Dependency audit with no critical/high findings, or an owner-accepted residual list: security module S9 (not core 1).
+- Dependency audit with no unresolved critical/high findings: security module S9 (not core 1). S9 is launch-critical in its own right, so S9 FAIL selects NOT READY. An owner-accepted residual list is recorded as an owner-accepted FAIL (owner release-decision note, as above); the outcome stays NOT READY.
 - Feature flags decouple deploy from release when the project uses them (check 20 and remaining risks). This skill still does not deploy.
 - Staged rollout thresholds and monitoring belong in remaining risks unless the project already requires them as launch-critical.
 - Accessibility (keyboard, screen reader, contrast): record under platform evidence or remaining risks unless the project or contract requires it as launch-critical.
