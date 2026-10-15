@@ -3,7 +3,7 @@
 Canonical home for skills that are rolled out to the product repositories. A target repository never holds the source of truth: it holds a generated, provenance-tracked adapter.
 
 - `product-discovery-build/` - the Product Discovery & Build workflow.
-- `universal-pre-launch-gate/` - the 20-check, evidence-based pre-launch gate for any platform. Host loader evidence is UNKNOWN for every host (see its `references/host-adapters.md`).
+- `universal-pre-launch-gate/` - the 20-check, evidence-based pre-launch gate for any platform, plus extension modules (security, payments, launch/SEO, AI red-team names, legal, empty states). Host loader evidence is UNKNOWN for every host (see its `references/host-adapters.md`).
 - `manifest.json` - one entry per skill, keyed by skill name: version, origin and origin hash, changes from origin, content hash, and the `AGENTS.md` pointer text.
 - `scripts/skill-sync.mjs` - generates adapters. Dry run by default.
 
