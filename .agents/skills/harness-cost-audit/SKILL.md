@@ -21,6 +21,17 @@ Build an evidence table with Verified, Inferred, or Unknown for:
 
 If any required evidence or gate is Unknown, do not edit. Return a read-only findings report and the smallest evidence-gathering plan. Do not invent rates, quality thresholds, or permissions. Do not issue new provider requests, enable a live flag, install a tool, or incur spend to establish a baseline. A new paid evaluation requires explicit owner approval with a cost ceiling and data-handling plan.
 
+## Frame the outcome and evidence
+
+Before proposing a savings change:
+
+- State the bounded task outcome behind the request. Optimize cost per completion only within that outcome and the authorized scope.
+- Identify the rawest approved evidence and real domain methods/tools a capable practitioner would use. Verify that data and tools are available and authorized; do not substitute persona role-play for method.
+- Name the accepted independent evaluation or external signal that can reject a wrong or lower-quality result. A model or implementer self-score is not enough.
+- Add another discipline only when it contributes a distinct method or check relevant to the outcome; do not add decorative roles or extra agents by default.
+
+If the evidence, approved tools, or outside judge is Unknown, keep the work read-only. Do not obtain it through new provider requests, installs, access, or spend. Freeze the task set and evaluation before measuring.
+
 ## Compute task-level cost
 
 Sum cached input, uncached input, and output tokens over all requests, retries, and rework for each task. Collect only minimal aggregate usage counters; do not persist raw prompts or task content. Include every attempted task’s cost in cohort spend, including failed or abandoned work. Report cohort spend divided by completed tasks, completion rate, and per-task cost distribution. Mark estimated or proxy figures clearly; use no fabricated invoice certainty.
