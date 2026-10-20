@@ -1,8 +1,6 @@
 name: Security scan baseline
 
 on:
-  push:
-    branches: [security/scan-baseline-2026-10-20]
   pull_request:
     branches: [main]
   schedule:
