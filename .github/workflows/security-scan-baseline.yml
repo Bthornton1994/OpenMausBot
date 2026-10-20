@@ -48,7 +48,7 @@ jobs:
           if [ "$scan_status" -eq 128 ] && [ ! -s "$result" ]; then
             {
               echo "### OSV-Scanner v2.6.0"
-              echo "- Candidate SHA: `$candidate_sha`"
+              echo "- Candidate SHA: $candidate_sha"
               echo "- Result: no supported dependency manifests detected (NOT COVERED)."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -92,7 +92,7 @@ jobs:
 
           {
             echo "### OSV-Scanner v2.6.0"
-            echo "- Candidate SHA: `$candidate_sha`"
+            echo "- Candidate SHA: $candidate_sha"
             echo "- Result: $scan_result"
             echo "- Packages: $package_count; vulnerability records: $vulnerability_count"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -138,15 +138,23 @@ jobs:
 
           candidate_sha="$(git rev-parse HEAD)"
 
-          if [ "$scan_status" -ne 0 ] || [ ! -s "$result" ] || ! jq -e 'type == "object" and (.results | type == "array")' "$result" >/dev/null; then
-            echo "Semgrep CE failed or returned invalid JSON; raw output was withheld from workflow logs." >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -s "$result" ]; then
+            echo "Semgrep CE failed: scanner exit status $scan_status; JSON output was empty. Raw stderr was withheld." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and (.results | type == "array")' "$result" >/dev/null; then
+            echo "Semgrep CE failed: scanner exit status $scan_status; JSON output was invalid. Raw output was withheld." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
           result_count="$(jq '[.results[]?] | length' "$result")"
           scan_error_count="$(jq '[.errors[]?] | length' "$result")"
           if [ "$scan_error_count" -ne 0 ]; then
-            echo "Semgrep CE reported scan errors; raw output was withheld from workflow logs." >> "$GITHUB_STEP_SUMMARY"
+            echo "Semgrep CE reported $scan_error_count scan errors; scanner exit status $scan_status. Raw output was withheld." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$scan_status" -ne 0 ]; then
+            echo "Semgrep CE exited with status $scan_status despite valid JSON and zero reported scan errors. Raw stderr was withheld." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -156,7 +164,7 @@ jobs:
 
           {
             echo "### Semgrep CE v1.181.0"
-            echo "- Candidate SHA: `$candidate_sha`"
+            echo "- Candidate SHA: $candidate_sha"
             echo "- Result: $result_count findings; informational during initial baseline"
             echo "- Semgrep severities: ERROR $error_count, WARNING $warning_count, INFO $info_count"
           } >> "$GITHUB_STEP_SUMMARY"
