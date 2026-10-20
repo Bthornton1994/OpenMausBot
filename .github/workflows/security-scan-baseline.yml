@@ -1,0 +1,200 @@
+name: Security scan baseline
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: OSV Scanner and Semgrep CE
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Dependency scan (OSV Scanner v2.6.0)
+        shell: bash
+        run: |
+          result="$RUNNER_TEMP/osv.json"
+          errors="$RUNNER_TEMP/osv.stderr"
+
+          set +e
+          docker run --rm \
+            --workdir /tmp \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            ghcr.io/google/osv-scanner@sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa \
+            scan -r /src --format json --verbosity error \
+            >"$result" 2>"$errors"
+          scan_status=$?
+          set -e
+
+          candidate_sha="$(git rev-parse HEAD)"
+
+          if [ "$scan_status" -eq 128 ] && [ ! -s "$result" ]; then
+            {
+              echo "### OSV-Scanner v2.6.0"
+              echo "- Candidate SHA: $candidate_sha"
+              echo "- Result: no supported dependency manifests detected (NOT COVERED)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ ! -s "$result" ] || ! jq -e 'type == "object" and (.results | type == "array")' "$result" >/dev/null; then
+            echo "OSV Scanner failed; raw output was withheld from workflow logs." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          package_count="$(jq '[.results[]?.packages[]?] | length' "$result")"
+          vulnerability_count="$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' "$result")"
+
+          case "$scan_status" in
+            0)
+              if [ "$vulnerability_count" -ne 0 ]; then
+                echo "OSV Scanner returned inconsistent status and JSON." >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              scan_result="no known vulnerabilities"
+              ;;
+            1)
+              if [ "$vulnerability_count" -eq 0 ]; then
+                echo "OSV Scanner returned a finding status without vulnerability records." >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              scan_result="findings recorded; informational during initial baseline"
+              ;;
+            128)
+              if [ "$package_count" -ne 0 ]; then
+                echo "OSV Scanner returned an unexpected no-packages status." >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              scan_result="no supported dependency manifests detected (NOT COVERED)"
+              ;;
+            *)
+              echo "OSV Scanner failed; raw output was withheld from workflow logs." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "### OSV-Scanner v2.6.0"
+            echo "- Candidate SHA: $candidate_sha"
+            echo "- Result: $scan_result"
+            echo "- Packages: $package_count; vulnerability records: $vulnerability_count"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$vulnerability_count" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Up to 30 findings (advisory, package, version, numeric CVSS when available, manifest):" >> "$GITHUB_STEP_SUMMARY"
+            echo '    Advisory | Package | Version | CVSS | Manifest' >> "$GITHUB_STEP_SUMMARY"
+            jq -r '
+              def safe: tostring | gsub("[^A-Za-z0-9._:@/+ -]"; "_") | .[0:120];
+              [
+                .results[]? as $source
+                | $source.packages[]? as $package
+                | $package.vulnerabilities[]? as $vuln
+                | [
+                    (($vuln.id // "unknown") | safe),
+                    (($package.package.name // "unknown") | safe),
+                    (($package.package.version // "unknown") | safe),
+                    ([$vuln.severity[]?.score? | (try tonumber catch null) | select(. != null)] | max // "unknown"),
+                    (($source.source.path // "unknown") | safe)
+                  ]
+                | join(" | ")
+              ]
+              | .[:30][]
+            ' "$result" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Source scan (Semgrep CE v1.181.0)
+        shell: bash
+        run: |
+          result="$RUNNER_TEMP/semgrep.json"
+          errors="$RUNNER_TEMP/semgrep.stderr"
+
+          set +e
+          docker run --rm \
+            --workdir /tmp \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            semgrep/semgrep@sha256:81474464c1f07483ba0682a44787fd93c91397419762a04abe2bafaae396304b \
+            semgrep scan --config p/security-audit --metrics=off --json --quiet /src \
+            >"$result" 2>"$errors"
+          scan_status=$?
+          set -e
+
+          candidate_sha="$(git rev-parse HEAD)"
+
+          if [ ! -s "$result" ]; then
+            echo "Semgrep CE failed: scanner exit status $scan_status; JSON output was empty. Raw stderr was withheld." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and (.results | type == "array")' "$result" >/dev/null; then
+            echo "Semgrep CE failed: scanner exit status $scan_status; JSON output was invalid. Raw output was withheld." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          result_count="$(jq '[.results[]?] | length' "$result")"
+          scan_error_count="$(jq '[.errors[]?] | length' "$result")"
+          if [ "$scan_error_count" -ne 0 ]; then
+            {
+              echo "Semgrep CE reported $scan_error_count scan errors; scanner exit status $scan_status. Raw messages, paths, and stderr were withheld."
+              echo ""
+              echo "Error categories (up to 10 groups by type, code, and level):"
+              jq -r '
+                def safe: tostring | gsub("[^A-Za-z0-9._:+/-]"; "_") | .[0:80];
+                .errors
+                | group_by([.type, .code, .level])
+                | map(.[0] as $first
+                    | "type: \($first.type | safe); code: \($first.code | safe); level: \($first.level | safe); count: \(length)")
+                | .[:10][]
+              ' "$result"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$scan_status" -ne 0 ]; then
+            echo "Semgrep CE exited with status $scan_status despite valid JSON and zero reported scan errors. Raw stderr was withheld." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          error_count="$(jq '[.results[]? | select(.extra.severity == "ERROR")] | length' "$result")"
+          warning_count="$(jq '[.results[]? | select(.extra.severity == "WARNING")] | length' "$result")"
+          info_count="$(jq '[.results[]? | select(.extra.severity == "INFO")] | length' "$result")"
+
+          {
+            echo "### Semgrep CE v1.181.0"
+            echo "- Candidate SHA: $candidate_sha"
+            echo "- Result: $result_count findings; informational during initial baseline"
+            echo "- Semgrep severities: ERROR $error_count, WARNING $warning_count, INFO $info_count"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$result_count" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Up to 30 findings (rule, Semgrep severity, path, line):" >> "$GITHUB_STEP_SUMMARY"
+            echo '    Rule | Severity | Path | Line' >> "$GITHUB_STEP_SUMMARY"
+            jq -r '
+              def safe: tostring | gsub("[^A-Za-z0-9._:@/+ -]"; "_") | .[0:120];
+              [
+                .results[]?
+                | [
+                    ((.check_id // "unknown") | safe),
+                    ((.extra.severity // "UNKNOWN") | safe),
+                    ((.path // "unknown") | safe),
+                    (.start.line // 0 | tostring)
+                  ]
+                | join(" | ")
+              ]
+              | .[:30][]
+            ' "$result" >> "$GITHUB_STEP_SUMMARY"
+          fi
