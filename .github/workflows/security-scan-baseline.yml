@@ -148,7 +148,19 @@ jobs:
           result_count="$(jq '[.results[]?] | length' "$result")"
           scan_error_count="$(jq '[.errors[]?] | length' "$result")"
           if [ "$scan_error_count" -ne 0 ]; then
-            echo "Semgrep CE reported $scan_error_count scan errors; scanner exit status $scan_status. Raw output was withheld." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "Semgrep CE reported $scan_error_count scan errors; scanner exit status $scan_status. Raw messages, paths, and stderr were withheld."
+              echo ""
+              echo "Error categories (up to 10 groups by type, code, and level):"
+              jq -r '
+                def safe: tostring | gsub("[^A-Za-z0-9._:+/-]"; "_") | .[0:80];
+                .errors
+                | group_by([.type, .code, .level])
+                | map(.[0] as $first
+                    | "type: \($first.type | safe); code: \($first.code | safe); level: \($first.level | safe); count: \(length)")
+                | .[:10][]
+              ' "$result"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           if [ "$scan_status" -ne 0 ]; then
