@@ -89,3 +89,11 @@ Before claiming a server or conversation change works, follow
 isolated fixture; never verify mutations against the user's live app or data.
 
 More specific `AGENTS.md` files override this note within their directories.
+
+## Correction escalation
+
+When the same agent mistake shows up twice, don't just write more prose. Fix it in this order: (1) change the design or types so the mistake can't happen, (2) add a lint rule, test, or CI check, (3) only then add a rule or skill. Record which step you took in the PR.
+
+## Smallest complete change
+
+Before writing new code, read the code it touches and list every caller, test, fixture and config the change must reach. Then take the first option that fully works: (1) skip anything nobody asked for, and say what you skipped; (2) reuse a helper, component or pattern already in this repo; (3) use the standard library or a built-in platform feature; (4) use a dependency that is already installed, and never add a new dependency for a few lines; (5) only then write the minimum new code. New logic with a branch, loop, parser, money, security or data writes leaves one small test that fails when it breaks. Never cut validation at trust boundaries, error handling that prevents data loss, security or accessibility. Record which option you took in the PR.
