@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+if [ -n "$OMB_SKIP_HOOKS" ]; then
+  echo "pre-commit: skipped (OMB_SKIP_HOOKS is set)"
+  exit 0
+fi
+cd "$(git rev-parse --show-toplevel)"
+if ! command -v node >/dev/null 2>&1; then
+  echo "pre-commit: warning: node is unavailable; CI runs the file size check" >&2
+  exit 0
+fi
+node scripts/check-file-size.mjs --staged

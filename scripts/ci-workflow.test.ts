@@ -114,6 +114,7 @@ describe("CI concurrency", () => {
     expect(workflow.jobs.static.if).toBeUndefined();
     expect(workflow.jobs.static.steps[0].with["fetch-depth"]).toBe(0);
     expect(workflow.jobs.static.steps.find((step: { id?: string }) => step.id === "scope").run).toBe("node scripts/ci-scope.mjs");
+    expect(workflow.jobs.static.steps.some((step: { name?: string }) => step.name === "Check file size ratchet")).toBe(true);
     expect(workflow.jobs.static.outputs).toEqual({
       runtime: "${{ steps.scope.outputs.runtime }}", mobile: "${{ steps.scope.outputs.mobile }}",
       vitest_os: "${{ steps.scope.outputs.vitest_os }}",

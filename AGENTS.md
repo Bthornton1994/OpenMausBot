@@ -97,3 +97,7 @@ When the same agent mistake shows up twice, don't just write more prose. Fix it 
 ## Smallest complete change
 
 Before writing new code, read the code it touches and list every caller, test, fixture and config the change must reach. Then take the first option that fully works: (1) skip anything nobody asked for, and say what you skipped; (2) reuse a helper, component or pattern already in this repo; (3) use the standard library or a built-in platform feature; (4) use a dependency that is already installed, and never add a new dependency for a few lines; (5) only then write the minimum new code. New logic with a branch, loop, parser, money, security or data writes leaves one small test that fails when it breaks. Never cut validation at trust boundaries, error handling that prevents data loss, security or accessibility. Record which option you took in the PR.
+## File size ratchet
+
+Keep each source file under 8,000 tokens (bytes / 4). New files over the limit are blocked; files listed in `scripts/file-size-ratchet.json` may be edited but must not grow. When the check blocks you, split the file by responsibility, move code verbatim, keep the old path as a thin re-exporting entry point, and run the tests. The pre-commit hook and CI run the same check (
+ode scripts/check-file-size.mjs`); skipping the hook does not skip CI. Never raise a baseline entry to get past the check.
