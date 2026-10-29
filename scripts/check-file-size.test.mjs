@@ -105,7 +105,7 @@ test("CI detects baseline additions and raises, and initial rollout accepts its 
 });
 
 test("baseline regeneration refuses additions without explicit allow-raise and removes deleted paths", () => {
-  const { cwd, cfg } = repo();
+  const { cwd } = repo();
   writeFileSync(join(cwd, "large.ts"), "x".repeat(9)); commit(cwd, "large file");
   assert.equal(run(cwd, "--write-baseline").status, 1);
   assert.equal(run(cwd, "--write-baseline", "--allow-raise").status, 0);
