@@ -59,6 +59,22 @@ jobs:
       - name: Select checks for this change
         id: scope
         run: node scripts/ci-scope.mjs
+      - name: Check file size ratchet
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            node scripts/check-file-size.mjs --base "$PR_BASE"
+          elif [ "$EVENT_NAME" = merge_group ]; then
+            node scripts/check-file-size.mjs --base "$MERGE_BASE"
+          elif [ "$EVENT_NAME" = push ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            node scripts/check-file-size.mjs --base "$PUSH_BEFORE"
+          else
+            node scripts/check-file-size.mjs --all
+          fi
       - run: pnpm install --frozen-lockfile
       - name: Verify CI selection and documentation references
         run: pnpm exec vitest run scripts/ci-scope.test.ts scripts/ci-workflow.test.ts scripts/testing/verification-docs.test.ts
